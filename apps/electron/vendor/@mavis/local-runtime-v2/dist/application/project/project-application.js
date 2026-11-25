@@ -1,4 +1,4 @@
-import { SidebarQueryError, ProjectServiceError, sessionTreeFilterFromRequest, } from '../../service/session-system/index.js';
+import { SidebarQueryError, ProjectServiceError, projectSessionFilter, } from '../../service/session-system/index.js';
 import { AppError } from '../errors.js';
 import { publishBestEffort } from '../events.js';
 import { readSessionAssignments, toSessionInfoView, toSessionTreeChildView, } from '../session/wire.js';
@@ -194,6 +194,10 @@ export class ProjectApplication {
         const project = await this.invoke(() => this.options.service.setHidden(toProjectReference(req.project), req.hidden));
         return mutationResponse(project);
     }
+    async moveSidebarProject(_context, req) {
+        const project = await this.invoke(() => this.options.service.moveInSidebar(toProjectReference(req.project), req.after ? toProjectReference(req.after) : undefined));
+        return mutationResponse(project);
+    }
     async putProjectsOrder(context, req) {
         await this.invoke(() => this.options.pinService.putProjectsOrder((req.projects ?? []).map(toProjectReference)));
         return this.listProjects(context, { includeHidden: true });
@@ -237,20 +241,6 @@ export class ProjectApplication {
             throw error;
         }
     }
-}
-/**
- * Projects include Cron roots because they are user-visible tasks associated
- * with a workspace. Ordinary conversation lists still exclude Cron's internal
- * execution tree through their default Session filter.
- */
-function projectSessionFilter(request) {
-    const { excludeSessionKinds, ...filter } = sessionTreeFilterFromRequest(request, false);
-    const excluded = excludeSessionKinds?.filter((kind) => kind !== 'cron');
-    return {
-        ...filter,
-        excludeInternalTreeSessions: false,
-        ...(excluded?.length ? { excludeSessionKinds: excluded } : {}),
-    };
 }
 async function archiveSessionsBestEffort(sessionIds, sessions) {
     const archivedSessionIds = [];
@@ -310,13 +300,17 @@ const PROJECT_FAILURE_MAPPINGS = {
     'invalid-project-icon': { status: 400, key: 'INVALID_PROJECT_ICON' },
     'invalid-project-name': { status: 400, key: 'INVALID_PROJECT_NAME' },
     'default-project-name': { status: 400, key: 'DEFAULT_PROJECT_NAME_IMMUTABLE' },
+    'default-project-hidden': { status: 400, key: 'DEFAULT_PROJECT_HIDE_FORBIDDEN' },
     'invalid-project-id': { status: 400, key: 'INVALID_PROJECT_ID' },
     'project-required': { status: 400, key: 'PROJECT_REQUIRED' },
     'invalid-workspace-dir': { status: 400, key: 'INVALID_WORKSPACE_DIR' },
     'invalid-workspace-roots': { status: 400, key: 'INVALID_WORKSPACE_ROOTS' },
+    'forbidden-workspace-root': { status: 400, key: 'FORBIDDEN_WORKSPACE_ROOT' },
+    'overlapping-workspace-roots': { status: 400, key: 'OVERLAPPING_WORKSPACE_ROOTS' },
     'project-conflict': { status: 409, key: 'PROJECT_CONFLICT' },
     'project-not-found': { status: 404, key: 'PROJECT_NOT_FOUND' },
     'duplicate-project': { status: 400, key: 'DUPLICATE_PROJECT' },
+    'invalid-project-move': { status: 400, key: 'INVALID_PROJECT_MOVE' },
     'invalid-project-row': { status: 500, key: 'INVALID_PROJECT_ROW' },
     'session-cursor-missing': { status: 500, key: 'PROJECT_SESSION_CURSOR_MISSING' },
 };

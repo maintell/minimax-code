@@ -340,10 +340,12 @@ export function extractAssistantUsage(message, contextWindow) {
     const output = finite(u.output);
     const cacheRead = finite(u.cacheRead) ?? 0;
     const cacheWrite = finite(u.cacheWrite) ?? 0;
+    const contextTokens = finite(u.contextTokens);
     const total = (finite(u.totalTokens) ?? 0) || (input ?? 0) + (output ?? 0) + cacheRead + cacheWrite;
     return {
         total_tokens: total,
         context_window: contextWindow,
+        ...(contextTokens !== undefined && contextTokens > 0 ? { context_tokens: contextTokens } : {}),
         // input_tokens / output_tokens 落 IRuntimeUsage 主列,RecordTokenUsage RPC
         // 上报 token_usage 表时 InputTokens/OutputTokens 是 required IDL 字段,不
         // 输的话整批被 archon-server billing pipeline 当 0 写入,污染 reports。
@@ -631,11 +633,17 @@ export function extractFinalAssistantUsageFromBuffer(buffered) {
             return undefined;
         const u = usage;
         const total = typeof u.total_tokens === 'number' ? u.total_tokens : 0;
+        const contextTokens = typeof u.context_tokens === 'number' &&
+            Number.isFinite(u.context_tokens) &&
+            u.context_tokens > 0
+            ? u.context_tokens
+            : 0;
         const cw = typeof u.context_window === 'number' ? u.context_window : 0;
         const cacheRead = typeof u.cache_read === 'number' ? u.cache_read : 0;
         const cacheWrite = typeof u.cache_write === 'number' ? u.cache_write : 0;
         return {
             total_tokens: total,
+            ...(contextTokens > 0 ? { context_tokens: contextTokens } : {}),
             context_window: cw,
             ...(cacheRead > 0 ? { cache_read: cacheRead } : {}),
             ...(cacheWrite > 0 ? { cache_write: cacheWrite } : {}),

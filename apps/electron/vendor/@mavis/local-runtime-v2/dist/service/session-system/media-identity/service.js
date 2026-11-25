@@ -230,7 +230,12 @@ function metadata(file) {
         return { path: file.path };
     }
 }
-function localMediaKind(file) {
+/** The Drive node a Session file names, e.g. after `enrich`; undefined when it names none. */
+export function cloudDriveNodeIdOf(file) {
+    return getCloudDriveNodeId(metadata(file)) ?? undefined;
+}
+/** Image or video kind of a local delivery; URLs and `commit-id-` cloud references are not local. */
+export function localMediaKind(file) {
     if (/^(?:[a-z][a-z\d+.-]*:|commit-id-)/iu.test(file.path.replace(/^[a-z]:[\\/]/iu, '/')))
         return undefined;
     const kind = deriveMediaKind({

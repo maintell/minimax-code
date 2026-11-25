@@ -2,6 +2,17 @@ import { createHash } from 'node:crypto';
 import { formatSelfReminderName } from '@mavis/shared/cron-purpose';
 import { CronRepositoryError } from '../errors.js';
 import { assertCronContentSafe } from './content-safety.js';
+/**
+ * The fixed reporting line every self reminder's prompt ends with.
+ *
+ * Exported because the high-risk-write Skills teach the model to tell a
+ * reminder it set itself from a scheduled task the user asked for by exactly
+ * this ending. Exporting it lets the test that pins those Skills read the source
+ * sentence instead of repeating it, so editing one side fails the build.
+ *
+ * @internal Exported only for that focused test; production reads it here.
+ */
+export const SELF_REMINDER_REPORTING_LINE = 'Only report meaningful progress, completion, failure or required user action.';
 export function createSelfReminderService(deps) {
     const result = (definition) => ({
         reminder_id: definition.cronId,
@@ -33,7 +44,7 @@ export function createSelfReminderService(deps) {
                 cronId,
                 agentName: command.agentName,
                 name: formatSelfReminderName(cronId),
-                prompt: `${command.prompt.trim()}\n\nOnly report meaningful progress, completion, failure or required user action.`,
+                prompt: `${command.prompt.trim()}\n\n${SELF_REMINDER_REPORTING_LINE}`,
                 schedule: { kind: 'once', runAtMs },
                 sessionTarget: { mode: 'sessionId', sessionId: command.sessionId },
                 project: command.project,

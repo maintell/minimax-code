@@ -1,4 +1,5 @@
 import { Type } from '@sinclair/typebox';
+import { BUILTIN_NAMESPACED_TOOL_NAMES } from '../shared/builtin-tool-namespaces.js';
 import { CRON_FIXED_SESSION_ID } from '../shared/cron-schedule-input.js';
 export const CRON_TOOL_NAMES = [
     'self_reminder',
@@ -15,6 +16,7 @@ export const CRON_TOOL_NAMES = [
 export const MAVIS_CAPABILITY_TOOL_NAMES = [
     'mavis',
     'session_create',
+    ...BUILTIN_NAMESPACED_TOOL_NAMES,
     ...CRON_TOOL_NAMES,
 ];
 const nonblank = (description) => Type.String({ minLength: 1, description });
@@ -65,6 +67,28 @@ function normalizeNumericId(args, idField) {
 function cronPrepareArguments(idField) {
     return (args) => normalizeNumericId(args, idField);
 }
+/**
+ * The creation-time gate for the desktop writes a scheduled run cannot take back.
+ * A coordinator loads the cron tools inline and never reads `cron-manage`, so the rule
+ * has to sit in the description every Agent reads at the call. The cloud runtime
+ * has no tool for any of these five writes, so only the desktop wire id carries it.
+ */
+const SCHEDULED_HIGH_RISK_WRITE_GATE = 'For a task that will archive all of a project’s chats, remove a project from ' +
+    'the sidebar, delete a sidebar section, enable or disable a plugin or uninstall a ' +
+    'plugin, the user must have named both the object and the operation and the prompt ' +
+    'must copy their words verbatim; when they were vague, ask with `ask_user` and ' +
+    '`async: false` first, and never turn a vague request into a specific operation on ' +
+    'their behalf.';
+function cronCreateDescription(idField) {
+    return [
+        'Create a user-requested recurring or one-time task.',
+        'Clarify unclear task content or timing with ask_user.',
+        ...(idField === 'cron_id' ? [SCHEDULED_HIGH_RISK_WRITE_GATE] : []),
+        'Describe fixed mode as a separate task-owned conversation (任务专用对话), reused across runs.',
+        'Use self_reminder for follow-up on the current work.',
+        'Do not repeat a successful creation.',
+    ].join(' ');
+}
 export function cronToolDefinitions(idField) {
     // Local models can serialize booleans as JSON strings. Accept only the two
     // unambiguous spellings; the local tool normalizes them before domain validation.
@@ -76,15 +100,17 @@ export function cronToolDefinitions(idField) {
     const identity = {
         [idField]: nonblank('Exact scheduled-task ID returned by cron_read or cron_create. Pass it as a string — snowflake IDs exceed safe integer range once quoted values are lost.'),
     };
+    // A namespace binds the group to a Skill, and the tool_search catalog then
+    // advertises every on_demand tool in it as `skill_required`. Only the local
+    // Agent has that Skill and its gate, so the cloud definitions stay
+    // unnamespaced and the cloud catalog lists no gate for them.
+    const namespaced = idField === 'cron_id' ? { namespace: 'cron' } : {};
     return [
         {
             name: 'cron_create',
+            ...namespaced,
             loading: 'on_demand',
-            description: 'Create a user-requested recurring or one-time task. ' +
-                'Clarify unclear task content or timing with ask_user. ' +
-                'Describe fixed mode as a separate task-owned conversation (任务专用对话), reused across runs. ' +
-                'Use self_reminder for follow-up on the current work. ' +
-                'Do not repeat a successful creation.',
+            description: cronCreateDescription(idField),
             schema: Type.Object({
                 cron_name: nonblank('Natural-language task title.'),
                 prompt,
@@ -107,6 +133,7 @@ export function cronToolDefinitions(idField) {
         },
         {
             name: 'cron_read',
+            ...namespaced,
             loading: 'on_demand',
             description: 'List scheduled tasks, inspect a task, or read its run history.',
             prepareArguments: cronPrepareArguments(idField),
@@ -123,6 +150,7 @@ export function cronToolDefinitions(idField) {
         },
         {
             name: 'cron_update',
+            ...namespaced,
             loading: 'on_demand',
             description: `Update or pause/resume a scheduled task. ${idField === 'cron_id' ? 'Self-reminder sessions, models and workspaces stay fixed. ' : ''}Run immediately from the scheduling UI.`,
             prepareArguments: cronPrepareArguments(idField),
@@ -148,6 +176,7 @@ export function cronToolDefinitions(idField) {
         },
         {
             name: 'cron_delete',
+            ...namespaced,
             loading: 'on_demand',
             description: 'Delete a scheduled task and stop future runs. Keep run history and conversations.',
             prepareArguments: cronPrepareArguments(idField),
@@ -168,13 +197,17 @@ export function withCoordinatorCronSpace(def) {
         ...def,
         schema: Type.Object({
             cron_name: cron_name,
-            space: Type.Optional(nonblank('Bunny 定时关联的任务空间 ID；到点叫醒当前 Bunny 主对话')),
+            space: Type.Optional(nonblank('Bunny 定时关联的事项 ID；到点叫醒当前 Bunny 主对话')),
             ...rest,
         }, { additionalProperties: false }),
     };
 }
 export const LocalSelfReminderToolDef = {
     name: 'self_reminder',
+    // Grouped with the scheduled tasks so loading `cron-manage` brings its
+    // rules along, but kept default-loading: the system reminder tells the model
+    // to call it directly, so the Skill gate must not stand in front of it.
+    namespace: 'cron',
     loading: 'default',
     description: 'Set or cancel a single follow-up check for external work in this conversation. Use only when no completion notification is available; never just to wait for a user reply. Only one unfinished reminder is allowed; another set returns SELF_REMINDER_EXISTS without changing it. Cancel when follow-up is no longer needed. For user-requested scheduled tasks, discover cron_create with tool_search.',
     schema: Type.Object({

@@ -7,6 +7,7 @@ import { bindRuntimeHostedCloudHandoff } from './runtime-services-composition.js
 import { AgentApplication, AppError, createRuntimeAgentApplication, createRuntimePluginSessionLifecycle, initializeApplications, ModelProviderApplication, } from '../index.js';
 import { createProductionConversationMutationWorkflow, unavailableForkWorktree, } from './conversation-mutation-workflow.js';
 import { createForkState } from './conversation-fork-state.js';
+import { SessionProjectMoveWorkflow } from './project-move-workflow.js';
 import {} from './turn-lifecycle-event-observer.js';
 import { createQueueWakeFailureReporter, reportRootBestEffortFailure, } from './turn-message-delivery.js';
 import { createSessionHandoffComposition } from '../../service/session-handoff/index.js';
@@ -66,12 +67,14 @@ export async function initializeSessionApplications(input, turnSystem, plugin, o
         resolveAgentWriteTarget: input.agentSessionPorts.resolveWriteTarget,
         requireExactAgentKey: input.agentSessionPorts.requireExactAgentKey,
         ...createRuntimePluginSessionLifecycle(turnSystem, plugin),
+        pauseActiveGoalForArchive: (sessionId) => input.goalPort.pauseActiveForAbort(sessionId),
         turn: turnSystem.turns,
         assertSessionDeletionAllowed: async (sessionId) => {
             if (ownership.isSessionOwnedByScheduledTask(sessionId)) {
                 throw new AppError(409, 'CRON_OWNED_SESSION', 'This session is owned by a scheduled task. Delete the scheduled task instead.');
             }
         },
+        sessionProjectMove: createSessionProjectMove(input, sessionApplications, ownership),
         conversationMutationPort: input.sessionSystem.conversationMutationState,
         conversationMutationWorkflow: createProductionConversationMutationWorkflow({
             sessionFork: input.sessionSystem.fork,
@@ -122,6 +125,20 @@ export async function initializeSessionApplications(input, turnSystem, plugin, o
         onQueueWakeFailure: createQueueWakeFailureReporter(input.product.executor.reportFailure, 'conversation_queue_wake_failed'),
     });
     return { sessionApplications, applications, agentApplication, runtimeConversation };
+}
+/** Moves local tasks between Project folders under the Session maintenance lease. */
+function createSessionProjectMove(input, sessionApplications, ownership) {
+    const sessionSystem = input.sessionSystem;
+    return new SessionProjectMoveWorkflow({
+        sessions: sessionSystem.repositories.sessions,
+        projects: sessionSystem.repositories.projects,
+        catalog: sessionSystem.projects.service,
+        maintenance: sessionApplications.session.maintenance,
+        noProjectWorkspaceDir: (session) => sessionSystem.sessions.records.resolveNoProjectWorkspaceDir(session),
+        isOwnedByScheduledTask: ownership.isSessionOwnedByScheduledTask,
+        nowMs: input.nowMs,
+        publish: input.writeGlobalEvent,
+    });
 }
 /** Lets Rewind/Edit refuse a Turn that another live Runtime owns. */
 function rewindEditActiveTurn(turnSystem) {

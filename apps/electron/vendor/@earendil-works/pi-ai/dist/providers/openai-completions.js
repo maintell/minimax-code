@@ -11,6 +11,21 @@ import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.js";
 import { buildBaseOptions } from "./simple-options.js";
 import { transformMessages } from "./transform-messages.js";
 /**
+ * Recognize the official Mistral OpenAI-compatible endpoint without matching
+ * lookalike gateway hostnames.
+ */
+function isMistralApiModel(model) {
+    if (model.provider.toLowerCase() === "mistral") {
+        return true;
+    }
+    try {
+        return new URL(model.baseUrl).hostname.toLowerCase() === "api.mistral.ai";
+    }
+    catch {
+        return false;
+    }
+}
+/**
  * Check if conversation messages contain tool calls or tool results.
  * This is needed because Anthropic (via proxy) requires the tools param
  * to be present when messages include tool_calls or tool role messages.
@@ -402,8 +417,9 @@ function buildParams(model, context, options, compat = getCompat(model), cacheRe
         model: model.id,
         messages,
         stream: true,
-        prompt_cache_key: (model.baseUrl.includes("api.openai.com") && cacheRetention !== "none") ||
-            (cacheRetention === "long" && compat.supportsLongCacheRetention)
+        prompt_cache_key: !isMistralApiModel(model) &&
+            ((model.baseUrl.includes("api.openai.com") && cacheRetention !== "none") ||
+                (cacheRetention === "long" && compat.supportsLongCacheRetention))
             ? clampOpenAIPromptCacheKey(options?.sessionId)
             : undefined,
         prompt_cache_retention: cacheRetention === "long" && compat.supportsLongCacheRetention ? "24h" : undefined,
@@ -426,7 +442,7 @@ function buildParams(model, context, options, compat = getCompat(model), cacheRe
         params.temperature = options.temperature;
     }
     if (context.tools && context.tools.length > 0) {
-        params.tools = convertTools(context.tools, compat);
+        params.tools = convertTools(context.tools, compat, isMistralApiModel(model));
         if (compat.zaiToolStream) {
             params.tool_stream = true;
         }
@@ -597,7 +613,7 @@ function addCacheControlToTextContent(message, cacheControl) {
     }
     return false;
 }
-export function convertMessages(model, context, compat) {
+export function convertMessages(model, context, compat = getCompat(model)) {
     const params = [];
     const normalizeToolCallId = (id) => {
         // Handle pipe-separated IDs from OpenAI Responses API
@@ -822,17 +838,23 @@ export function convertMessages(model, context, compat) {
     }
     return params;
 }
-function convertTools(tools, compat) {
+function convertTools(tools, compat, stripSchemaMetadata) {
     return tools.map((tool) => ({
         type: "function",
         function: {
             name: tool.name,
             description: tool.description,
-            parameters: tool.parameters, // TypeBox already generates JSON Schema
+            parameters: stripSchemaMetadata
+                ? stripToolSchemaMetadata(tool.parameters)
+                : tool.parameters, // TypeBox already generates JSON Schema
             // Only include strict if provider supports it. Some reject unknown fields.
             ...(compat.supportsStrictMode !== false && { strict: false }),
         },
     }));
+}
+function stripToolSchemaMetadata(parameters) {
+    const { $schema: _schema, $id: _id, ...withoutMetadata } = parameters;
+    return withoutMetadata;
 }
 function parseChunkUsage(rawUsage, model) {
     const promptTokens = rawUsage.prompt_tokens || 0;
@@ -901,7 +923,7 @@ function detectCompat(model) {
     const isDashScope = /^https?:\/\/(?:dashscope(?:-intl|-us)?|(?:coding(?:-intl)?|cn-hongkong)\.dashscope)\.aliyuncs\.com(?::\d+)?(?:\/|$)/i.test(baseUrl) ||
         /^https?:\/\/[a-z0-9-]+\.(?:cn-beijing|cn-hongkong|ap-southeast-1|ap-northeast-1|eu-central-1|us-east-1)\.maas\.aliyuncs\.com(?::\d+)?(?:\/|$)/i.test(baseUrl);
     const isSiliconFlow = /^https?:\/\/api\.siliconflow\.(?:cn|com)(?::\d+)?(?:\/|$)/i.test(baseUrl);
-    const isMistralApi = /^https?:\/\/api\.mistral\.ai(?::\d+)?(?:\/|$)/i.test(baseUrl);
+    const isMistralApi = isMistralApiModel(model);
     const isOpenRouter = provider === "openrouter" || baseUrl.includes("openrouter.ai");
     const isCloudflareWorkersAI = provider === "cloudflare-workers-ai" || baseUrl.includes("api.cloudflare.com");
     const isCloudflareAiGateway = provider === "cloudflare-ai-gateway" || baseUrl.includes("gateway.ai.cloudflare.com");
@@ -917,12 +939,19 @@ function detectCompat(model) {
         baseUrl.includes("deepseek.com") ||
         isZai ||
         isMoonshot ||
+        isMistralApi ||
         provider === "opencode" ||
         baseUrl.includes("opencode.ai") ||
         isCloudflareWorkersAI ||
         isCloudflareAiGateway ||
         isAntLing;
-    const useMaxTokens = baseUrl.includes("chutes.ai") || isMoonshot || isCloudflareAiGateway || isTogether || isNvidia || isAntLing;
+    const useMaxTokens = baseUrl.includes("chutes.ai") ||
+        isMoonshot ||
+        isCloudflareAiGateway ||
+        isTogether ||
+        isNvidia ||
+        isAntLing ||
+        isMistralApi;
     const isGrok = provider === "xai" || baseUrl.includes("api.x.ai");
     const isDeepSeek = provider === "deepseek" || baseUrl.includes("deepseek.com");
     const isOpenRouterDeveloperRoleModel = isOpenRouter && (model.id.startsWith("anthropic/") || model.id.startsWith("openai/"));
@@ -934,8 +963,10 @@ function detectCompat(model) {
             !isSiliconFlow &&
             !isMistralApi &&
             (isOpenRouterDeveloperRoleModel || (!isNonStandard && !isOpenRouter)),
-        supportsReasoningEffort: !isGrok && !isZai && !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia && !isAntLing,
-        supportsUsageInStreaming: true,
+        // Mistral's reasoning_effort and tool-schema metadata support are inferred from
+        // compatibility paths; no real 422 response body has confirmed these fields yet.
+        supportsReasoningEffort: !isGrok && !isZai && !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia && !isAntLing && !isMistralApi,
+        supportsUsageInStreaming: !isMistralApi,
         maxTokensField: useMaxTokens ? "max_tokens" : "max_completion_tokens",
         requiresToolResultName: false,
         requiresAssistantAfterToolResult: false,
@@ -955,14 +986,15 @@ function detectCompat(model) {
         openRouterRouting: {},
         vercelGatewayRouting: {},
         zaiToolStream: false,
-        supportsStrictMode: !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia,
+        supportsStrictMode: !isMoonshot && !isTogether && !isCloudflareAiGateway && !isNvidia && !isMistralApi,
         cacheControlFormat,
         sendSessionAffinityHeaders: false,
         supportsLongCacheRetention: !(isTogether ||
             isCloudflareWorkersAI ||
             isCloudflareAiGateway ||
             isNvidia ||
-            isAntLing),
+            isAntLing ||
+            isMistralApi),
     };
 }
 /**

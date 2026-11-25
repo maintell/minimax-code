@@ -7,9 +7,9 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { isRmCommand, parseScriptPlainCommands, unwrapBashCommandWrappers, } from '@mavis/permission';
 import { readPermissionCommand, } from '../checker-input.js';
-import { gitBashPathSafetyReason } from '../git-bash-path-safety.js';
+import { evaluateGitBashPathSafety, } from '../git-bash/git-bash-path-safety.js';
 import { expandWindowsCommandSurfaces, expandWindowsCommandSurfacesWithShell, normalizeWindowsProgramName, tokenizeWindowsCommand, } from './command-surfaces.js';
-import { isNativeDeleteSurface, isRecursiveWindowsWriteCommand, isWindowsCopyOption, isWindowsWriteOrDeleteCommand, parseWindowsDeleteTargets, readWindowsPathSafetyTargets, readWindowsWriteTargets, resolveWindowsTargets, } from './write-targets.js';
+import { isNativeDeleteSurface, isPowerShellCopyOrMoveItem, isRecursiveWindowsWriteCommand, isSingleFileMove, isWindowsCopyOption, isWindowsWriteOrDeleteCommand, parseWindowsDeleteTargets, readPowerShellPathVariables, readWindowsPathSafetyTargets, readWindowsWriteTargets, resolveWindowsTargets, } from './write-targets.js';
 import { isNativeHomeReference, isNativeProtectedReference, readNativeDeleteOperands, } from './native-delete-operands.js';
 const READ_ONLY_TOOLS = new Set(['read', 'glob', 'grep', 'list']);
 const HOME_DELETE_REASON = 'Refused: recursive deletion targets a root or home directory. This can cause unrecoverable data loss; choose a specific sub-path instead.';
@@ -115,22 +115,23 @@ function findDriveRelativeWindowsPath(value) {
     const match = /(?:^|[\s"';&|<>])([A-Za-z]:(?![\\/])[^\s"';&|<>]*)/.exec(value);
     return match?.[1];
 }
-function buildWindowsPathSafetyDenyReason(input) {
+function hardFinding(reason) {
+    return reason ? { reason, denyKind: 'bypass-immune' } : undefined;
+}
+function buildWindowsPathSafetyFinding(input) {
     if (isOutsideWindowsPathPolicy(input))
         return undefined;
     const rawCommand = readPermissionCommand(input.input);
     if (input.trustedShellFamily === 'posix' && rawCommand) {
-        return buildGitBashPathSafetyDenyReason(input, rawCommand);
+        return buildGitBashPathSafetyFinding(input, rawCommand);
     }
     const scan = collectWindowsPathSafetyScan(input);
     const nativeDeleteReason = checkNativeDeleteTargets(input, scan.nativeDeleteSurfaces);
     if (nativeDeleteReason)
-        return nativeDeleteReason;
+        return hardFinding(nativeDeleteReason);
     if (hasNoWindowsWrite(scan))
         return undefined;
-    return (checkScriptContext(input, scan) ??
-        checkWindowsPathSpellings(input.toolName, scan) ??
-        checkResolvedWindowsPaths(input, scan));
+    return (hardFinding(checkScriptContext(input, scan) ?? checkWindowsPathSpellings(input.toolName, scan)) ?? checkResolvedWindowsPaths(input, scan));
 }
 function isOutsideWindowsPathPolicy(input) {
     return (input.platform ?? process.platform) !== 'win32' || READ_ONLY_TOOLS.has(input.toolName);
@@ -146,27 +147,29 @@ function hasNoWindowsWrite(scan) {
  * trustedShellFamily is only set from the session snapshot / resolver path,
  * never from tool input, OS detection or fresh preference reads.
  */
-function buildGitBashPathSafetyDenyReason(input, rawCommand) {
+function buildGitBashPathSafetyFinding(input, rawCommand) {
     const checkNative = (surface, nesting, uncertainCwd) => {
         // Only the native invocation belongs to the Windows parser. Re-tokenizing
         // the surrounding Bash script would discard /c/... operands as switches.
-        const nativeReason = buildWindowsPathSafetyDenyReason({
+        const native = buildWindowsPathSafetyFinding({
             ...input,
             input: { ...input.input, command: surface },
             trustedShellFamily: undefined,
             uncertainWorkingDirectory: uncertainCwd,
         });
-        if (nativeReason)
-            return nativeReason;
-        return findNestedGitBashReason(surface, {
+        if (native?.denyKind === 'bypass-immune')
+            return native;
+        return (findNestedGitBashFinding(surface, {
             workspaceDir: input.workspaceDir,
+            additionalWorkspaceDirs: input.additionalWorkspaceDirs,
             nesting,
             checkNative,
             uncertainCwd,
             nativeDelete: input.nativeDelete === true,
-        });
+        }) ?? native);
     };
-    const reason = gitBashPathSafetyReason(rawCommand, input.workspaceDir, undefined, {
+    const finding = evaluateGitBashPathSafety(rawCommand, input.workspaceDir, undefined, {
+        additionalWorkspaceDirs: input.additionalWorkspaceDirs,
         nesting: 0,
         checkNative,
         nativeDelete: input.nativeDelete === true,
@@ -174,22 +177,38 @@ function buildGitBashPathSafetyDenyReason(input, rawCommand) {
     // This parser owns the complete Bash script, including redirects and native
     // wrapper callbacks. Re-parsing that script as Windows argv would discard
     // MSYS operands and reject safe mixed-shell commands.
-    return reason ? `Local hard safety policy blocked ${input.toolName}: ${reason}` : undefined;
+    if (!finding)
+        return undefined;
+    if (finding.denyKind === 'policy') {
+        return finding.reason.startsWith('Local ')
+            ? finding
+            : {
+                ...finding,
+                reason: `Local permission check requires approval for ${input.toolName}: ${finding.reason}`,
+            };
+    }
+    return {
+        ...finding,
+        reason: `Local hard safety policy blocked ${input.toolName}: ${finding.reason}`,
+    };
 }
-function findNestedGitBashReason(surface, context) {
+function findNestedGitBashFinding(surface, context) {
+    let confirmable;
     for (const nested of expandWindowsCommandSurfaces(surface)) {
         if (unwrapBashCommandWrappers(nested).length <= 1)
             continue;
-        const reason = gitBashPathSafetyReason(nested, context.workspaceDir, undefined, {
+        const finding = evaluateGitBashPathSafety(nested, context.workspaceDir, undefined, {
+            additionalWorkspaceDirs: context.additionalWorkspaceDirs,
             nesting: context.nesting + 1,
             checkNative: context.checkNative,
             uncertainCwd: context.uncertainCwd,
             nativeDelete: context.nativeDelete,
         });
-        if (reason)
-            return reason;
+        if (finding?.denyKind === 'bypass-immune')
+            return finding;
+        confirmable ??= finding;
     }
-    return undefined;
+    return confirmable;
 }
 function collectWindowsPathSafetyScan(input) {
     const command = readPermissionCommand(input.input);
@@ -215,6 +234,8 @@ function collectWindowsPathSafetyScan(input) {
     const values = command
         ? [...writeSurfaces.flatMap(readSurfacePathValues), ...redirectionTargets]
         : directPathValues(directPath);
+    const recursiveSurfaces = writeSurfaces.filter((surface) => isRecursiveWindowsWriteCommand(surface.command, surface.shellFamily));
+    const singleFileMoves = recursiveSurfaces.filter((surface) => isSingleFileMove(surface, input.workspaceDir));
     return {
         ...(command ? { command } : {}),
         ...(typeof directPath === 'string' ? { directPath } : {}),
@@ -223,8 +244,17 @@ function collectWindowsPathSafetyScan(input) {
         writeSurfaces,
         redirectionTargets,
         values,
-        recursiveSurfaces: writeSurfaces.filter((surface) => isRecursiveWindowsWriteCommand(surface.command, surface.shellFamily)),
+        recursiveSurfaces: recursiveSurfaces.filter((surface) => !singleFileMoves.includes(surface)),
+        singleFileMoves,
+        pathVariables: command ? readPowerShellPathVariables(command) : undefined,
     };
+}
+/** Only PowerShell expands `$env:` and `~`; other shells keep them dynamic. */
+function surfacePathVariables(scan, surface) {
+    return surface.shellFamily === 'powershell' ? scan.pathVariables : undefined;
+}
+function surfaceWorkspace(surface, workspaceDir) {
+    return surface.cwdChanged ? undefined : workspaceDir;
 }
 function readSurfacePathValues(surface) {
     return (readWindowsPathSafetyTargets(surface.command, surface.shellFamily, surface.recoverableRm) ?? [
@@ -263,53 +293,76 @@ function hasDynamicPosixWrite(command, writeSurfaces) {
         writeSurfaces.some((surface) => surface.shellFamily === 'posix' && !surface.recoverableRm && isRmCommand(surface.command)));
 }
 function checkResolvedWindowsPaths(input, scan) {
-    const native = collectNativeDeleteTargets(input, scan.writeSurfaces);
+    const native = collectNativeDeleteTargets(input, scan);
     if (native.reason)
-        return native.reason;
+        return hardFinding(native.reason);
     const cwdReason = checkCwdChangedTargets(input.toolName, scan);
     if (cwdReason)
-        return cwdReason;
-    const targets = [...collectWindowsAbsoluteTargets(scan.values), ...native.targets];
+        return hardFinding(cwdReason);
+    const targets = [
+        ...collectWindowsAbsoluteTargets(scan.values),
+        ...native.targets,
+        ...resolveSingleFileMoveTargets(input.workspaceDir, scan),
+    ];
     if (scan.recursiveSurfaces.length === 0) {
-        return checkProtectedWindowsTargets(input.toolName, targets);
+        return (hardFinding(checkProtectedWindowsTargets(input.toolName, targets)) ??
+            findUnverifiableSingleFileMove(input, scan));
     }
     const workspaceDir = input.workspaceDir;
     if (!workspaceDir) {
-        return `Local hard safety policy blocked ${input.toolName}: recursive write/delete target cannot be verified because the workspace is unavailable.`;
+        return hardFinding(`Local hard safety policy blocked ${input.toolName}: recursive write/delete target cannot be verified because the workspace is unavailable.`);
     }
-    const recursive = scan.recursiveSurfaces.map((surface) => resolveWindowsTargets(readWindowsWriteTargets(surface.command, surface.shellFamily, surface.recoverableRm), surface.cwdChanged ? undefined : workspaceDir));
+    const recursive = scan.recursiveSurfaces.map((surface) => ({
+        confirmable: isPowerShellCopyOrMoveItem(surface.command, surface.shellFamily),
+        ...resolveWindowsTargets(readWindowsWriteTargets(surface.command, surface.shellFamily, surface.recoverableRm), surfaceWorkspace(surface, workspaceDir), surfacePathVariables(scan, surface)),
+    }));
     const resolvedTargets = recursive.flatMap((result) => result.resolved);
-    return (checkProtectedWindowsTargets(input.toolName, [...targets, ...resolvedTargets]) ??
+    return (hardFinding(checkProtectedWindowsTargets(input.toolName, [...targets, ...resolvedTargets])) ??
         checkRecursiveWindowsTargets({
             toolName: input.toolName,
             workspaceDir,
-            resolvedTargets,
-            hasDynamicTarget: recursive.some((result) => result.hasDynamicTarget),
-        }));
+            additionalWorkspaceDirs: input.additionalWorkspaceDirs ?? [],
+            recursive,
+        }) ??
+        findUnverifiableSingleFileMove(input, scan));
+}
+/** A known file moved to an unresolvable destination confirms, like any unmapped write. */
+function findUnverifiableSingleFileMove(input, scan) {
+    const unverifiable = scan.singleFileMoves.some((surface) => resolveWindowsTargets(readWindowsPathSafetyTargets(surface.command, surface.shellFamily, surface.recoverableRm), surfaceWorkspace(surface, input.workspaceDir), surfacePathVariables(scan, surface)).hasDynamicTarget);
+    return unverifiable
+        ? {
+            reason: `Local permission check requires approval: ${input.toolName} move destination cannot be resolved.`,
+            denyKind: 'policy',
+        }
+        : undefined;
+}
+/** Sources and destinations of a demoted single-file move keep the protected-path check. */
+function resolveSingleFileMoveTargets(workspaceDir, scan) {
+    return scan.singleFileMoves.flatMap((surface) => resolveWindowsTargets(readWindowsPathSafetyTargets(surface.command, surface.shellFamily, surface.recoverableRm), surfaceWorkspace(surface, workspaceDir), surfacePathVariables(scan, surface)).resolved);
 }
 /**
  * Delete operands cannot fall back to copy's last positional destination:
  * a trailing option value (for example `-ErrorAction Stop`) is not a target.
  * Unknown syntax or shell must remain fail-closed even without -Recurse.
  */
-function collectNativeDeleteTargets(input, surfaces) {
+function collectNativeDeleteTargets(input, scan) {
     const targets = [];
-    for (const surface of surfaces) {
+    for (const surface of scan.writeSurfaces) {
         if (surface.recoverableRm || !isNativeDeleteSurface(surface))
             continue;
-        const resolved = resolveNativeDeleteSurface(input, surface);
+        const resolved = resolveNativeDeleteSurface(input, surface, surfacePathVariables(scan, surface));
         if (typeof resolved === 'string')
             return { reason: resolved, targets };
         targets.push(...resolved);
     }
     return { targets };
 }
-function resolveNativeDeleteSurface(input, surface) {
+function resolveNativeDeleteSurface(input, surface, pathVariables) {
     const nativeDelete = parseWindowsDeleteTargets(surface.command, surface.shellFamily);
     if (!nativeDelete) {
         return `Local hard safety policy blocked ${input.toolName}: native delete targets cannot be verified safely. Use literal targets with supported delete options.`;
     }
-    const resolved = resolveWindowsTargets(nativeDelete.targets, surface.cwdChanged ? undefined : input.workspaceDir);
+    const resolved = resolveWindowsTargets(nativeDelete.targets, surfaceWorkspace(surface, input.workspaceDir), pathVariables);
     if (resolved.hasDynamicTarget) {
         return `Local hard safety policy blocked ${input.toolName}: native delete targets cannot be verified safely because the workspace or command working directory is unavailable.`;
     }
@@ -321,9 +374,9 @@ function resolveNativeDeleteSurface(input, surface) {
 }
 function checkCwdChangedTargets(toolName, scan) {
     const unresolvedWrite = scan.writeSurfaces.some((surface) => surface.cwdChanged &&
-        resolveWindowsTargets(readWindowsPathSafetyTargets(surface.command, surface.shellFamily, surface.recoverableRm), undefined).hasDynamicTarget);
+        resolveWindowsTargets(readWindowsPathSafetyTargets(surface.command, surface.shellFamily, surface.recoverableRm), undefined, surfacePathVariables(scan, surface)).hasDynamicTarget);
     const unresolvedRedirect = scan.surfaces.some((surface) => surface.cwdChanged &&
-        resolveWindowsTargets(surface.redirectionTargets, undefined).hasDynamicTarget);
+        resolveWindowsTargets(surface.redirectionTargets, undefined, surfacePathVariables(scan, surface)).hasDynamicTarget);
     return unresolvedWrite || unresolvedRedirect
         ? `Local hard safety policy blocked ${toolName}: write/delete targets cannot be verified safely after a command working directory change.`
         : undefined;
@@ -345,18 +398,34 @@ function collectWindowsAbsoluteTargets(values) {
         .flatMap((value) => value.match(/(?:\\\\\?\\)?[A-Za-z]:[\\/][^\s"';&|<>]*/gi) ?? [])
         .map(canonicalizeWindowsAbsolutePath);
 }
+/**
+ * Unverifiable recursive targets and recursive deletes outside the workspace
+ * stay bypass-immune. A PowerShell copy/move that only lands outside the
+ * workspace (protected targets were already refused) needs confirmation.
+ */
 function checkRecursiveWindowsTargets(input) {
-    const { workspaceDir, resolvedTargets, hasDynamicTarget } = input;
-    if (hasDynamicTarget) {
-        return `Local hard safety policy blocked ${input.toolName}: recursive write/delete target cannot be verified inside the workspace "${workspaceDir}".`;
+    const { toolName, workspaceDir, additionalWorkspaceDirs, recursive } = input;
+    if (recursive.some((result) => result.hasDynamicTarget)) {
+        return hardFinding(`Local hard safety policy blocked ${toolName}: recursive write/delete target cannot be verified inside the workspace "${workspaceDir}".`);
     }
-    const workspace = normalizeWindowsPath(workspaceDir);
-    const outside = resolvedTargets.find((target) => {
+    const workspaces = [workspaceDir, ...additionalWorkspaceDirs].map(normalizeWindowsPath);
+    const findOutside = (confirmable) => recursive
+        .filter((result) => result.confirmable === confirmable)
+        .flatMap((result) => result.resolved)
+        .find((target) => {
         const normalized = normalizeWindowsPath(target);
-        return normalized !== workspace && !normalized.startsWith(`${workspace}/`);
+        return !workspaces.some((workspace) => normalized === workspace || normalized.startsWith(`${workspace}/`));
     });
-    return outside
-        ? `Local hard safety policy blocked ${input.toolName}: recursive write/delete target "${outside.trim()}" is outside the workspace "${workspaceDir}".`
+    const outside = findOutside(false);
+    if (outside) {
+        return hardFinding(`Local hard safety policy blocked ${toolName}: recursive write/delete target "${outside.trim()}" is outside the workspace "${workspaceDir}".`);
+    }
+    const confirmable = findOutside(true);
+    return confirmable
+        ? {
+            reason: `Local permission check requires approval: ${toolName} recursive copy/move target "${confirmable.trim()}" is outside the workspace "${workspaceDir}".`,
+            denyKind: 'policy',
+        }
         : undefined;
 }
 function checkProtectedWindowsTargets(toolName, targets) {
@@ -439,7 +508,7 @@ function canonicalizeWindowsAbsolutePath(value) {
     return path.win32.isAbsolute(unquoted) ? path.win32.normalize(unquoted) : unquoted;
 }
 export function evaluateWindowsPathSafetyCheck(input) {
-    const reason = buildWindowsPathSafetyDenyReason(input);
-    return reason ? { behavior: 'deny', reason, denyKind: 'bypass-immune' } : undefined;
+    const finding = buildWindowsPathSafetyFinding(input);
+    return finding ? { behavior: 'deny', ...finding } : undefined;
 }
 //# sourceMappingURL=path-safety.js.map

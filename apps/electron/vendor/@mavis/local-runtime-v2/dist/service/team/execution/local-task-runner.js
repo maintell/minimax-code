@@ -43,6 +43,7 @@ export async function runForegroundLocalTask(input) {
             status: 'failed',
             requestedAgentName: target.requestedName,
             resolvedAgentName: target.resolvedAgentName,
+            ...(target.agentDisplayName ? { agentDisplayName: target.agentDisplayName } : {}),
             ...precheckFailure,
         };
     }
@@ -71,7 +72,7 @@ async function executeForegroundLocalTask(input, taskInput, conversation, target
             metadata: { childSessionId: childSession.sessionId, subTurnId: turnId, agentName },
         });
         await prepareForegroundChild(input, childSession.sessionId, turnId);
-        notifyChildStarted(input, childSession.sessionId, turnId);
+        notifyChildStarted(input, childSession.sessionId, turnId, target.agentDisplayName);
         const pluginStartContext = await input.toolCtx.pluginSubagentLifecycle?.start({
             childSessionId: childSession.sessionId,
             childTurnId: turnId,
@@ -98,7 +99,11 @@ async function executeForegroundLocalTask(input, taskInput, conversation, target
         await finalizeForegroundTask(input.host, taskId, result, turnId);
         if (result.status !== 'succeeded')
             cancelChild(input, childSession.sessionId);
-        return { ...result, taskId };
+        return {
+            ...result,
+            taskId,
+            ...(target.agentDisplayName ? { agentDisplayName: target.agentDisplayName } : {}),
+        };
     }
     catch (error) {
         cancelChild(input, childSession?.sessionId);
@@ -161,15 +166,20 @@ function buildForegroundFailure(input) {
         status: 'failed',
         requestedAgentName: target.requestedName,
         resolvedAgentName: target.resolvedAgentName,
+        ...(target.agentDisplayName ? { agentDisplayName: target.agentDisplayName } : {}),
         ...(childSession ? { subSessionId: childSession.sessionId } : {}),
         subTurnId: turnId,
         ...localTaskAdmissionFailure(error, occupancy),
         taskId,
     };
 }
-function notifyChildStarted(input, subSessionId, subTurnId) {
+function notifyChildStarted(input, subSessionId, subTurnId, agentDisplayName) {
     try {
-        input.onChildStarted?.({ subSessionId, subTurnId });
+        input.onChildStarted?.({
+            subSessionId,
+            subTurnId,
+            ...(agentDisplayName ? { agentDisplayName } : {}),
+        });
     }
     catch {
         // Diagnostic observation must never change task execution.

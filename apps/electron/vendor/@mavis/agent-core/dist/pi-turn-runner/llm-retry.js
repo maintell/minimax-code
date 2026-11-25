@@ -1,10 +1,11 @@
 import { createAssistantMessageEventStream, isContextOverflow, } from '@earendil-works/pi-ai';
-import { isLLMDeterministicRequestRejection, isLLMDeterministicStreamRefusal, isLLMRecoverableStreamInterruption, normalizeLLMError, toLLMMetricErrorKind, toLLMProtocolClassification, toLLMRetryDecision, } from '@mavis/shared/llm-error-classifier';
+import { isLLMDeterministicRequestRejection, isLLMDeterministicStreamRefusal, isLLMRecoverableStreamInterruption, normalizeLLMError, toLLMMetricErrorKind, toLLMRetryDecision, } from '@mavis/shared/llm-error-classifier';
+import { parseContentReviewError } from './content-review.js';
 import { LLM_PARTIAL_STREAM_RESET } from '../protocol/stream-reset.js';
 import { runWithLLMCallLifecycle, } from './llm-call-lifecycle.js';
 import { LLMReplyLoopGuard, llmReplyLoopMessage, } from './llm-reply-loop-guard.js';
 import { withLLMStreamFailure } from './llm-stream-failure.js';
-import { abortError, abortableSleep, asError, callSettledEvent, captureProviderError, classifyCallOutcome, commitsOutput, createRetryBudget, createSystemWakeLatch, defaultCallId, isDeviceOffline, isEmptyReply, isFailureMessage, parseRetryAfterMs, readProviderUsage, releaseIterator, replayStream, retryDelayMs, retryPolicyForReason, retryTimeout, signalAborted, sleepUntilResume, throwingReplayStream, refusalWaitFields, } from './llm-retry-support.js';
+import { abortError, abortableSleep, asError, callSettledEvent, captureProviderError, classifyCallOutcome, commitsOutput, createRetryBudget, createSystemWakeLatch, defaultCallId, isDeviceOffline, isEmptyReply, isFailureMessage, parseRetryAfterMs, PUBLIC_ERROR_MESSAGES, publicRetryError, readProviderUsage, releaseIterator, replayStream, retryDelayMs, retryPolicyForReason, retryTimeout, signalAborted, sleepUntilResume, throwingReplayStream, refusalWaitFields, } from './llm-retry-support.js';
 function isByokProvider(provider) {
     return provider === 'minimax_api' || provider.startsWith('custom_provider:');
 }
@@ -78,24 +79,6 @@ export class LLMRequestStoppedError extends Error {
 export function isLLMRequestStoppedMessage(message) {
     return message?.startsWith(LLM_REQUEST_STOPPED_MESSAGE_PREFIX) === true;
 }
-const PUBLIC_ERROR_MESSAGES = {
-    abort: 'LLM request was cancelled',
-    timeout: 'LLM request timed out',
-    rate_limited: 'LLM provider rate limited the request',
-    tpm_rate_limited: 'LLM provider token rate limit reached',
-    usage_limit: 'LLM usage limit reached',
-    credits_exhausted: 'LLM credits exhausted',
-    auth: 'LLM provider authentication failed',
-    bad_request: 'LLM provider rejected the request',
-    not_found: 'LLM provider resource not found',
-    content_filter: 'LLM provider blocked the response',
-    server_error: 'LLM provider request failed',
-    overloaded: 'LLM provider is overloaded',
-    network: 'LLM network connection failed',
-    empty_response: 'LLM provider returned an empty response',
-    unknown: 'LLM request failed',
-    length: 'LLM response reached the length limit',
-};
 /** Add framework-owned transport retry to a provider StreamFn. Hosts opt in explicitly. */
 export function withLLMRetry(inner, input) {
     return (async (model, context, options) => {
@@ -559,6 +542,10 @@ function projectAdmittedContext(context, admission) {
  * proposal is made; the request is still settled with the provider's answer.
  */
 function withoutToolIntents(final) {
+    // 失败的消息原样返回：agent loop 不会执行它的工具调用；复制一份还会丢掉网关打回（content_error）
+    // 按对象登记的结构化信息，runner 就认不出来了。
+    if (final.stopReason === 'error')
+        return final;
     if (!final.content.some((block) => block.type === 'toolCall'))
         return final;
     return {
@@ -1535,6 +1522,10 @@ function failureResult(input) {
     // the whole backoff window. The deterministic check excludes anything that
     // also looks transient (timeout, network, 408/429/5xx). A context overflow,
     // by tokens or by request bytes, is left to context management as in Pi.
+    // 网关 content_error 是确定的审核结论，重发同一请求只会重复结论、重复计费；
+    // 要不要带引导词重发由 runner 按 action 决定，这里一律不重试（BYOK 也一样）。
+    const contentReviewed = parseContentReviewError(input.final) !== undefined ||
+        parseContentReviewError(input.thrown) !== undefined;
     // Retrying everything changes only whether to retry: the reason stays the
     // error's own classification (429 is rate_limited, 529 overloaded, a 5xx
     // server_error), so metrics and the public error do not read every BYOK
@@ -1548,20 +1539,22 @@ function failureResult(input) {
             classifiedDecision.reason === 'usage_limit' ||
             classifiedDecision.reason === 'credits_exhausted' ||
             classifiedDecision.reason === 'content_filter');
-    const decision = input.retryAllErrors &&
-        !classifiedDecision.retryable &&
-        !terminalDecision &&
-        !isLLMDeterministicRequestRejection(normalized) &&
-        !(input.final && isContextOverflow(input.final))
-        ? { retryable: true, reason: classifiedDecision.reason }
-        : // Opt-in hosts also resend a recognised transient stream interruption
-            // that happened before any output reached the consumer. Nothing was
-            // rendered, so this needs no reset frame.
-            input.recoverStreamInterruptions && isLLMRecoverableStreamInterruption(normalized)
-                ? { retryable: true, reason: 'network' }
-                : input.vetoDeterministicRejections && isLLMDeterministicStreamRefusal(normalized)
-                    ? { retryable: false, reason: toLLMMetricErrorKind(normalized.facts) }
-                    : classifiedDecision;
+    const decision = contentReviewed
+        ? { retryable: false, reason: toLLMMetricErrorKind(normalized.facts) }
+        : input.retryAllErrors &&
+            !classifiedDecision.retryable &&
+            !terminalDecision &&
+            !isLLMDeterministicRequestRejection(normalized) &&
+            !(input.final && isContextOverflow(input.final))
+            ? { retryable: true, reason: classifiedDecision.reason }
+            : // Opt-in hosts also resend a recognised transient stream interruption
+                // that happened before any output reached the consumer. Nothing was
+                // rendered, so this needs no reset frame.
+                input.recoverStreamInterruptions && isLLMRecoverableStreamInterruption(normalized)
+                    ? { retryable: true, reason: 'network' }
+                    : input.vetoDeterministicRejections && isLLMDeterministicStreamRefusal(normalized)
+                        ? { retryable: false, reason: toLLMMetricErrorKind(normalized.facts) }
+                        : classifiedDecision;
     if (!decision.retryable) {
         return {
             kind: 'terminal',
@@ -1695,14 +1688,6 @@ function resolveReplyGuardPolicy(policy) {
         holdReasoningMaxChars: count(merged.holdReasoningMaxChars, d.holdReasoningMaxChars),
         loopGuard: merged.loopGuard !== false,
         loopRetries: count(merged.loopRetries, d.loopRetries),
-    };
-}
-function publicRetryError(normalized, reason) {
-    const protocol = toLLMProtocolClassification(normalized);
-    return {
-        reason,
-        ...(protocol ? { code: protocol.code } : {}),
-        message: PUBLIC_ERROR_MESSAGES[reason],
     };
 }
 async function notify(observer, event) {

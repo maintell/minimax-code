@@ -8,6 +8,6 @@ export { startQuestionnaireRecovery } from './recovery/recovery.js';
 export { copyPendingQuestionnaireForFork } from './orchestration/fork.js';
 export { classifyQuestionnaireReplyError } from './lifecycle/reply-outcome.js';
 export { OwnedActionDeferredError } from './lifecycle/owned-action-deferral.js';
-export { buildLocalAskUserAdapter } from './ask-user.adapter.js';
+export { createLocalUserQuestionHost } from './ask-user.adapter.js';
 export { createAgentQuestionnaires } from './agent-questionnaires.js';
 //# sourceMappingURL=index.js.map

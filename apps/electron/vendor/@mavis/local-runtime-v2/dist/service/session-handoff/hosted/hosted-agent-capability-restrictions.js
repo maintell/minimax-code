@@ -15,9 +15,12 @@ function applyHostedCapabilityRestrictions(capabilities, restrictions) {
     };
 }
 /**
- * The CLI ceiling turns `mavis` off, but a coordinator's space, context and
- * project commands live there. Its own tool sources keep the tool; the final
- * catalog still admits only `mavis` and the Cron refusals for it.
+ * The CLI ceiling turns `mavis` off, but a coordinator still works through it:
+ * the shared session and agent reads it checks a task with are the migrated
+ * mavis tools behind their Skill. Its own space and task model operations are
+ * top-level tools of their own (`space_*`, `task_model_*`) and do not depend on
+ * this feature. Keeping it on keeps that shared vocabulary; the final catalog
+ * still admits only what the coordinator's authority allows.
  */
 export function resolveHostedToolCapabilities(capabilities, restrictions, coordination) {
     if (restrictions.disableMavis !== true || !isCoordinatorAgent(coordination)) {

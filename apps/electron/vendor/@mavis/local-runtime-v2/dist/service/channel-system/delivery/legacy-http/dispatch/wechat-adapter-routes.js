@@ -9,7 +9,8 @@
  * resolves attachments via the adapter's `downloadAttachmentToLocal`,
  * matching the multimodal coverage of the legacy `wechat.handleEvent` path.
  */
-import { json, readFirstString, readJsonBody } from '../http-helpers.js';
+import { json, readFirstString } from '../http-helpers.js';
+import { parseIlinkJson } from '../../../transport/wechat/sdk/ilink-wire.js';
 import { wechatClientId } from '../../../transport/wechat/wechat-store.js';
 const ADAPTER_UNAVAILABLE = {
     status: 503,
@@ -24,7 +25,7 @@ export async function dispatchWeChatAdapterRoute(input) {
     const { method, path, request, registry, dispatcher } = input;
     const defaultAgentName = dispatcher?.defaultAgentName ?? 'mavis';
     if (method === 'POST' && path === 'wechat/inbound') {
-        const body = await readJsonBody(request);
+        const body = await readLosslessInboundBody(request);
         const agentName = readFirstString(body, ['agentName', 'agentId', 'agent']) ?? defaultAgentName;
         const adapter = registry.get('wechat', wechatClientId(agentName));
         if (!adapter)
@@ -53,6 +54,23 @@ export async function dispatchWeChatAdapterRoute(input) {
         return json({ ok: true, envelope, localRuntime: true });
     }
     return undefined;
+}
+/**
+ * Read the inbound body with 64-bit ids preserved. WeChat `message_id` is a
+ * uint64 that `request.json()` would round to the nearest double, silently
+ * corrupting the id every later dedupe / correlation step keys on. Malformed
+ * input degrades to `{}`, exactly like the shared `readJsonBody`.
+ */
+async function readLosslessInboundBody(request) {
+    try {
+        const data = parseIlinkJson(await request.text());
+        return data && typeof data === 'object' && !Array.isArray(data)
+            ? data
+            : {};
+    }
+    catch {
+        return {};
+    }
 }
 async function downloadAttachmentsForUnifiedInbound(adapter, envelope) {
     const refs = envelope.attachmentRefs ?? [];

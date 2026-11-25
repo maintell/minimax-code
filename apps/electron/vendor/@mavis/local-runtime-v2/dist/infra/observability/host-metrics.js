@@ -108,11 +108,14 @@ const HISTOGRAM_BUCKETS_BY_NAME = {
  */
 export function buildLocalRuntimeMetricsClient(options) {
     const managed = isManagedRuntime();
-    const reporter = options.metricsReporter ?? buildManagedReporter(managed);
+    const uploadsEnabled = options.diagnosticUploadsEnabled !== false;
+    const reporter = uploadsEnabled
+        ? (options.metricsReporter ?? buildManagedReporter(managed))
+        : undefined;
     const onError = (err) => {
         logger.warn({ reason: 'metrics_report_failed', err: serializeMetricsError(err) }, 'Local runtime metrics reporter failed');
     };
-    if (!managed && !options.metricsReporter) {
+    if (uploadsEnabled && !managed && !options.metricsReporter) {
         logger.info({ reason: 'unmanaged_runtime' }, 'Local runtime metrics reporter disabled');
     }
     return createLocalRuntimeMetricsClient({

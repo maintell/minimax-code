@@ -15,12 +15,37 @@ export function parsePluginsConfig(raw) {
     }
     const names = new Set();
     for (const [index, name] of forbidden.entries()) {
-        if (typeof name !== 'string' || name.trim() === '') {
+        if (!isPluginNameEntry(name)) {
             throw new Error(`Invalid plugins.forbidden[${index}]: expected a non-empty plugin name string.`);
         }
-        names.add(name.trim().normalize('NFKC').toLocaleLowerCase('en-US'));
+        names.add(normalizePluginName(name));
     }
     return { forbidden: [...names] };
+}
+/** What counts as one plugins.forbidden entry; the parser and the fail-closed path share it. */
+function isPluginNameEntry(value) {
+    return typeof value === 'string' && value.trim() !== '';
+}
+/**
+ * How plugin names compare against plugins.forbidden: trimmed, NFKC, lowercased.
+ * Every place that enforces the deny-list uses this, so it cannot drift from
+ * what the list stores.
+ */
+export function normalizePluginName(name) {
+    return name.trim().normalize('NFKC').toLocaleLowerCase('en-US');
+}
+/**
+ * The plugins.forbidden names that are still readable in an invalid plugins
+ * section. Failing closed keeps them: dropping the list would load official
+ * plugins the user turned off.
+ */
+export function readableForbiddenPlugins(raw) {
+    const forbidden = raw != null && typeof raw === 'object' && !Array.isArray(raw)
+        ? raw.forbidden
+        : undefined;
+    if (!Array.isArray(forbidden))
+        return [];
+    return [...new Set(forbidden.filter(isPluginNameEntry).map(normalizePluginName))];
 }
 export function parseStartupRecoveryFault(raw) {
     if (!raw || typeof raw !== 'object')

@@ -11,6 +11,12 @@
 import { wrapSystemReminder } from './initialize.js';
 import { ledgerLocalTime } from './state-block.js';
 // The first message (assignment/orchestration/assignment.service.ts).
+/**
+ * Below this many non-whitespace characters, finding the user's words inside the brief is
+ * coincidence rather than a quotation of them (a bare "好。" in prose, a test's "U"). Repeating
+ * such a phrase costs nothing, while dropping the block would cost the task its labelled copy.
+ */
+const MIN_QUOTED_USER_WORDS = 4;
 /** Bunny's instruction, the done-when criteria, then the user's own words quoted line by line. */
 export function renderTaskFirstMessage(input) {
     const quoted = input.userWords
@@ -21,7 +27,32 @@ export function renderTaskFirstMessage(input) {
     const doneWhen = input.criteria.length
         ? `\n\n完成标准：\n${input.criteria.map((item) => `- ${item}`).join('\n')}`
         : '';
-    return `${input.content}${doneWhen}\n\n用户原话：\n${quoted}`;
+    const brief = `${input.content}${doneWhen}`;
+    // The prompt tells Bunny the words are appended and must not be quoted again in `content`
+    // (<brief>), but a model that quotes them anyway used to hand the task the same sentence
+    // twice. They are already in the message, so the block is dropped rather than added again:
+    // the task reads the user's own words exactly once, whichever way Bunny wrote the brief.
+    return alreadyQuotes(brief, input.userWords) ? brief : `${brief}\n\n用户原话：\n${quoted}`;
+}
+/** Whether `text` already carries `userWords` in full, ignoring where the line breaks fall. */
+function alreadyQuotes(text, userWords) {
+    const needle = withoutWhitespace(userWords);
+    return needle.length >= MIN_QUOTED_USER_WORDS && withoutWhitespace(text).includes(needle);
+}
+function withoutWhitespace(value) {
+    return value.replace(/\s+/gu, '');
+}
+/**
+ * Appended to a queued task's first message when some of the files it was dispatched with can no
+ * longer be read by the time it starts (assignment/orchestration/assignment-queue.ts). Empty when
+ * every file is there, so the message is then exactly the one an immediate start sends.
+ */
+export function missingTaskAttachments(paths) {
+    if (!paths.length)
+        return '';
+    return `\n\n派出时附带的这些文件，在任务开始时已经读不到，没能附上：\n${paths
+        .map((path) => `- ${path}`)
+        .join('\n')}\n需要它们才能做的部分，在回复里写明缺了哪个文件。`;
 }
 // The execution reminder (assignment/execution-reminder.ts); every text comes escaped.
 const TASK_BRIEF_POINTER = '本任务的目标和用户的原话，都已逐字写在本会话的第一条消息里：需要哪一条就回看那条消息的原文，不要凭记忆改写或省略。';
@@ -36,12 +67,16 @@ export function renderExecutionReminder(reminder) {
     return wrapSystemReminder([
         '这是 Bunny 安排的任务。Bunny 是用户的协作管家，你的结果会自动送回给它核对。',
         '',
-        `任务空间：${reminder.spaceName}`,
+        ...(reminder.spaceName ? [`所属事项：${reminder.spaceName}`] : []),
         ...(reminder.overallGoal ? [`整体目标：${reminder.overallGoal}`] : []),
-        ...(reminder.conventions ? [`空间约定：${reminder.conventions}`] : []),
-        ...(reminder.excerpt ? ['', '空间现状（context.md 摘录）：', reminder.excerpt] : []),
+        ...(reminder.conventions ? [`事项约定：${reminder.conventions}`] : []),
+        ...(reminder.excerpt ? ['', '事项简报（context.md 摘录）：', reminder.excerpt] : []),
         ...(reminder.constraints.length ? ['', ...reminder.constraints] : []),
-        `空间目录：${reminder.spaceDir}。context.md 记录目标和现状，artifacts/ 放各任务的文件；context.md、meta.json 只读，由 Bunny 维护。`,
+        ...(reminder.spaceDir
+            ? [
+                `事项目录：${reminder.spaceDir}。context.md 记录目标和现状，artifacts/ 放各任务的文件；context.md、meta.json 只读，由 Bunny 维护。`,
+            ]
+            : []),
         '',
         TASK_BRIEF_POINTER,
         ...taskCriteriaBlock(reminder.criteria ?? []),
@@ -77,5 +112,5 @@ export const NESTED_TASK_REFUSAL = '任务会话不能再派任务：需要拆�
 /** A task tried to message Bunny's conversation (session-system/session-send/). */
 export const TASK_TO_COORDINATOR_REFUSAL = '任务会话不能给 Bunny 的对话发消息：这一轮结束后结果会自动回传给 Bunny，要交代的写进最终回复。';
 /** A task tried to write a space's own files (assignment/permission/protected-paths.ts). */
-export const PERMISSION_TASK_SPACE_FILES = '这里用不了：任务空间的 context.md、meta.json、data/ 和 .db/ 只由 Bunny 维护，任务里只能读。要记的决定或产出写在最后的回复里，Bunny 核对后会更新 context.md。';
+export const PERMISSION_TASK_SPACE_FILES = '这里用不了：事项的 context.md、meta.json、data/ 和 .db/ 只由 Bunny 维护，任务里只能读。要记的决定或产出写在最后的回复里，Bunny 核对后会更新 context.md。';
 //# sourceMappingURL=task-session.js.map

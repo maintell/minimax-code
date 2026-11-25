@@ -239,9 +239,10 @@ export function createWindowsAbePrivilegedOperations(options) {
             const session = await ensureSession(signal);
             return session.unwrapSystemLayer(abeBlob);
         },
-        cngDecrypt: async (block, signal) => {
+        cngDecrypt: async (block, keyName, signal) => {
             const session = await ensureSession(signal);
-            return session.cngDecrypt(block, options.cngKeyName ?? CHROME_CNG_KEY_NAME);
+            // `options.cngKeyName` 是显式覆盖，优先于按 Envelope 版本推断出来的密钥名。
+            return session.cngDecrypt(block, options.cngKeyName ?? keyName ?? CHROME_CNG_KEY_NAME);
         },
         createSnapshot: async (sourcePath, signal) => {
             const session = await ensureSession(signal);

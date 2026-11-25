@@ -114,6 +114,8 @@ function mapOptionalRunLocationView(value) {
         resolvedBranch: maybeString(obj.resolvedBranch ?? obj.resolved_branch),
         parentRepoDir: maybeString(obj.parentRepoDir ?? obj.parent_repo_dir),
         createdAt: maybeNumber(obj.createdAt ?? obj.created_at),
+        cleanedAt: maybeNumber(obj.cleanedAt ?? obj.cleaned_at),
+        restorable: maybeBoolean(obj.restorable),
     };
 }
 function mapOptionalModelInfoView(value) {

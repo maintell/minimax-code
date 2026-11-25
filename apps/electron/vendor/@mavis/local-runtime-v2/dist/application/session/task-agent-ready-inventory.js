@@ -1,3 +1,4 @@
+import { withUserQuestionTools, } from '../../service/turn-system/index.js';
 import { createDispatchModelLoginCheck } from './dispatch-model-login-check.js';
 import { createTaskAgentBindingCaptureCoordinator, } from './task-agent-binding-capture.js';
 /** Binds the ready-inventory Task capture after plugin and MCP owners exist. */
@@ -38,7 +39,7 @@ async function capture(input, session, profile) {
         const builtinCapabilities = input.product.capabilities
             ? await input.product.capabilities.resolve(profile.exactOwnerName)
             : undefined;
-        const sources = await input.product.toolSources.resolve({
+        const resolved = await input.product.toolSources.resolve({
             session,
             turnId,
             resourceAgentName: profile.resourceReadRef,
@@ -50,7 +51,9 @@ async function capture(input, session, profile) {
         });
         const runtimeSkills = await input.product.preparation.configBuilder.skills.listRuntimeSkills(skillReadScope(session, profile));
         return {
-            sources,
+            // The Turn builds ask_user/request_feature_enable from the question port
+            // the same way, so the captured ceiling names them.
+            sources: withUserQuestionTools(resolved),
             ...(lease.capabilities ? { desktopCapabilities: lease.capabilities } : {}),
             skills: runtimeSkills.skills.map((skill) => ({
                 name: skill.name,

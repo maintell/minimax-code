@@ -2,7 +2,6 @@ import { and, count, desc, eq, gt, inArray, isNull, lt, ne, notExists, exists, o
 import { messageRows, newerSessionAssets, sessionAssetIndexState, sessionAssets, } from '../../../../infra/db/schema/messages.js';
 import { sessions, sessionSideChats } from '../../../../infra/db/schema/sessions.js';
 import { assignedByBunnyCondition } from '../../assignment-tasks/repo/assigned-by-bunny.js';
-import { DEFAULT_SPACE_ID } from '../library/space-directory.js';
 export const ARTIFACT_EXTENSIONS = {
     document: ['md', 'txt', 'pdf', 'doc', 'docx', 'ppt', 'pptx', 'rtf'],
     webpage: ['html', 'htm'],
@@ -38,10 +37,13 @@ function linksJson(links) {
     return JSON.stringify(Object.fromEntries(links));
 }
 /** Session deliveries, the latest occurrence of each asset of each listed session. */
-function sessionDeliveries(db, { links, ...visibility }) {
-    // The library's own root chats are never linked to a space; their deliveries belong to the
-    // default space, where the coordinator also files the tasks it assigns without naming a space.
-    const linkedSpace = sql `coalesce((select value from json_each(${linksJson(links)}) where key = ${sessionAssets.sessionId}), case when ${and(libraryRootAgentCondition(visibility.rootAgents), eq(sessions.sessionType, 'root'), eq(sessions.runtime, 'pi-agent'))} then ${DEFAULT_SPACE_ID} end)`;
+function sessionDeliveries(db, { links, rootSpaceId, ...visibility }) {
+    const linked = sql `(select value from json_each(${linksJson(links)}) where key = ${sessionAssets.sessionId})`;
+    // The library's own root chats are never linked to a space: their deliveries go to
+    // `rootSpaceId` when there is one, else to none.
+    const linkedSpace = rootSpaceId === undefined
+        ? linked
+        : sql `coalesce(${linked}, case when ${and(libraryRootAgentCondition(visibility.rootAgents), eq(sessions.sessionType, 'root'), eq(sessions.runtime, 'pi-agent'))} then ${rootSpaceId} end)`;
     const source = db
         .select({
         assetKey: sessionAssets.assetKey,

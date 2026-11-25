@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, rename, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join } from 'node:path';
 import { LOCAL_MEMORY_TOPIC_NAME_RE, LocalMemoryError, } from './types.js';
-import { appendWithSeparator, applyEdit, assertDate, assertSafeAgentName, byteLength, deleteIfExists, firstLine, formatTs, formatTopic, parseTopic, safeRead, safeReaddir, searchLines, today, } from './local-memory-store-utils.js';
+import { appendWithSeparator, applyEdit, assertDate, assertSafeAgentName, byteLength, countMatchedTerms, deleteIfExists, firstLine, formatTs, formatTopic, parseSearchTerms, parseTopic, rankByScore, safeRead, safeReaddir, searchLines, today, } from './local-memory-store-utils.js';
 import { FsLocalMemoryTracking } from './local-memory-tracking.js';
 import { ensureEmptyMainFile, readMainFile } from './local-memory-main-file.js';
 const MAIN_MEMORY_FILE = 'MEMORY.md';
@@ -157,17 +157,19 @@ export class FsLocalMemoryStore {
         return deleteIfExists(filePath);
     }
     async searchTopics(target, keyword, limit = 10) {
-        const lower = keyword.toLowerCase();
+        const terms = parseSearchTerms(keyword);
         const topics = await this.listTopics(target);
-        const out = [];
+        if (terms.length === 0) {
+            return topics.slice(0, limit).map((topic) => ({ topic, matchedTerms: 0 }));
+        }
+        const matches = [];
         for (const topic of topics) {
             const body = (await this.readTopic(target, topic.name)).body;
-            if (topic.name.includes(lower) || body.toLowerCase().includes(lower))
-                out.push(topic);
-            if (out.length >= limit)
-                break;
+            const matchedTerms = countMatchedTerms(`${topic.name}\n${body}`, terms);
+            if (matchedTerms > 0)
+                matches.push({ topic, matchedTerms });
         }
-        return out;
+        return rankByScore(matches, ({ matchedTerms }) => matchedTerms).slice(0, limit);
     }
     async listDaily(target, limit = 20, offset = 0, includeArchived = false) {
         const location = this.requireAgentLocation(target);

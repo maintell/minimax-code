@@ -44,6 +44,7 @@ export class HostChannelRuntime {
                     sessionId: input.sessionId,
                     ...(input.workspaceDir !== undefined ? { workspaceDir: input.workspaceDir } : {}),
                     ...(input.error !== undefined ? { error: input.error } : {}),
+                    ...(input.replyScope !== undefined ? { replyScope: input.replyScope } : {}),
                 }),
             },
             typing: {

@@ -21,7 +21,16 @@ export function setupBrowserWebviewIPC() {
             browserGuestRegistry.nativeReady(event.sender, id, blocked);
     };
     ipcMain.on(WEBVIEW_HOST_CHANNELS.nativeReady, nativeReady);
+    const takeOver = (event, id) => {
+        if (!browserGuestRegistry.isTrusted(event))
+            return;
+        const guest = browserGuestRegistry.guestForView(event.sender, id);
+        if (guest)
+            getEmbeddedBrowserManager().takeOverWebviewGuest(guest);
+    };
+    ipcMain.on(WEBVIEW_HOST_CHANNELS.takeOver, takeOver);
     return () => {
+        ipcMain.removeListener(WEBVIEW_HOST_CHANNELS.takeOver, takeOver);
         ipcMain.removeHandler(WEBVIEW_HOST_CHANNELS.ready);
         ipcMain.removeListener(WEBVIEW_HOST_CHANNELS.applied, applied);
         ipcMain.removeListener(WEBVIEW_HOST_CHANNELS.nativeReady, nativeReady);

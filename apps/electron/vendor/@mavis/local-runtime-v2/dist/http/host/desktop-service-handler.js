@@ -1,4 +1,4 @@
-import { getRuntimeBuildEnv, getRuntimeRegion, isManagedRuntime, replaceLocalManagedMinimaxProvider, } from '@mavis/config';
+import { getRuntimeBuildEnv, getRuntimePresetKey, getRuntimeRegion, isManagedRuntime, replaceLocalManagedMinimaxProvider, } from '@mavis/config';
 import { DesktopService } from '../desktop/server.js';
 import { createDesktopServiceRequestHandler, } from '../desktop/routes.js';
 import { compareAndSetLocalModelContext, updateLocalByokConfig, } from '../../infra/config/update.js';
@@ -42,7 +42,11 @@ export function buildDesktopServiceHandler(host) {
                 }
             },
             writeProvider: async (provider) => {
-                await replaceLocalManagedMinimaxProvider(provider);
+                const { replacedDefaults } = await replaceLocalManagedMinimaxProvider(provider);
+                // The rewrite lands in the shared config; other processes reading it get no event.
+                for (const replaced of replacedDefaults) {
+                    logger.info({ ...replaced, preset: getRuntimePresetKey() }, 'official_model_default_replaced');
+                }
             },
             nowMs: host.nowMs,
             ...(host.metricsClient ? { metrics: host.metricsClient } : {}),

@@ -63,6 +63,18 @@ export function isBrowserJsDialogNotActiveError(error) {
     const message = error instanceof Error ? error.message : String(error);
     return message.startsWith(`${BROWSER_JS_DIALOG_NOT_ACTIVE}:`);
 }
+/**
+ * Abort reason a provider gives an action when a JavaScript dialog in another
+ * page pauses this one (a same-site popup shares the opener's renderer). The
+ * connection is healthy, so Browser Core ends the action without recovery and
+ * the provider reports the popup's dialog.
+ */
+export class BrowserRelatedPageDialogPause extends Error {
+    constructor() {
+        super(`${BROWSER_JS_DIALOG_ACTIVE}: A JavaScript dialog in a page this action opened pauses this page until it is handled`);
+        this.name = 'BrowserRelatedPageDialogPause';
+    }
+}
 /** Validate public handle_js_dialog input against the current dialog type. */
 export function parseBrowserJsDialogHandleInput(input) {
     const dialogId = asString(input.dialogId).trim();
@@ -223,6 +235,10 @@ export class JsDialogTracker {
         this.disposer = this.source
             ? this.source.onChange((dialog) => this.emit(dialog))
             : () => undefined;
+        // A dialog the page opened before this session subscribed is reported once only.
+        const alreadyOpen = this.source ? undefined : transport.pendingJavaScriptDialog?.();
+        if (alreadyOpen)
+            this.handleCdpEvent({ method: 'Page.javascriptDialogOpening', params: alreadyOpen });
     }
     observeTransportEvent(event) {
         if (!this.source)

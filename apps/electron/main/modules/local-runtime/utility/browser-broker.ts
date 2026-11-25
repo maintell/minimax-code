@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { ELECTRON_BROWSER_PUBLIC_ACTIONS } from "../../browser/electron-browser-route-policy";
-import { BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH, BROWSER_ERROR_MESSAGES, isBrowserBrokerAbortMessage, isSafeBrokerRequestId, isBrowserBrokerRequestMessage, isStrictStructuredCloneValue, isBrowserBrokerResultMessage, isBrowserBrokerErrorMessage, isBrowserBrokerAction } from "./control";
+import { BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH, BROWSER_ERROR_MESSAGES, isBrowserBrokerAbortMessage, isBrowserBrokerLifecycleMessage, isSafeBrokerRequestId, isBrowserBrokerRequestMessage, strictStructuredCloneViolation, browserInvalidResultDetail, isBrowserBrokerResultMessage, isBrowserBrokerErrorMessage, isBrowserBrokerAction } from "./control";
 const STRUCTURED_BROWSER_ERROR_CODES = {
     AMBIGUOUS_TARGET: 'ambiguous_target',
     ACTION_TIMEOUT: 'browser_operation_timeout',
     BROWSER_SESSION_POISONED: 'browser_session_poisoned',
     BROWSER_RESULT_TOO_LARGE: 'browser_result_too_large',
+    BROWSER_USER_TAKEOVER: 'browser_user_takeover',
     CURRENT_TAB_OCCUPIED: 'current_tab_occupied',
     FRAME_COORDINATES_UNAVAILABLE: 'frame_coordinates_unavailable',
     BROWSER_PAGE_UNAVAILABLE: 'browser_page_unavailable',
@@ -13,12 +14,23 @@ const STRUCTURED_BROWSER_ERROR_CODES = {
     MINIAPP_BUSY: 'miniapp_busy',
     MINIAPP_UNAVAILABLE: 'miniapp_unavailable',
     MINIAPP_TAB_ASLEEP: 'miniapp_tab_asleep',
+    INVALID_ELEMENT_REF: 'invalid_element_ref',
     SNAPSHOT_CONTINUATION_MISMATCH: 'snapshot_continuation_mismatch',
     SNAPSHOT_KIND_MISMATCH: 'snapshot_kind_mismatch',
     STALE_ELEMENT_REF: 'stale_element_ref',
     STALE_SNAPSHOT: 'stale_snapshot',
+    SUBAGENT_TAB_NOT_RETAINABLE: 'subagent_tab_not_retainable',
+    TAB_NOT_CONTROLLED: 'tab_not_controlled',
+    UNVERIFIED_WRITE_RETRY: 'unverified_write_retry',
 };
 const BROWSER_BROKER_REQUEST_TIMEOUT_MS = 275000;
+/**
+ * An http(s) URL in free text: scheme, optional userinfo, host, path, then
+ * query and fragment. Only scheme, host and path are kept, as the console
+ * diagnostics keep page URLs: OAuth callbacks (`?code=`), magic-link tokens and
+ * `user:password@` live in the others.
+ */
+const HTTP_URL_PATTERN = /\b(https?:\/\/)(?:[^\s/?#'"<>]*@)?([^\s?#'"<>]*)[^\s'"<>]*/giu;
 const SECRET_ASSIGNMENT_PATTERN = /\b(access[_-]?token|refresh[_-]?token|id[_-]?token|token|api[_-]?key|apikey|key|secret|password|passwd|pwd|authorization|cookie|session[_-]?id|sid|signature|sig|credential[s]?)(\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s&,;'")\]]+)/giu;
 const BEARER_PATTERN = /\b(bearer|basic)\s+[a-z0-9._~+/=-]{8,}/giu;
 const WINDOWS_PATH_PATTERN = /\b[a-z]:\\[^\s'"<>|]*/giu;
@@ -26,14 +38,17 @@ const POSIX_PRIVATE_PATH_PATTERN = /(^|[\s'"(=])(\/(?:Users|home|root|private|va
 /** An over-long detail keeps its ending, where Browser errors put their next step. */
 const DETAIL_TAIL_CHARS = 280;
 /**
- * The original exception tells the model why an action failed. Forward it
- * without credentials or local file paths: credential assignments,
- * Bearer/Basic tokens and local paths are removed, control characters and
- * runs of whitespace collapse. An over-long message keeps its start and end.
+ * The original exception is what tells the model why an action failed; the
+ * generic "Browser action failed in Electron main" alone does not. Forward
+ * it, but never credentials or local file paths: URL userinfo,
+ * queries and fragments, credential assignments, Bearer/Basic tokens and local
+ * paths are removed, control characters and runs of whitespace collapse. An
+ * over-long message keeps its start and its ending.
  */
 export function redactBrowserErrorDetail(error) {
     const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
     const redacted = raw
+        .replace(HTTP_URL_PATTERN, '$1$2')
         .replace(SECRET_ASSIGNMENT_PATTERN, '$1$2[redacted]')
         .replace(BEARER_PATTERN, '$1 [redacted]')
         .replace(WINDOWS_PATH_PATTERN, '[path]')
@@ -72,13 +87,15 @@ function browserBrokerErrorCode(error, aborted) {
     return 'browser_action_failed';
 }
 /**
- * The redacted original message for the generic failure and allowlisted
- * recovery codes. Timeouts keep their label/deadline contract instead.
+ * The redacted original message for failures it can help with: the generic
+ * failure and allowlisted recovery codes, timeouts included (a Core deadline
+ * says which command hung and whether the server already answered a submit,
+ * so a bare "timed out" does not lead to sending it again). A timeout
+ * with a label keeps its label/deadline message on the client.
  */
 function browserBrokerErrorDetail(code, error) {
     const actionable = code === 'browser_action_failed' ||
-        (code !== 'browser_operation_timeout' &&
-            Object.values(STRUCTURED_BROWSER_ERROR_CODES).includes(code));
+        Object.values(STRUCTURED_BROWSER_ERROR_CODES).includes(code);
     if (!actionable)
         return undefined;
     const detail = redactBrowserErrorDetail(error);
@@ -129,6 +146,11 @@ function postBrowserMessage(target, message, requestId, messageType, onDeliveryF
         }
     }
 }
+/** The wire field `ephemeral` maps to the Runtime tool context's `browserEphemeral`. */
+function browserAdapterContext(context) {
+    const { ephemeral, ...rest } = context;
+    return (ephemeral ? { ...rest, browserEphemeral: true } : rest);
+}
 export class MainOwnedBrowserBroker {
     constructor(options) {
         this.options = options;
@@ -142,6 +164,17 @@ export class MainOwnedBrowserBroker {
             if (!isBrowserBrokerAbortMessage(value))
                 return true;
             this.abortRequest(target, value.requestId);
+            return true;
+        }
+        if (type === 'browser-lifecycle') {
+            if (!isBrowserBrokerLifecycleMessage(value))
+                return true;
+            try {
+                this.options.getAdapter()?.notifyLifecycle?.(value.event);
+            }
+            catch {
+                // Lifecycle delivery is best-effort; the next Agent call reconciles turns.
+            }
             return true;
         }
         if (type !== 'browser-request')
@@ -201,12 +234,13 @@ export class MainOwnedBrowserBroker {
         const pending = { controller: new AbortController() };
         targetPending.set(message.requestId, pending);
         void Promise.resolve()
-            .then(() => activeAdapter.execute(message.context, message.action, message.input, pending.controller.signal))
+            .then(() => activeAdapter.execute(browserAdapterContext(message.context), message.action, message.input, pending.controller.signal))
             .then((result) => {
             if (!this.takePending(target, message.requestId, pending))
                 return;
-            if (!isStrictStructuredCloneValue(result)) {
-                this.postError(target, message.requestId, 'invalid_result');
+            const violation = strictStructuredCloneViolation(result);
+            if (violation) {
+                postBrowserError(target, message.requestId, 'invalid_result', this.options.onDeliveryFailure, undefined, browserInvalidResultDetail(violation));
                 return;
             }
             postBrowserMessage(target, {
@@ -259,8 +293,12 @@ export class MainOwnedBrowserBroker {
 }
 
 function browserBrokerClientError(message) {
-    const detailCode = message.code === 'browser_action_failed' && message.detail
-        ? /^([A-Z][A-Z0-9_]+):/u.exec(message.detail)?.[1]
+    // A Browser Core error triple (`CODE: reason Next: next`) is complete as
+    // sent; so is the original message of the generic failure.
+    const detailIsComplete = message.detail !== undefined &&
+        (message.code === 'browser_action_failed' || message.detail.includes(' Next: '));
+    const detailCode = detailIsComplete
+        ? /^([A-Z][A-Z0-9_]+):/u.exec(message.detail ?? '')?.[1]
         : undefined;
     const code = message.code === 'aborted'
         ? 'ABORTED'
@@ -273,13 +311,13 @@ function browserBrokerClientError(message) {
                     message.code === 'background_render_queue_timeout'
                     ? 'BROWSER_OPERATION_TIMEOUT'
                     : (detailCode ?? message.code);
-    // The generic failure shows the original (redacted) message itself; an
-    // allowlisted recovery code keeps its fixed guidance and appends the cause.
+    // Any other allowlisted recovery code keeps its fixed guidance and appends
+    // the original cause.
     const publicMessage = code === 'BROWSER_OPERATION_TIMEOUT' && message.label && message.timeoutMs !== undefined
         ? `BROWSER_OPERATION_TIMEOUT: Operation "${message.label}" exceeded ${message.timeoutMs}ms`
         : message.detail === undefined
             ? message.message
-            : message.code === 'browser_action_failed'
+            : detailIsComplete
                 ? message.detail
                 : `${message.message} (${message.detail.replace(/^[A-Z][A-Z0-9_]+:\s*/u, '')})`;
     return Object.assign(new Error(publicMessage), {
@@ -308,8 +346,31 @@ export class UtilityBrowserBrokerClient {
                 // intentionally absent from the model-facing Electron capability.
                 actions: ELECTRON_BROWSER_PUBLIC_ACTIONS,
                 interactiveTakeover: true,
+                // Program ops (`program_op`) travel the same request/abort messages.
+                programOps: true,
             }),
             execute: (context, action, input, signal) => this.execute(context, action, input, signal),
+            notifyLifecycle: (event) => {
+                if (this.closed)
+                    return;
+                const message = {
+                    type: 'browser-lifecycle',
+                    event: {
+                        type: event.type,
+                        sessionId: event.sessionId,
+                        turnId: event.turnId,
+                        ...(event.ephemeral ? { ephemeral: true } : {}),
+                    },
+                };
+                if (!isBrowserBrokerLifecycleMessage(message))
+                    return;
+                try {
+                    this.options.postMessage(message);
+                }
+                catch {
+                    // Main may already be gone.
+                }
+            },
         };
     }
     handleMessage(value) {
@@ -373,6 +434,7 @@ export class UtilityBrowserBrokerClient {
                 sessionId: context.sessionId,
                 turnId: context.turnId,
                 ...(context.toolCallId ? { toolCallId: context.toolCallId } : {}),
+                ...(context.browserEphemeral ? { ephemeral: true } : {}),
                 ...(context.browserAssets
                     ? {
                         browserAssets: context.browserAssets.map((asset) => ({

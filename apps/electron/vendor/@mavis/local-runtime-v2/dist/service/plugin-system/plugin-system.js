@@ -13,8 +13,12 @@ import { decidePreparedOfficialSync, handleIncompleteOfficialSync, OfficialPlugi
 import { buildCustomOnlySnapshot, deactivatedPluginNames, localSnapshotInventory, readOfficialPluginInstallations, readPluginSnapshotInputs, } from './plugin/runtime/snapshot-inputs.js';
 import { PluginPackageStorage } from './plugin/runtime/package-storage.js';
 import { materializeOfficialPluginArchive, } from './plugin/package/archive-cache.js';
-import { PluginSnapshotBuilder, EMPTY_PLUGIN_SNAPSHOT, withPluginMcpRuntime, withPluginSnapshotRevision, } from './plugin/runtime/snapshot-builder.js';
+import { PluginSnapshotBuilder, normalizedPluginNames, snapshotBuilderPolicy, EMPTY_PLUGIN_SNAPSHOT, withPluginMcpRuntime, withPluginSnapshotRevision, } from './plugin/runtime/snapshot-builder.js';
 import { assertPluginPublicationFence, completePluginPublication, commitPreparedPluginPublication, isPublicationSuperseded, officialPublicationOptions, preparePluginPublication, recoverDestructivePluginPublication, throwRecoveredDestructivePublicationFailure, preparedPluginPublicationFinalizer, PluginMcpDiscoveryScheduler, rollbackPreparedPluginPublication, sameLocalPluginProjection, } from './publication.js';
+/** Every effective installed extension, whatever its package source. */
+function installedExtensionsOf(snapshot) {
+    return snapshot.extensions;
+}
 function toSelector(selector) {
     return typeof selector === 'string' ? { name: selector } : selector;
 }
@@ -54,21 +58,29 @@ export class PluginSystem {
     disposalController = new AbortController();
     snapshot = EMPTY_PLUGIN_SNAPSHOT;
     desiredSnapshot = this.snapshot;
-    snapshotListeners = new Set();
     mcpRuntime;
     capabilityGenerations;
     metrics;
     packageStorage;
     localDirectoryWatcher;
     local;
+    snapshotListeners = new Set();
+    /** Extension modules of the published snapshot's effective Plugins, whatever their source. */
+    installedExtensions = {
+        current: () => installedExtensionsOf(this.snapshot),
+        subscribe: (listener) => {
+            const notify = (snapshot) => listener(installedExtensionsOf(snapshot));
+            this.snapshotListeners.add(notify);
+            return () => {
+                this.snapshotListeners.delete(notify);
+            };
+        },
+    };
     forbiddenPluginNames;
     constructor(options) {
         this.options = options;
-        this.forbiddenPluginNames = new Set((options.forbiddenPluginNames ?? []).map((name) => name.trim().normalize('NFKC').toLocaleLowerCase('en-US')));
-        this.builder = new PluginSnapshotBuilder(options.mcpNames, {
-            forbiddenPluginNames: this.forbiddenPluginNames,
-            ...(options.miniAppHostVersion ? { hostVersion: options.miniAppHostVersion } : {}),
-        });
+        this.forbiddenPluginNames = normalizedPluginNames(options.forbiddenPluginNames);
+        this.builder = new PluginSnapshotBuilder(options.mcpNames, snapshotBuilderPolicy(this.forbiddenPluginNames, options));
         this.metrics = new PluginSystemMetrics(options.metrics);
         this.packageStorage = new PluginPackageStorage({
             dataDir: options.dataDir,
@@ -200,15 +212,28 @@ export class PluginSystem {
             inventory: this.mcpRuntime.exportInventory?.(),
         }));
     }
-    captureTurnCapabilities() {
+    /** A session sees the published snapshot with its own preview overlay applied. */
+    sessionSnapshot(sessionId) {
+        return this.options.sessionOverlays?.snapshotFor(sessionId, this.snapshot) ?? this.snapshot;
+    }
+    captureTurnCapabilities(input) {
         this.assertUsable();
-        return capturePluginSystemTurnCapabilities(this.snapshot.turnCapabilities);
+        const snapshot = input ? this.sessionSnapshot(input.sessionId) : this.snapshot;
+        return capturePluginSystemTurnCapabilities(snapshot.turnCapabilities);
     }
     retainTurnCapabilities(capabilities) {
-        this.capabilityGenerations.retain(capabilities.revision);
+        const overlays = this.options.sessionOverlays;
+        if (overlays)
+            overlays.retain(capabilities.revision, this.capabilityGenerations);
+        else
+            this.capabilityGenerations.retain(capabilities.revision);
     }
     releaseTurnCapabilities(capabilities) {
-        this.capabilityGenerations.release(capabilities.revision);
+        const overlays = this.options.sessionOverlays;
+        if (overlays)
+            overlays.release(capabilities.revision, this.capabilityGenerations);
+        else
+            this.capabilityGenerations.release(capabilities.revision);
     }
     onHostIdle() {
         this.attemptPublication();
@@ -842,8 +867,14 @@ export class PluginSystem {
         if (this.disposed)
             return;
         this.options.onCapabilitiesChanged?.(next.turnCapabilities);
-        for (const listener of [...this.snapshotListeners])
-            listener();
+        for (const listener of [...this.snapshotListeners]) {
+            try {
+                listener(next);
+            }
+            catch {
+                // A failing subscriber must not block the publication or the others.
+            }
+        }
     }
     adoptPublishedSnapshot(snapshot, buildContextSource = snapshot) {
         const reservations = this.snapshotReservations.get(snapshot);

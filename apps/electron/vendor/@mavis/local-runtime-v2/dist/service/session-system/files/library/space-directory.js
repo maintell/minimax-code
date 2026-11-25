@@ -6,8 +6,8 @@ import path from 'node:path';
  * never by its full name, so renaming a space never moves or loses its directory:
  *
  * - `<slug>-<uuid>`: the layout new spaces get (the slug comes from the name at creation);
- * - `default`: the built-in space keeps its plain name;
- * - `<uuid>` (or any other plain ID): the path a space without a directory resolves to.
+ * - `<uuid>` (or any other plain ID, such as `default` of the space older versions created):
+ *   the path a space without a directory resolves to.
  *
  * Entries starting with `.` (staging, trash, the Bunny database, OS files) are never spaces.
  *
@@ -17,9 +17,7 @@ import path from 'node:path';
  * - under `spaces/`: every `.`-name, `.staging-<id>/` included;
  * - under a space: `meta.json`, `context.md`, `artifacts/` (the directory itself), `data/` and
  *   `.db/`.
- * @internal Exported only for focused tests.
  */
-export const DEFAULT_SPACE_ID = 'default';
 const SPACE_UUID = /(?:^|-)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SLUG_MAX_LENGTH = 40;
@@ -33,12 +31,17 @@ export const SPACE_STAGING_PREFIX = '.staging-';
 export const BUNNY_DATABASE_DIR = 'data';
 export const BUNNY_TRASH_DIR = '.trash';
 /**
+ * The ID of the space older versions created as Bunny's default. Since v13 of the Bunny store it is
+ * an ordinary space (renamed 默认事项); the library's own root chats still deliver into it while it
+ * exists, as they did before.
+ */
+export const LEGACY_DEFAULT_SPACE_ID = 'default';
+/**
  * Slugs that read like a reserved name once the leading `.` is gone (`.trash` slugs to `trash`),
  * or that match one exactly (`data`, the Bunny database directory). The
  * UUID suffix already keeps them apart on disk; this keeps the names unambiguous to people.
  */
 const RESERVED_SLUGS = new Set([
-    DEFAULT_SPACE_ID,
     'db',
     'trash',
     'staging',
@@ -89,8 +92,8 @@ export function spaceDirectorySlug(name) {
     return RESERVED_SLUGS.has(slug.toLowerCase()) ? `space-${slug}` : slug;
 }
 /**
- * The name a space's directory gets when it is created: `<slug>-<uuid>`. The default space and
- * any ID that is not a UUID keep the plain ID, the only name that still resolves back to them.
+ * The name a space's directory gets when it is created: `<slug>-<uuid>`. An ID that is not a
+ * UUID keeps the plain ID, the only name that still resolves back to it.
  */
 export function spaceDirectoryName(id, name) {
     assertSpaceId(id);
@@ -103,8 +106,6 @@ export function spaceDirectoryName(id, name) {
 export function spaceIdOfDirectoryName(entry) {
     if (!entry || entry.startsWith('.'))
         return undefined;
-    if (entry === DEFAULT_SPACE_ID)
-        return DEFAULT_SPACE_ID;
     return SPACE_UUID.exec(entry)?.[1] ?? entry;
 }
 /** Every space directory on disk, grouped by space ID. One ID can map to several directories. */

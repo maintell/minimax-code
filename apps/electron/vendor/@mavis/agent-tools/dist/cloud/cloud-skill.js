@@ -48,18 +48,20 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Type } from '@sinclair/typebox';
 import { bindTool, } from '@mavis/agent-core/tools';
-import { formatSkillContent, resolveSkillContent as resolveSkillContentFromOss, } from './skill-reader.js';
+import { skillFound, skillNotFound, skillReadName, skillReadToolResult, } from './skill-read-result.js';
+import { resolveSkillContent as resolveSkillContentFromOss } from './skill-reader.js';
+import { isSkillUnavailableInWindow, renderSkillUnavailableMessage, } from '../skill-catalog-window/index.js';
 export const SkillReadToolDef = {
     name: 'skill',
     description: 'Loads the complete SKILL.md instructions for an available hosted or plugin skill.\n\n' +
-        '- Load a skill when the user explicitly names it (including `/name`), or its name and description in `available_skills` clearly match the request or linked resource. Do not load unrelated skills.\n' +
-        '- Set `name` to an exact catalog name or one the user explicitly provided, without a leading slash; preserve any `plugin:skill` prefix. Do not guess names or invoke built-in CLI commands such as `/help` or `/clear`.\n' +
+        '- Load a skill when the user explicitly names it (including `/name`), or its name and description in `available_skills` or a `skill-availability-update` clearly match the request or linked resource. When a skill listed by name only may fit the request, load it to read its instructions. Do not load unrelated skills.\n' +
+        '- Set `name` to an exact name from `available_skills` (including skills listed by name only), from a `skill-availability-update`, or one the user explicitly provided, without a leading slash; preserve any `plugin:skill` prefix. Do not guess names or invoke built-in CLI commands such as `/help` or `/clear`.\n' +
         '- Before related task actions, make this the first and only tool call in the assistant step. Wait for the complete result, then follow its instructions to perform the task.\n' +
         '- Reuse complete instructions already in context when their loading prerequisites are satisfied; an earlier-turn result does not satisfy a current-turn loading requirement.\n' +
         '- If the skill is not found or cannot be read, it has not been loaded. Do not claim to have used it.',
     schema: Type.Object({
         name: Type.String({
-            description: 'Exact skill name from the catalog or user, without a leading slash; preserve any plugin prefix.',
+            description: 'Exact skill name from the catalog, a skill-availability update, or the user, without a leading slash; preserve any plugin prefix.',
         }),
     }),
 };
@@ -84,37 +86,20 @@ let CloudSkillTool = (() => {
         async execute(_ctx, input, signal) {
             if (signal?.aborted)
                 throw new Error('Operation aborted');
-            const name = (typeof input.name === 'string' && input.name.trim()) || 'unknown-skill';
+            const name = skillReadName(input);
             const outcome = await this.readSkillContent(_ctx, name, signal);
-            return {
-                tool_name: SkillReadToolDef.name,
-                text: outcome.text,
-                content: [{ type: 'text', text: outcome.text }],
-                details: {
-                    kind: 'skill',
-                    skill: name,
-                    found: outcome.found,
-                    readable: outcome.readable,
-                    source: outcome.source,
-                    owner: 'cloud_host',
-                },
-            };
+            return skillReadToolResult(outcome);
         }
         async readSkillContent(ctx, name, signal) {
             const { skillsDir, registryStore, ossClient, log } = this.deps;
             const selected = ctx.skillLookup?.lookup(name);
             if (ctx.skillLookup && !selected)
-                return notFound(name);
+                return notFound(ctx.sessionId, name);
             if (selected?.source === 'plugin') {
-                return {
-                    text: formatSkillContent(selected.name, selected.content, selected.location),
-                    found: true,
-                    readable: true,
-                    source: 'plugin',
-                };
+                return skillFound(selected.name, selected.content, selected.location, 'plugin');
             }
             if (!skillsDir)
-                return notFound(name);
+                return notFound(ctx.sessionId, name);
             const hostedName = selected?.name ?? name;
             const content = registryStore && ossClient && log
                 ? await resolveSkillContentFromOss(hostedName, {
@@ -130,27 +115,24 @@ let CloudSkillTool = (() => {
             if (signal?.aborted)
                 throw new Error('Operation aborted');
             if (content === null) {
-                return notFound(hostedName);
+                return notFound(ctx.sessionId, hostedName);
             }
-            const skillDir = join(skillsDir, hostedName);
-            return {
-                text: formatSkillContent(hostedName, content, skillDir),
-                found: true,
-                readable: true,
-                source: 'hosted',
-            };
+            return skillFound(hostedName, content, join(skillsDir, hostedName), 'hosted');
         }
     };
     return CloudSkillTool = _classThis;
 })();
 export { CloudSkillTool };
-function notFound(name) {
-    return {
-        text: `Cloud Host skill not found: ${name}`,
-        found: false,
-        readable: false,
-        source: 'none',
-    };
+/**
+ * A skill the frozen catalog or an availability update still shows, but that the live
+ * view no longer has, was removed or disabled mid-window: say so instead of a bare
+ * miss so the model stops retrying it.
+ */
+function notFound(sessionId, name) {
+    const outcome = skillNotFound(name);
+    return isSkillUnavailableInWindow(sessionId, name)
+        ? { ...outcome, text: renderSkillUnavailableMessage(name) }
+        : outcome;
 }
 async function readLocalHostedSkillContent(skillsDir, name) {
     const localSkillMd = join(skillsDir, name, 'SKILL.md');

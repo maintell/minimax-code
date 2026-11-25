@@ -14,7 +14,8 @@ const UPSTREAM_CODE = {
 export async function callSafetyApi(input) {
     if (input.scene === SAFETY_SCENE.AgentConfigName ||
         input.scene === SAFETY_SCENE.AgentConfigAvatar ||
-        input.scene === SAFETY_SCENE.CronTitle) {
+        input.scene === SAFETY_SCENE.CronTitle ||
+        input.scene === SAFETY_SCENE.ProjectName) {
         return reviewConfigV2(input);
     }
     const { region, url, accessToken, resolvedBuildEnv } = prepareRequest(input);

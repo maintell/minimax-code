@@ -12,6 +12,11 @@ const TASK_REASSIGN_REVERTED = 'task.reassign_reverted';
 const TASK_REPORTED = 'task.reported';
 /** Appended whenever a review ends, with the coordinator Turn that held it. */
 export const REVIEW_FINISHED = 'review.finished';
+/**
+ * A dispatched review stopped holding the task's conclusion; history only. Carries `released`
+ * and `cause` so the event cannot be read as a gate release when it was only a replacement.
+ */
+const TASK_VERDICT_REVIEW_ABANDONED = 'task.verdict_review_abandoned';
 const TASK_CLOSED = 'task.closed';
 const TASK_REOPENED = 'task.reopened';
 /** Appended by observers, not derived from a projection change. */
@@ -26,6 +31,7 @@ export function diffTaskEvents(input) {
         admitted(input),
         reported(input),
         reviewFinished(input),
+        verdictReviewAbandoned(input),
         closed(input),
         reopened(input),
     ].filter((event) => event !== undefined);
@@ -41,7 +47,6 @@ function opened({ current, next, note }) {
             assigner: next.assignerAgentName,
             ...optional('spaceId', note?.spaceId),
             ...optional('dispatchTurnId', note?.dispatchTurnId),
-            ...optional('spaceType', note?.spaceType),
             ...optional('execLocation', note?.execLocation),
             ...optional('trigger', note?.trigger),
         },
@@ -100,6 +105,32 @@ function reviewFinished(input) {
     };
 }
 const REVIEW_ENDING = new Set(['finishReview', 'reassign', 'reopen']);
+/**
+ * The review task linked to a task stopped holding its conclusion. Derived from the link
+ * going away, so it covers both an abandoned review and one a newer dispatch replaced.
+ *
+ * Those two are not the same fact, and only the first writes `verdictGateReleased`
+ * ({@link assignmentTransitions.abandonVerdictReview}); a `reassign` or `restore` replaces the
+ * whole projection and drops the link without releasing anything. So the payload says which
+ * happened: `released` mirrors whether this review's gate really was released in storage, and
+ * `cause` names the path. A reader that took the event name alone as "the gate is open and no
+ * conclusion is held" would otherwise read the opposite of `verdictGateReleased`.
+ */
+function verdictReviewAbandoned({ current, next }) {
+    const reviewTask = current?.reviewTask;
+    if (!reviewTask || next.reviewTask)
+        return undefined;
+    const released = next.verdictGateReleased?.reviewTaskId === reviewTask.sessionId;
+    return {
+        type: TASK_VERDICT_REVIEW_ABANDONED,
+        payload: {
+            reviewTaskId: reviewTask.sessionId,
+            reportKey: reviewTask.reportKey,
+            released,
+            cause: released ? 'abandoned' : 'replaced',
+        },
+    };
+}
 function reviewResult({ kind, current, next, note }) {
     if (note?.reviewResult)
         return note.reviewResult;

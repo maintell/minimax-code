@@ -1,4 +1,4 @@
-import { AgentModelSelectionError, LocalModelProviderError, formatModelKey, parseSourceQualifiedModelKey, readAdvisorSelection, } from '../../service/model-system/index.js';
+import { AgentModelSelectionError, LocalModelProviderError, formatModelKey, isAdvisorReleased, parseSourceQualifiedModelKey, readAdvisorSelection, readStoredAdvisorSelection, } from '../../service/model-system/index.js';
 import { isAdvisorContextWindow } from '@mavis/config';
 /**
  * The selection an advisor write stores. Like the main model, picking another model starts a
@@ -61,18 +61,28 @@ export function toDefaultAdvisorConfig(selection) {
     };
 }
 /**
- * The stored selection as a Turn reads it: an effort or window its model no longer accepts is
- * left out. Writes merge onto this too, so such a leftover never blocks the next write.
+ * The stored selection a write merges onto: an effort or window its model no longer accepts is
+ * left out, so such a leftover never blocks the next write. The global switch is not applied, so
+ * a write while it is off keeps the stored model.
  */
 export function readStoredAdvisor(config, stored) {
-    return stored ? readAdvisorSelection(config, stored).selection : undefined;
+    return stored ? readStoredAdvisorSelection(config, stored).selection : undefined;
 }
 /**
- * The listed advisor. Like the main model's listing, it reports what a Turn would run without
- * writing it, so a client copying this view writes a valid selection.
+ * The listed Session advisor. Like the main model's listing, it reports what a Turn would run
+ * without writing it; with the global switch off that is none.
  */
 export function toAdvisorSelectionView(config, stored) {
-    return advisorSelectionToView(readStoredAdvisor(config, stored));
+    return advisorSelectionToView(stored ? readAdvisorSelection(config, stored).selection : undefined);
+}
+/**
+ * The listed new-conversation default. No Turn runs it: clients copy it into each conversation
+ * they start, so a client copying this view writes a valid selection. It is listed as stored even
+ * while the global switch is off, so a conversation started then runs it once the switch is on.
+ * A build without the advisor lists none.
+ */
+export function toDefaultAdvisorSelectionView(config, stored) {
+    return advisorSelectionToView(isAdvisorReleased(config) ? readStoredAdvisor(config, stored) : undefined);
 }
 /**
  * A selection as the wire shows it. SessionInfo passes the stored selection, ListModels the one

@@ -5,10 +5,9 @@
  * actually read the messages of the session the user referenced?
  *
  * Why tool calls are the evidence: the Bunny prompt requires a turn that has
- * `run_code` to read history with `mavis_session_messages` *inside* run_code
- * (`assets/agents/bunny/system-prompt.md:81`), and other turns to use the
- * `mavis` tool's `session messages` command. A message-reading call in the
- * turn is therefore direct behavioural evidence, not a heuristic.
+ * `run_code` to read history with `session_messages` *inside* run_code, and
+ * other turns to reach the same tool through `mcp_invoke`. A message-reading
+ * call in the turn is therefore direct behavioural evidence, not a heuristic.
  *
  * Why this module owns its own tool-call reader instead of reusing the search
  * index's: `search-index/documents.ts:138` drops every call carrying

@@ -2,9 +2,11 @@ import { DEFAULT_BROWSER_VIEWPORT } from './browser-constants.js';
 import { modifierBit } from './browser-action-helpers.js';
 import { browserKeyDescriptor } from './browser-keyboard.js';
 import { BrowserQuerySupport, invalidSelectorHint, isInvalidSelectorMessage, } from './browser-query.js';
+import { formatSelectorCandidates } from './browser-selector-candidates.js';
 import { diagnoseSelectorMiss, selectorMissRecovery } from './browser-selector-diagnostics.js';
 import { isBrowserOperationInterruption } from './operation-timeout.js';
 import { asString, cdp, clearBrowserSnapshots, describeUnresolvedBrowserRef, evaluate, inputCoordinate, inputCoordinateScale, invalidateBrowserObservations, isRecord, resolveBrowserSnapshotElement, } from './browser-state.js';
+import { findReplacementNode, rebindElementRecord } from './browser-ref-rebind.js';
 export class BrowserActionTargetSupport extends BrowserQuerySupport {
     /** True only when the node is positively known to be disconnected from its document. */
     async backendNodeIsDetached(session, backendNodeId) {
@@ -35,7 +37,12 @@ export class BrowserActionTargetSupport extends BrowserQuerySupport {
             }
         }
     }
-    async resolveTarget(session, input, scrollIntoView = true, requireCoordinates = true) {
+    /**
+     * `rebindField`: fill/type/paste only. A ref whose node the page replaced
+     * follows the editable field now in its place (see browser-ref-rebind.ts);
+     * every other action reports it as STALE_ELEMENT_REF.
+     */
+    async resolveTarget(session, input, scrollIntoView = true, requireCoordinates = true, rebindField = false) {
         const ref = asString(input.ref);
         if (ref) {
             const allowFixtureFallback = session.snapshotAuthorityEstablished !== true;
@@ -64,21 +71,55 @@ export class BrowserActionTargetSupport extends BrowserQuerySupport {
                 element.rect.y >= 0 &&
                 element.rect.x + element.rect.width <= viewport.width &&
                 element.rect.y + element.rect.height <= viewport.height;
-            if (scrollIntoView && !fullyVisible) {
-                await cdp(session, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: element.backendNodeId });
-                await this.centerBackendNodeInView(session, element.backendNodeId);
-            }
-            const measuredRect = await this.readBox(session, element.backendNodeId).catch((error) => {
-                if (isBrowserOperationInterruption(error))
-                    throw error;
-                return undefined;
-            });
-            // A framework re-render replaces the node but the old backendNodeId stays
-            // resolvable as a detached node, so element actions would fail later with
-            // opaque CDP errors such as "Element is not focusable". Report the stale
-            // ref at resolution time instead (checked only when the box read failed).
-            if (!measuredRect && (await this.backendNodeIsDetached(session, element.backendNodeId))) {
-                throw new Error('STALE_ELEMENT_REF: the inspected element was replaced or removed (the page re-rendered); inspect again and use the new ref');
+            // A node the page replaced cannot be scrolled; its missing box below
+            // decides between a rebind and STALE_ELEMENT_REF instead of a raw CDP error.
+            const measure = async (backendNodeId, scroll) => {
+                if (scroll) {
+                    try {
+                        await cdp(session, 'DOM.scrollIntoViewIfNeeded', { backendNodeId });
+                        await this.centerBackendNodeInView(session, backendNodeId);
+                    }
+                    catch (error) {
+                        if (isBrowserOperationInterruption(error))
+                            throw error;
+                    }
+                }
+                return this.readBox(session, backendNodeId).catch((error) => {
+                    if (isBrowserOperationInterruption(error))
+                        throw error;
+                    return undefined;
+                });
+            };
+            let measuredRect = await measure(element.backendNodeId, scrollIntoView && !fullyVisible);
+            if (!measuredRect) {
+                // A framework re-render replaces the node but the old backendNodeId stays
+                // resolvable as a detached node, so element actions would fail later with
+                // opaque CDP errors such as "Element is not focusable". A node still in
+                // the page may have been swapped for a twin painted in its place. A field
+                // written by fill/type/paste follows the one field with its identity now
+                // in its place; otherwise a detached ref is stale here (checked only when
+                // the box read failed).
+                const detached = await this.backendNodeIsDetached(session, element.backendNodeId);
+                const replacement = rebindField
+                    ? await findReplacementNode(session, element, elementSnapshot?.page.scrollPosition)
+                    : undefined;
+                if (replacement !== undefined) {
+                    rebindElementRecord(session, element, replacement);
+                    // The page may have scrolled since inspect: judge the replacement's own box.
+                    measuredRect = await measure(replacement, false);
+                    const offset = element.frameOffset ?? { x: 0, y: 0 };
+                    if (scrollIntoView &&
+                        measuredRect &&
+                        (measuredRect.x + offset.x < 0 ||
+                            measuredRect.y + offset.y < 0 ||
+                            measuredRect.x + offset.x + measuredRect.width > viewport.width ||
+                            measuredRect.y + offset.y + measuredRect.height > viewport.height)) {
+                        measuredRect = await measure(replacement, true);
+                    }
+                }
+                else if (detached) {
+                    throw new Error('STALE_ELEMENT_REF: the inspected element was replaced or removed (the page re-rendered); inspect again and use the new ref');
+                }
             }
             if (!measuredRect && requireCoordinates) {
                 throw new Error(element.commandSessionId
@@ -119,7 +160,9 @@ export class BrowserActionTargetSupport extends BrowserQuerySupport {
         const fullyVisible = r.x >= 0 && r.y >= 0 &&
           r.x + r.width <= innerWidth && r.y + r.height <= innerHeight;
         if (${scrollIntoView ? 'true' : 'false'} && !fullyVisible) {
-          element.scrollIntoView({ block: 'center', inline: 'center' });
+          // 'instant': a page with scroll-behavior: smooth would otherwise
+          // still be at its old scroll position when the box is measured.
+          element.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
           r = element.getBoundingClientRect();
         }
         return { x: r.x, y: r.y, width: r.width, height: r.height };
@@ -134,7 +177,8 @@ export class BrowserActionTargetSupport extends BrowserQuerySupport {
             });
             if (!rect) {
                 const diagnostics = await diagnoseSelectorMiss(session, selector);
-                throw new Error(`TARGET_NOT_FOUND: selector ${JSON.stringify(selector.slice(0, 200))} did not match an element. ${selectorMissRecovery(diagnostics)}`);
+                const candidates = formatSelectorCandidates(diagnostics.candidates ?? []);
+                throw new Error(`TARGET_NOT_FOUND: selector ${JSON.stringify(selector.slice(0, 200))} did not match an element. ${selectorMissRecovery(diagnostics)}${candidates ? ` ${candidates}` : ''}`);
             }
             const backendNodeId = await this.resolveSelectorBackendNode(session, selector);
             return {

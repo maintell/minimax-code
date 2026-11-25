@@ -1,22 +1,36 @@
 /**
- * `<available_skills>` catalog renderer shared by the desktop runtime and Cloud Runtime:
- * list format, budget min(2% of the context window, 5,000 tokens), protected Skills first.
+ * `<available_skills>` catalog renderer shared by the desktop runtime and Cloud Runtime.
+ *
+ * Every skill name is always listed: protected Skills first, then by name. The
+ * budget B = min(2% of the context window, 5,000 tokens) constrains descriptions
+ * only, so the catalog exceeds B when the names alone do. Protected Skills keep
+ * their full descriptions; the others get their full description (capped at
+ * 1,024 code points) or none, in keep order: decayed usage score, new-skill
+ * protection, builtin tier, name. The same input always renders the same bytes.
  */
 import { createDefaultTokenEstimator } from './token-estimator.js';
 const LOCAL_SKILL_CATALOG_MAX_BUDGET_TOKENS = 5_000;
-const LOCAL_SKILL_DESCRIPTION_MAX_CODE_POINTS = 1_024;
+/** Longest description a non-protected Skill shows, in code points. */
+const SKILL_DESCRIPTION_MAX_CODE_POINTS = 1_024;
 const PROTECTED_SKILL_NAMES = new Set(['mcode-tools-master', 'minimax-code-product']);
 /**
  * Official Office plugin Skills replaced the bundled `docx` / `xlsx` / `pdf` /
  * `pptx` Skills. Hosts project plugin Skills as non-builtin, so keep these four
- * runtime names in the builtin description tier they had before the move.
+ * runtime names in the builtin tier they had before the move.
  */
 const BUILTIN_TIER_PLUGIN_SKILL_NAMES = new Set(['excel:xlsx', 'pdf:pdf', 'ppt:pptx', 'word:docx']);
-const PARTIAL_DESCRIPTION_NOTICE = 'Skill descriptions were shortened to fit the catalog budget.';
-const PARTIAL_SKILL_NOTICE = 'Some skills were omitted because not every skill name fits within the skills context budget.';
-const LOCAL_NON_MONOTONIC_RECOVERY_MAX_CONSECUTIVE_MISSES = 8;
+const DAY_MS = 24 * 60 * 60 * 1_000;
+const USAGE_HALF_LIFE_MS = 30 * DAY_MS;
+const NEW_SKILL_PROTECTION_MS = 7 * DAY_MS;
+/** First line inside the block whenever a description was dropped for the budget. */
+export const SKILL_NAME_ONLY_NOTICE = 'Some skills are listed by name only to fit the context budget. If a name may fit the task, load it with the `skill` tool to read its full instructions.';
 const DEFAULT_TOKEN_ESTIMATOR = createDefaultTokenEstimator();
-function resolveLocalSkillCatalogBudgetTokens(contextWindowTokens) {
+/** Key of a Skill in usage maps: trimmed, NFKC-normalized, lowercase. */
+export function normalizeSkillUsageKey(name) {
+    return name.trim().normalize('NFKC').toLocaleLowerCase('en-US');
+}
+/** The description budget B: min(2% of the context window, 5,000 tokens). */
+export function resolveSkillCatalogBudgetTokens(contextWindowTokens) {
     if (typeof contextWindowTokens !== 'number' ||
         !Number.isFinite(contextWindowTokens) ||
         contextWindowTokens <= 0) {
@@ -24,229 +38,162 @@ function resolveLocalSkillCatalogBudgetTokens(contextWindowTokens) {
     }
     return Math.min(Math.floor(contextWindowTokens * 0.02), LOCAL_SKILL_CATALOG_MAX_BUDGET_TOKENS);
 }
+/** A description as the catalog shows it before any cap: whitespace collapsed and trimmed. */
+export function normalizeSkillCatalogDescription(description) {
+    return description.replace(/\s+/gu, ' ').trim();
+}
+/**
+ * The description as catalog lines, signatures and updates show it: normalized,
+ * whole for protected Skills, capped at 1,024 code points for the others.
+ */
+export function skillCatalogDescription(entry) {
+    const normalized = normalizeSkillCatalogDescription(entry.description);
+    if (isProtectedSkill(entry.name))
+        return normalized;
+    const codePoints = Array.from(normalized);
+    return codePoints.length > SKILL_DESCRIPTION_MAX_CODE_POINTS
+        ? codePoints.slice(0, SKILL_DESCRIPTION_MAX_CODE_POINTS).join('')
+        : normalized;
+}
+/** Builtin Skills and the official Office plugin Skills share the builtin keep tier. */
+function isBuiltinTierSkill(entry) {
+    return entry.builtin || BUILTIN_TIER_PLUGIN_SKILL_NAMES.has(entry.name);
+}
 export function renderLocalSkillsCatalogResult(skills, options = {}) {
     if (skills.length === 0) {
         return {
             catalog: '',
-            softOverflow: false,
-            hardOverflow: false,
+            descriptionsDropped: 0,
+            nameOnly: new Set(),
             descriptionCapTruncated: false,
+            catalogTokens: 0,
         };
     }
     const estimator = options.tokenEstimator ?? DEFAULT_TOKEN_ESTIMATOR;
-    const budgetTokens = resolveLocalSkillCatalogBudgetTokens(options.contextWindowTokens);
-    const prepared = prepareSkills(skills);
-    const completeLengths = prepared.map((skill) => skill.description.length);
-    const completeCatalog = renderCatalog(prepared, completeLengths);
-    const descriptionCapTruncated = prepared.some((skill) => skill.descriptionTruncated);
-    if (fitsBudget(completeCatalog, budgetTokens, estimator)) {
-        return {
-            catalog: completeCatalog,
-            softOverflow: false,
-            hardOverflow: false,
-            descriptionCapTruncated,
-        };
-    }
-    const protectedLengths = protectedDescriptionLengths(prepared);
-    const protectedFloor = renderCatalog(prepared, protectedLengths);
-    if (!fitsBudget(protectedFloor, budgetTokens, estimator)) {
-        return renderHardOverflow(prepared, budgetTokens, estimator, descriptionCapTruncated);
-    }
-    const noticedProtectedFloor = renderCatalog(prepared, protectedLengths, PARTIAL_DESCRIPTION_NOTICE);
-    const notice = fitsBudget(noticedProtectedFloor, budgetTokens, estimator)
-        ? PARTIAL_DESCRIPTION_NOTICE
-        : undefined;
-    const allocatedLengths = allocateDescriptions(prepared, notice, budgetTokens, estimator);
-    const catalog = renderCatalog(prepared, allocatedLengths, notice);
-    if (!fitsBudget(catalog, budgetTokens, estimator)) {
-        if (notice) {
-            const lengthsWithoutNotice = allocateDescriptions(prepared, undefined, budgetTokens, estimator);
-            const catalogWithoutNotice = renderCatalog(prepared, lengthsWithoutNotice);
-            if (fitsBudget(catalogWithoutNotice, budgetTokens, estimator)) {
-                return {
-                    catalog: catalogWithoutNotice,
-                    softOverflow: true,
-                    hardOverflow: false,
-                    descriptionCapTruncated,
-                };
-            }
-        }
-        if (fitsBudget(protectedFloor, budgetTokens, estimator)) {
-            return {
-                catalog: protectedFloor,
-                softOverflow: true,
-                hardOverflow: false,
-                descriptionCapTruncated,
-            };
-        }
-        return renderHardOverflow(prepared, budgetTokens, estimator, descriptionCapTruncated);
-    }
-    return {
+    const budgetTokens = resolveSkillCatalogBudgetTokens(options.contextWindowTokens);
+    const { prepared, descriptionCapTruncated } = prepareSkills(skills);
+    const result = (catalog, nameOnly) => ({
         catalog,
-        softOverflow: true,
-        hardOverflow: false,
+        descriptionsDropped: nameOnly.size,
+        nameOnly,
         descriptionCapTruncated,
-    };
+        catalogTokens: estimator.estimateTextTokens(catalog),
+    });
+    /**
+     * B constrains the descriptions only: names, order lines and the notice are not
+     * budgeted, so the catalog may exceed B when the names alone do.
+     */
+    const tokensOf = (described) => descriptionTokens(prepared, described, estimator);
+    const everyIndex = new Set(prepared.keys());
+    const droppable = prepared.flatMap((skill, index) => !skill.protected && skill.description ? [index] : []);
+    if (tokensOf(everyIndex) <= budgetTokens || droppable.length === 0) {
+        return result(renderCatalog(prepared, everyIndex), new Set());
+    }
+    // Protected descriptions are always placed; the notice comes with any drop.
+    const described = new Set(prepared.flatMap((skill, index) => (skill.protected ? [index] : [])));
+    let remaining = budgetTokens - tokensOf(described);
+    const added = [];
+    for (const index of keepOrder(prepared, droppable, options)) {
+        const cost = estimator.estimateTextTokens(`: ${prepared[index].description}`);
+        if (cost > remaining)
+            continue;
+        remaining -= cost;
+        described.add(index);
+        added.push(index);
+    }
+    // Per-line estimates can undercount the whole (BPE is not additive): drop the
+    // last-added descriptions until the descriptions fit again.
+    while (tokensOf(described) > budgetTokens && added.length > 0) {
+        described.delete(added.pop());
+    }
+    const nameOnly = new Set(droppable.flatMap((index) => (described.has(index) ? [] : [prepared[index].name])));
+    return result(renderCatalog(prepared, described, SKILL_NAME_ONLY_NOTICE), nameOnly);
 }
+/** No description placed: every Skill is listed by name. */
+const NO_DESCRIPTIONS = new Set();
+/**
+ * Estimated tokens the placed descriptions add to a catalog: the difference
+ * against the same catalog with every Skill name-only, which cancels the name
+ * lines, the notice and the block overhead. This is the number B constrains.
+ */
+function descriptionTokens(prepared, described, estimator) {
+    return (estimator.estimateTextTokens(renderCatalog(prepared, described, SKILL_NAME_ONLY_NOTICE)) -
+        estimator.estimateTextTokens(renderCatalog(prepared, NO_DESCRIPTIONS, SKILL_NAME_ONLY_NOTICE)));
+}
+/** `descriptionTokens` of a catalog rendered by this renderer with `described` placed. */
+export function measureSkillCatalogDescriptionTokens(skills, described, options = {}) {
+    const { prepared } = prepareSkills(skills);
+    const wanted = new Set(described);
+    const indexes = new Set(prepared.flatMap((skill, index) => (wanted.has(skill.name) ? [index] : [])));
+    return descriptionTokens(prepared, indexes, options.tokenEstimator ?? DEFAULT_TOKEN_ESTIMATOR);
+}
+/** Listing order: protected Skills first, then by name. */
 function prepareSkills(skills) {
-    return [...skills]
+    let descriptionCapTruncated = false;
+    const prepared = [...skills]
         .sort((left, right) => {
         const priority = Number(isProtectedSkill(right.name)) - Number(isProtectedSkill(left.name));
         return priority || left.name.localeCompare(right.name);
     })
         .map((skill) => {
-        const normalizedDescription = Array.from(normalizeDescription(skill.description));
-        const protectedDescription = isProtectedSkill(skill.name);
+        const description = skillCatalogDescription(skill);
+        if (description !== normalizeSkillCatalogDescription(skill.description)) {
+            descriptionCapTruncated = true;
+        }
         return {
             name: skill.name,
-            builtin: skill.builtin || BUILTIN_TIER_PLUGIN_SKILL_NAMES.has(skill.name),
-            description: protectedDescription
-                ? normalizedDescription
-                : normalizedDescription.slice(0, LOCAL_SKILL_DESCRIPTION_MAX_CODE_POINTS),
-            descriptionTruncated: !protectedDescription &&
-                normalizedDescription.length > LOCAL_SKILL_DESCRIPTION_MAX_CODE_POINTS,
+            description,
+            protected: isProtectedSkill(skill.name),
+            builtinTier: isBuiltinTierSkill(skill),
         };
     });
+    return { prepared, descriptionCapTruncated };
+}
+/**
+ * Which descriptions stay first: higher decayed usage score, then never-used
+ * Skills first seen within 7 days, then the builtin tier, then name.
+ */
+function keepOrder(skills, indexes, options) {
+    const ranked = indexes.map((index) => {
+        const skill = skills[index];
+        const usage = options.usage?.get(normalizeSkillUsageKey(skill.name));
+        const useCount = usage && Number.isFinite(usage.useCount) ? Math.max(0, usage.useCount) : 0;
+        return {
+            index,
+            skill,
+            score: usageScore(useCount, usage?.lastUsedAtMs, options.nowMs),
+            fresh: useCount === 0 && isNewSkill(usage?.firstSeenAtMs, options.nowMs),
+        };
+    });
+    return ranked
+        .sort((left, right) => right.score - left.score ||
+        Number(right.fresh) - Number(left.fresh) ||
+        Number(right.skill.builtinTier) - Number(left.skill.builtinTier) ||
+        left.skill.name.localeCompare(right.skill.name))
+        .map(({ index }) => index);
+}
+/** useCount × 0.5^(days since last use / 30). */
+function usageScore(useCount, lastUsedAtMs, nowMs) {
+    if (useCount === 0)
+        return 0;
+    if (nowMs === undefined || lastUsedAtMs === undefined || !Number.isFinite(lastUsedAtMs)) {
+        return useCount;
+    }
+    return useCount * 0.5 ** (Math.max(0, nowMs - lastUsedAtMs) / USAGE_HALF_LIFE_MS);
+}
+function isNewSkill(firstSeenAtMs, nowMs) {
+    return (nowMs !== undefined &&
+        firstSeenAtMs !== undefined &&
+        Number.isFinite(firstSeenAtMs) &&
+        nowMs - firstSeenAtMs <= NEW_SKILL_PROTECTION_MS);
 }
 function isProtectedSkill(name) {
     return PROTECTED_SKILL_NAMES.has(name);
 }
-function protectedDescriptionLengths(skills) {
-    return skills.map((skill) => (isProtectedSkill(skill.name) ? skill.description.length : 0));
-}
-function allocateDescriptions(skills, notice, budgetTokens, estimator) {
-    const allocatedLengths = protectedDescriptionLengths(skills);
-    const builtinComplete = allocateTier(skills, allocatedLengths, true, {
-        notice,
-        budgetTokens,
-        estimator,
-    });
-    if (builtinComplete) {
-        allocateTier(skills, allocatedLengths, false, { notice, budgetTokens, estimator });
-    }
-    return allocatedLengths;
-}
-function allocateTier(skills, allocatedLengths, builtin, budget) {
-    const { notice, budgetTokens, estimator } = budget;
-    const tierIndexes = skills
-        .map((skill, index) => ({ skill, index }))
-        .filter(({ skill }) => !isProtectedSkill(skill.name) && skill.builtin === builtin && skill.description.length > 0)
-        .map(({ index }) => index);
-    if (tierIndexes.length === 0)
-        return true;
-    const maximumLevel = Math.max(...tierIndexes.map((index) => skills[index].description.length));
-    const allocatedLevel = findLargestLocallyFittingCandidate(maximumLevel, (candidateLevel) => {
-        const candidateLengths = [...allocatedLengths];
-        for (const index of tierIndexes) {
-            candidateLengths[index] = Math.min(candidateLevel, skills[index].description.length);
-        }
-        const candidate = renderCatalog(skills, candidateLengths, notice);
-        return fitsBudget(candidate, budgetTokens, estimator);
-    });
-    for (const index of tierIndexes) {
-        allocatedLengths[index] = Math.min(allocatedLevel, skills[index].description.length);
-    }
-    for (const index of tierIndexes) {
-        const allocatedLength = allocatedLengths[index] ?? 0;
-        if (allocatedLength >= skills[index].description.length)
-            continue;
-        const candidateLengths = [...allocatedLengths];
-        candidateLengths[index] = allocatedLength + 1;
-        const candidate = renderCatalog(skills, candidateLengths, notice);
-        if (fitsBudget(candidate, budgetTokens, estimator)) {
-            allocatedLengths[index] = allocatedLength + 1;
-        }
-    }
-    return tierIndexes.every((index) => allocatedLengths[index] === skills[index].description.length);
-}
-function renderHardOverflow(skills, budgetTokens, estimator, descriptionCapTruncated) {
-    const protectedLengths = protectedDescriptionLengths(skills);
-    const baseWithoutNotice = renderCatalog([], []);
-    if (!fitsBudget(baseWithoutNotice, budgetTokens, estimator)) {
-        return { catalog: '', softOverflow: false, hardOverflow: true, descriptionCapTruncated };
-    }
-    const countWithoutNotice = findHardOverflowPrefixLength(skills, protectedLengths, {
-        notice: undefined,
-        budgetTokens,
-        estimator,
-    });
-    const baseWithNotice = renderCatalog([], [], PARTIAL_SKILL_NOTICE);
-    const countWithNotice = fitsBudget(baseWithNotice, budgetTokens, estimator)
-        ? findHardOverflowPrefixLength(skills, protectedLengths, {
-            notice: PARTIAL_SKILL_NOTICE,
-            budgetTokens,
-            estimator,
-        })
-        : -1;
-    const notice = countWithNotice >= countWithoutNotice ? PARTIAL_SKILL_NOTICE : undefined;
-    const retainedCount = notice ? countWithNotice : countWithoutNotice;
-    const catalog = renderCatalog(skills.slice(0, retainedCount), protectedLengths.slice(0, retainedCount), notice);
-    if (!fitsBudget(catalog, budgetTokens, estimator)) {
-        return {
-            catalog: fitsBudget(baseWithoutNotice, budgetTokens, estimator) ? baseWithoutNotice : '',
-            softOverflow: false,
-            hardOverflow: true,
-            descriptionCapTruncated,
-        };
-    }
-    return { catalog, softOverflow: false, hardOverflow: true, descriptionCapTruncated };
-}
-function findHardOverflowPrefixLength(skills, emptyLengths, budget) {
-    const { notice, budgetTokens, estimator } = budget;
-    return findLargestLocallyFittingCandidate(skills.length, (candidateCount) => {
-        const candidate = renderCatalog(skills.slice(0, candidateCount), emptyLengths.slice(0, candidateCount), notice);
-        return fitsBudget(candidate, budgetTokens, estimator);
-    });
-}
-function findLargestLocallyFittingCandidate(maximumCandidate, fitsCandidate) {
-    const verified = new Map();
-    const verify = (candidate) => {
-        const cached = verified.get(candidate);
-        if (cached !== undefined)
-            return cached;
-        const fits = fitsCandidate(candidate);
-        verified.set(candidate, fits);
-        return fits;
-    };
-    let lowerBound = 0;
-    let upperBound = maximumCandidate;
-    while (lowerBound < upperBound) {
-        const candidate = Math.ceil((lowerBound + upperBound) / 2);
-        if (verify(candidate)) {
-            lowerBound = candidate;
-        }
-        else {
-            upperBound = candidate - 1;
-        }
-    }
-    // Production BPE counts can dip at nearby token boundaries. Continue past a
-    // failed candidate, but bound the recovery scan so one turn cannot tokenize
-    // the whole 1,024-code-point or multi-thousand-skill search space repeatedly.
-    let largestFitting = lowerBound;
-    let consecutiveMisses = 0;
-    for (let candidate = lowerBound + 1; candidate <= maximumCandidate &&
-        consecutiveMisses < LOCAL_NON_MONOTONIC_RECOVERY_MAX_CONSECUTIVE_MISSES; candidate += 1) {
-        if (verify(candidate)) {
-            largestFitting = candidate;
-            consecutiveMisses = 0;
-        }
-        else {
-            consecutiveMisses += 1;
-        }
-    }
-    return largestFitting;
-}
-function renderCatalog(skills, descriptionLengths, notice) {
-    const entries = skills.map((skill, index) => {
-        const description = skill.description.slice(0, descriptionLengths[index] ?? 0).join('');
-        return description ? `- ${skill.name}: ${description}` : `- ${skill.name}`;
-    });
+function renderCatalog(skills, described, notice) {
+    const entries = skills.map((skill, index) => described.has(index) && skill.description
+        ? `- ${skill.name}: ${skill.description}`
+        : `- ${skill.name}`);
     return `<available_skills>\n${[...(notice ? [notice] : []), ...entries].join('\n')}\n</available_skills>`;
-}
-function fitsBudget(catalog, budgetTokens, estimator) {
-    return estimator.estimateTextTokens(catalog) <= budgetTokens;
-}
-function normalizeDescription(description) {
-    return description.replace(/\s+/gu, ' ').trim();
 }
 //# sourceMappingURL=skill-catalog.js.map

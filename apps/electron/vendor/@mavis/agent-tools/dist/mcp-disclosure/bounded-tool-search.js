@@ -2,7 +2,7 @@ import { Buffer } from 'node:buffer';
 import { Type } from '@sinclair/typebox';
 import { defineRuntimeTool, } from '@mavis/agent-core/tools';
 import { mcpServerOfToolName } from './search-index.js';
-import { TOOL_SEARCH_PTC_CALL_SENTENCE } from './tool-search.js';
+import { renderToolSearchDescription, resolveToolSearchTopK, toolSearchNoFilterError, TOOL_SEARCH_NAMESPACE_DESCRIPTION, } from './tool-search.js';
 /** Upper bound on names accepted by one `select:` query. */
 const MAX_SELECT_NAMES = 64;
 /** Server names listed when an `mcp__` name matches no indexed tool. */
@@ -12,6 +12,13 @@ const MAX_LISTED_SERVERS = 32;
  * definition is reported `oversized` instead of returned.
  */
 export const TOOL_SEARCH_MAX_RESULT_BYTES = 32 * 1024;
+/** How a `namespace` query relates to the namespaces this index actually holds. */
+function namespaceMatch(namespaces, query) {
+    const names = namespaces.map((entry) => entry.namespace);
+    if (names.includes(query))
+        return 'exact';
+    return names.some((name) => name.startsWith(`${query}.`)) ? 'prefix' : 'none';
+}
 export function createBoundedToolSearchTool(index, opts) {
     const maxResults = Number.isFinite(opts.topKMax)
         ? Math.max(1, Math.min(20, Math.trunc(opts.topKMax)))
@@ -30,10 +37,11 @@ export function createBoundedToolSearchTool(index, opts) {
             maxLength: 256,
             description: 'Regex filter over tool name/description/schema text (case-insensitive).',
         })),
+        namespace: Type.Optional(Type.String({ maxLength: 128, description: TOOL_SEARCH_NAMESPACE_DESCRIPTION })),
         top_k: Type.Optional(Type.Integer({
             minimum: 1,
             maximum: maxResults,
-            description: `Max results per page (default ${defaultResults}, max ${maxResults}; an "mcp__<server>" listing defaults to ${maxResults}).`,
+            description: `Max results per page (default ${defaultResults}, max ${maxResults}; a namespace query or an "mcp__<server>" listing defaults to ${maxResults}).`,
         })),
         offset: Type.Optional(Type.Integer({
             minimum: 0,
@@ -46,26 +54,23 @@ export function createBoundedToolSearchTool(index, opts) {
         content: [{ type: 'text', text }],
         isError: true,
     });
-    const callSentence = opts.ptc
-        ? TOOL_SEARCH_PTC_CALL_SENTENCE
-        : opts.directCall
-            ? 'Then call the chosen tool directly by its exact name with arguments matching its input_schema (`mcp_invoke` also works).'
-            : 'Then call `mcp_invoke` with the chosen tool_name and arguments to use one.';
     return defineRuntimeTool({
         name: 'tool_search',
-        description: [
-            'Discover on-demand tools, including scheduled-task management and configured integrations, that are absent from your default tool list.',
-            opts.exactSelect
-                ? 'Query with "select:<name>[,<name>...]" to load exact tools (for example names from the deferred tool catalog), "mcp__<server>" to list one server\'s tools, or keywords/`regex`; returns the full definitions (name, description, input_schema).'
-                : 'Search by keyword `query` and/or `regex`, or query "mcp__<server>" to list one server\'s tools; returns the full definitions (name, description, input_schema) of the matches, one page at a time.',
-            callSentence,
-        ].join(' '),
+        description: renderToolSearchDescription('Discover on-demand tools, including scheduled-task management and configured integrations, that are absent from your default tool list.', {
+            ...(opts.ptc ? { ptc: true } : {}),
+            ...(opts.exactSelect ? { exactSelect: true } : {}),
+            ...(opts.directCall ? { directCall: true } : {}),
+            paged: true,
+            namespaces: index.namespaces,
+        }),
         schema,
         execute: async (ctx, input) => {
-            if (!input.query?.trim() && !input.regex?.trim())
-                return err('Provide at least one of `query` or `regex`.');
-            if ((input.query?.length ?? 0) > 512 || (input.regex?.length ?? 0) > 256)
-                return err('query is limited to 512 characters; regex is limited to 256 characters.');
+            if (!input.query?.trim() && !input.regex?.trim() && !input.namespace?.trim())
+                return err(toolSearchNoFilterError(index.namespaces));
+            if ((input.query?.length ?? 0) > 512 ||
+                (input.regex?.length ?? 0) > 256 ||
+                (input.namespace?.length ?? 0) > 128)
+                return err('query is limited to 512 characters; regex is limited to 256 characters; namespace is limited to 128 characters.');
             if (input.top_k !== undefined &&
                 (!Number.isInteger(input.top_k) || input.top_k < 1 || input.top_k > maxResults))
                 return err(`top_k must be an integer between 1 and ${maxResults}.`);
@@ -80,19 +85,36 @@ export function createBoundedToolSearchTool(index, opts) {
                     return err(`Invalid regex: ${e instanceof Error ? e.message : String(e)}`);
                 }
             }
-            const topK = Math.max(1, Math.min(maxResults, Math.trunc(input.top_k ?? defaultResults)));
-            const resolved = opts.exactSelect
-                ? resolveExact(index, input, opts.directToolNames)
-                : (resolveByName(index, input) ??
-                    resolveMcpName(index, input, opts.directToolNames) ?? {
+            // `namespace` alone lists a whole group, so it ignores the default page
+            // size and goes up to the maximum; `top_k` still wins when the model sets it.
+            const topK = resolveToolSearchTopK(input, { default: defaultResults, max: maxResults });
+            const namespace = input.namespace?.trim();
+            if (namespace) {
+                try {
+                    opts.onNamespaceSearch?.({
+                        namespace,
+                        match: namespaceMatch(index.namespaces, namespace),
+                        withQuery: Boolean(input.query?.trim()),
+                    });
+                }
+                catch {
+                    // Counting never changes the search result.
+                }
+            }
+            // A `namespace` filter is a hard group filter, so `select:`/`mcp__<server>`
+            // name resolution does not apply to it; the keyword path carries it through.
+            const resolved = namespace
+                ? {
                     mode: 'keyword',
-                    matches: index.search({
-                        // Only the declared inputs: extra keys from the model (`topK`) must not reach the index.
-                        ...(input.query !== undefined ? { query: input.query } : {}),
-                        ...(input.regex !== undefined ? { regex: input.regex } : {}),
-                        nameBoost: true,
-                    }),
-                });
+                    matches: keywordMatches(index, input, namespace),
+                }
+                : opts.exactSelect
+                    ? resolveExact(index, input, opts.directToolNames)
+                    : (resolveByName(index, input) ??
+                        resolveMcpName(index, input, opts.directToolNames) ?? {
+                        mode: 'keyword',
+                        matches: keywordMatches(index, input, undefined),
+                    });
             const { matches } = resolved;
             const pageSize = resolved.mode === 'select'
                 ? matches.length
@@ -114,11 +136,16 @@ export function createBoundedToolSearchTool(index, opts) {
                 : undefined;
             const serialize = (consumed) => {
                 const more = consumed < matches.length;
+                // `omitted` answers "how many of this result set did I not get", which
+                // `next_offset` only implies; a namespace query lists a whole group, so
+                // the count is what tells the model the group is bigger than the page.
+                const omitted = matches.length - consumed;
                 return JSON.stringify({
                     hits,
                     total: matches.length,
                     returned: hits.length,
                     ...(more ? { next_offset: consumed } : {}),
+                    ...(omitted > 0 ? { omitted } : {}),
                     ...(oversized.length > 0 ? { oversized } : {}),
                     ...(resolved.notFound?.length ? { not_found: resolved.notFound } : {}),
                     ...(resolved.alreadyAvailable?.length
@@ -171,6 +198,19 @@ export function createBoundedToolSearchTool(index, opts) {
             }
             return { tool_name: 'tool_search', text, content: [{ type: 'text', text }] };
         },
+    });
+}
+/**
+ * The keyword path: only the declared inputs reach the index, so extra keys from
+ * the model (`topK`) cannot. `namespace` is a hard filter the index applies
+ * before BM25 ranks; paging bounds the result, so `topK` stays unset.
+ */
+function keywordMatches(index, input, namespace) {
+    return index.search({
+        ...(input.query !== undefined ? { query: input.query } : {}),
+        ...(input.regex !== undefined ? { regex: input.regex } : {}),
+        ...(namespace === undefined ? {} : { namespace }),
+        nameBoost: true,
     });
 }
 function noticeOf(...notices) {
@@ -274,11 +314,7 @@ function resolveExact(index, input, directToolNames) {
     if (mcpName)
         return mcpName;
     const named = unquotedQuery(query);
-    const matches = index.search({
-        ...(input.query !== undefined ? { query: input.query } : {}),
-        ...(input.regex !== undefined ? { regex: input.regex } : {}),
-        nameBoost: true,
-    });
+    const matches = keywordMatches(index, input, undefined);
     const direct = matches.length === 0 && named && !input.regex && directToolNames?.has(named);
     return { mode: 'keyword', matches, ...(direct ? { alreadyAvailable: [named] } : {}) };
 }

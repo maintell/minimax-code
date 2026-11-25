@@ -261,7 +261,7 @@ export class LocalApiAgentRoutes {
         const parentSession = parentSessionId ? await this.getSessionById(parentSessionId) : undefined;
         const explicitWorkspaceDir = readString(body, 'workspaceDir') ?? readString(body, 'workspace_dir');
         const appMode = readSessionAppMode(body, parentSession);
-        const runLocation = await this.resolveSessionRunLocation(body, appMode, explicitWorkspaceDir ?? localAgent?.defaultWorkspaceDir);
+        const runLocation = await this.resolveSessionRunLocation(body, appMode, explicitWorkspaceDir ?? localAgent?.defaultWorkspaceDir, explicitWorkspaceDir === undefined);
         if (runLocation instanceof Response)
             return runLocation;
         const workspaceDir = runLocation?.resolvedDir ?? explicitWorkspaceDir;
@@ -273,7 +273,7 @@ export class LocalApiAgentRoutes {
             isDefaultWorkspace: explicitWorkspaceDir === undefined && runLocation === undefined,
         };
     }
-    async resolveSessionRunLocation(body, appMode, workspaceDir) {
+    async resolveSessionRunLocation(body, appMode, workspaceDir, workspaceDirImplicit) {
         const baseDir = workspaceDir ?? this.resolveDefaultWorkspaceDir();
         try {
             const input = canUseRunLocationForAppMode(appMode)
@@ -281,7 +281,9 @@ export class LocalApiAgentRoutes {
                 : undefined;
             if (!input)
                 return undefined;
-            return await applyLocalRunLocation(input, baseDir, () => this.nowMs());
+            return await applyLocalRunLocation(input, baseDir, () => this.nowMs(), {
+                workspaceDirImplicit,
+            });
         }
         catch (err) {
             if (err instanceof LocalRunLocationError) {
@@ -527,8 +529,8 @@ export class LocalApiAgentRoutes {
             return readOnlyLegacySessionResponse();
         return this.ctx.requestCompaction(session, body);
     }
-    getLocalAgent(name) {
-        return this.management.getLocalAgent(name);
+    getLocalAgent(name, options) {
+        return this.management.getLocalAgent(name, options);
     }
     async ensurePrimaryAgentRecord() {
         const existing = await this.getLocalAgent(this.agentName);

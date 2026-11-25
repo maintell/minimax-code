@@ -59,17 +59,37 @@ export function toQueuedMessageItemView(item, overrides = {}) {
     };
 }
 function toQueueAttachment(input) {
-    const location = toQueueAttachmentLocation(input);
+    const drive = toQueueDriveAsset(input);
+    const location = toQueueAttachmentLocation(input) ?? (drive ? { filePath: '' } : undefined);
     if (!location)
         return undefined;
     const mimeType = input.meta?.mimeType ?? '';
     const fileName = nonEmptyString(input.meta?.fileName) ??
         (location.filePath ? basename(location.filePath) : 'attachment');
     return {
-        type: input.meta?.attachmentType === 'image' || mimeType.startsWith('image/') ? 'image' : 'file',
+        type: queueAttachmentType(input, mimeType, drive),
         fileName,
         mimeType,
         ...location,
+        ...drive,
+    };
+}
+function queueAttachmentType(input, mimeType, drive) {
+    if (drive && input.meta?.attachmentType === 'folder')
+        return 'folder';
+    return input.meta?.attachmentType === 'image' || mimeType.startsWith('image/') ? 'image' : 'file';
+}
+/** A Drive asset reference is kept even when it has no local source. */
+function toQueueDriveAsset(input) {
+    const driveNodeId = nonEmptyString(input.local?.driveNodeId);
+    if (!driveNodeId)
+        return undefined;
+    const drivePath = nonEmptyString(input.local?.drivePath);
+    const sizeBytes = input.meta?.sizeBytes;
+    return {
+        driveNodeId,
+        ...(drivePath ? { drivePath } : {}),
+        ...(sizeBytes !== undefined ? { sizeBytes } : {}),
     };
 }
 function toQueueAttachmentLocation(input) {
@@ -91,6 +111,9 @@ function toAttachmentView(attachment) {
             attachmentType: attachment.type,
             fileName: attachment.fileName,
             mimeType: attachment.mimeType,
+            ...(attachment.driveNodeId && attachment.sizeBytes !== undefined
+                ? { sizeBytes: attachment.sizeBytes }
+                : {}),
         },
         local: {
             filePath: attachment.filePath,
@@ -98,6 +121,8 @@ function toAttachmentView(attachment) {
             ...(attachment.dataUrl && !isInlineDisplayDataUrl(attachment.dataUrl)
                 ? { dataUrl: attachment.dataUrl }
                 : {}),
+            ...(attachment.driveNodeId ? { driveNodeId: attachment.driveNodeId } : {}),
+            ...(attachment.drivePath ? { drivePath: attachment.drivePath } : {}),
         },
     };
 }

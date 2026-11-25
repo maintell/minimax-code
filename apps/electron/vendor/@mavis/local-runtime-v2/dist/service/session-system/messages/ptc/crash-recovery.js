@@ -1,11 +1,10 @@
 import { readPtcChildExecutionDetails, } from '@mavis/agent-core/tools';
+import { renderPtcExecutionEvidence } from '@mavis/harness';
 import { logger } from '@mavis/shared/local-runtime-logging';
 const OUTCOME_UNKNOWN_CODE = 'PTC_OUTCOME_UNKNOWN';
-const OUTER_INTERRUPTED_CODE = 'PTC_INTERRUPTED_BY_RUNTIME_RESTART';
 const OUTCOME_UNKNOWN_MESSAGE = 'This tool call was interrupted by a local runtime restart. Its result is unknown and must not be replayed automatically.';
-const OUTER_INTERRUPTED_MESSAGE = 'This PTC program was interrupted because the previous local runtime stopped. Known child results were preserved; unknown child calls must not be replayed automatically.';
-const MAX_PTC_RECOVERY_SUMMARY_BYTES = 64 * 1024;
-const MAX_PTC_RECOVERY_INPUT_BYTES = 2 * 1024;
+/** Shared with the safety fold; both hosts render the same evidence text. */
+export { renderPtcExecutionEvidence };
 /**
  * Reconciles only evidence that survived in the existing display Message
  * rows. It never resumes a Worker, invokes a tool, or infers a call from JS.
@@ -248,112 +247,6 @@ function recoveredRunCodeResult(details) {
 }
 function outerInterruptedText(details) {
     return renderPtcExecutionEvidence(details, 'runtime-restart');
-}
-export function renderPtcExecutionEvidence(details, reason) {
-    const forced = [
-        ...(details.host_forced_content ? [details.host_forced_content] : []),
-        ...details.retained_facts.flatMap((fact) => fact.kind === 'plugin_feedback' && fact.text ? [fact.text] : []),
-    ];
-    const childLines = details.child_calls.map(describeRecoveredChild);
-    const childEffects = details.child_calls.flatMap(describeRecoveredChildEffects);
-    const factLines = details.retained_facts.flatMap(describeRetainedFact);
-    const errorCode = reason === 'runtime-restart' ? OUTER_INTERRUPTED_CODE : 'PTC_OUTPUT_WITHHELD_BY_SAFETY_REVIEW';
-    const message = reason === 'runtime-restart'
-        ? OUTER_INTERRUPTED_MESSAGE
-        : 'PTC output was withheld after safety review. Host-recorded child execution evidence was preserved. Unknown outcomes must not be replayed automatically.';
-    return truncateRecoverySummary([
-        `<ptc_error code="${errorCode}">${message}</ptc_error>`,
-        '<ptc_recovery>',
-        'The program was not replayed. Treat unknown child outcomes as non-retryable until you verify their effects.',
-        ...(childLines.length > 0 ? ['Child calls:', ...childLines] : []),
-        ...(factLines.length > 0 ? ['Preserved execution facts:', ...factLines] : []),
-        ...(childEffects.length > 0 ? ['Preserved child effects:', ...childEffects] : []),
-        ...(forced.length > 0 ? ['Preserved plugin feedback:', ...forced] : []),
-        '</ptc_recovery>',
-    ]);
-}
-function describeRecoveredChild(call) {
-    const status = {
-        unknown: 'outcome unknown; do not replay automatically',
-        failed: 'failed',
-        completed: 'completed',
-    }[call.status];
-    return `- ${call.tool_name} (${call.child_tool_call_id}): ${status}`;
-}
-function describeRecoveredChildEffects(call) {
-    const input = call.input ? `input=${boundedJson(call.input, MAX_PTC_RECOVERY_INPUT_BYTES)}` : '';
-    const resultRef = call.result_ref ? `result_ref=${call.result_ref}` : '';
-    const effects = [input, resultRef].filter(Boolean);
-    return effects.length > 0
-        ? [`- ${call.tool_name} (${call.child_tool_call_id}): ${effects.join('; ')}`]
-        : [];
-}
-function describeRetainedFact(fact) {
-    switch (fact.kind) {
-        case 'terminate_agent':
-            return ['- A trusted plugin requested that the outer agent stop.'];
-        case 'outcome_unknown':
-            return [`- ${fact.child_tool_call_id}: outcome unknown; do not replay automatically.`];
-        case 'child_error':
-            return [
-                `- ${fact.child_tool_call_id}: child error ${fact.code}${fact.cancelled ? ' (cancelled)' : ''}.`,
-            ];
-        case 'background_task':
-            return [`- ${fact.child_tool_call_id}: background task ${fact.task_id} was started.`];
-        case 'bash_exit':
-            return [`- ${fact.child_tool_call_id}: bash exit code ${String(fact.exit_code)}.`];
-        case 'approval':
-            return [`- ${fact.child_tool_call_id}: approval was ${fact.status}.`];
-        case 'budget_exceeded':
-            return [`- PTC budget exceeded: ${fact.budget}.`];
-        default:
-            return describeDeliveryFact(fact);
-    }
-}
-function describeDeliveryFact(fact) {
-    switch (fact.kind) {
-        case 'truncation':
-            // Same rule as the live run_code result (run-code-tool.ts truncationSummary):
-            // only a real cut is worth a line. "unknown" mostly means a non-builtin
-            // result the host never cuts; the fact itself stays in details.
-            return fact.truncated === 'true'
-                ? [
-                    `- ${fact.child_tool_call_id}: output completeness is truncated${fact.continuation ? `; continuation=${boundedJson(fact.continuation, MAX_PTC_RECOVERY_INPUT_BYTES)}` : ''}.`,
-                ]
-                : [];
-        case 'media_delivery':
-            return [`- ${fact.child_tool_call_id}: media delivery ${fact.status}.`];
-        case 'plugin_feedback':
-            return fact.text
-                ? [`- ${fact.child_tool_call_id}: plugin ${fact.phase} feedback was recorded.`]
-                : [`- ${fact.child_tool_call_id}: plugin ${fact.phase} feedback was preserved.`];
-        case 'delivery_incomplete':
-            return [
-                `- Outer delivery was incomplete (${fact.reason})${fact.reference ? `; reference=${fact.reference}` : ''}.`,
-            ];
-        default:
-            return [];
-    }
-}
-function boundedJson(value, maximumBytes) {
-    const json = JSON.stringify(value);
-    return truncateUtf8(json, maximumBytes, '…[truncated]');
-}
-function truncateRecoverySummary(lines) {
-    return truncateUtf8(lines.join('\n'), MAX_PTC_RECOVERY_SUMMARY_BYTES, '\n<ptc_recovery_summary_truncated/>');
-}
-function truncateUtf8(value, maximumBytes, marker) {
-    const bytes = new TextEncoder().encode(value);
-    if (bytes.byteLength <= maximumBytes)
-        return value;
-    const markerBytes = new TextEncoder().encode(marker);
-    if (maximumBytes <= markerBytes.byteLength) {
-        return new TextDecoder().decode(markerBytes.slice(0, maximumBytes), { stream: true });
-    }
-    const prefix = new TextDecoder().decode(bytes.slice(0, maximumBytes - markerBytes.byteLength), {
-        stream: true,
-    });
-    return `${prefix}${marker}`;
 }
 function emptyPtcDetails() {
     return { version: 1, child_calls: [], retained_facts: [] };

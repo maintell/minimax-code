@@ -3,7 +3,6 @@ import { parseProviderId, parseSourceQualifiedModelKey } from '../resolution/mod
 import { cacheStatusView, minimaxApiModels, } from '../catalog/list-models.js';
 import { modelConfigFingerprint } from '../catalog/model-cache.js';
 import { LocalModelProviderError } from '../contracts.js';
-import { assertGeminiEffortOptions } from '../resolution/model-ref.js';
 const providerMutationTails = new Map();
 export function patchModelParameters(model, normalizedPatch) {
     return {
@@ -13,12 +12,6 @@ export function patchModelParameters(model, normalizedPatch) {
 }
 export function removeLegacyCustomProviderNpm(provider) {
     delete provider.npm;
-}
-/** Validates against the final protocol, so switching an existing provider to Gemini is covered too. */
-export function assertCustomProviderEffortOptions(provider) {
-    for (const model of Object.values(provider.models ?? {})) {
-        assertGeminiEffortOptions(provider.api, model.thinking?.effortOptions);
-    }
 }
 /**
  * Keep the global default callable after a custom Provider/model mutation.

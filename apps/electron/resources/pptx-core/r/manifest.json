@@ -32,21 +32,21 @@
       "mimeType": "application/wasm"
     },
     {
-      "path": "_framework/Mavis.Pptx.Importer.Wasm.oiuwgy7wpu.wasm",
-      "sha256": "sha256:8055024b3b1c12fbcf98f12e9238e5247b827f983411811ca850d268db76b555",
+      "path": "_framework/Mavis.Pptx.Importer.Wasm.w8gugsmo6m.wasm",
+      "sha256": "sha256:40f216c708b0412ac94c4a1a122e230304a33104ec0cfc419a8c8a075b5af4c1",
       "sizeBytes": 22805,
       "mimeType": "application/wasm"
     },
     {
-      "path": "_framework/Mavis.Pptx.Importer.hqtbpm89y3.wasm",
-      "sha256": "sha256:49fc19ca88fd9b2e094d6c687ff579b503c67ae837ce8aff29a9b5b0e9194fdc",
+      "path": "_framework/Mavis.Pptx.Importer.nkp39sof0u.wasm",
+      "sha256": "sha256:377d2a1858cb28d20aed5dc14a9b39c37b7d3b1f16d3e64711f7ff9ef054bad4",
       "sizeBytes": 469269,
       "mimeType": "application/wasm"
     },
     {
-      "path": "_framework/Mavis.Pptx.SafeOpc.3wkxx8bd38.wasm",
-      "sha256": "sha256:fd464396b2e33b4bd7ee8eae959e7e089f00c9ae57fe8ea5b0b6adc548a6cfa4",
-      "sizeBytes": 72981,
+      "path": "_framework/Mavis.Pptx.SafeOpc.vpwzczwafy.wasm",
+      "sha256": "sha256:9df706a6b32626a9ddfada28ddb688b06b262c07c84bcc753e3aaf13c8edac38",
+      "sizeBytes": 74005,
       "mimeType": "application/wasm"
     },
     {
@@ -1089,7 +1089,7 @@
     },
     {
       "path": "_framework/dotnet.js",
-      "sha256": "sha256:13d6c73ee2c394d74e688be74d7591ceb60e75c2acfe76a460e20b5f4664dd94",
+      "sha256": "sha256:4b8c2a7d010ba8d797ea45f61adad8958cf2f6256d26a3e8c9fe2aaeb1126a6c",
       "sizeBytes": 82393,
       "mimeType": "text/javascript"
     },
@@ -1341,8 +1341,8 @@
     },
     {
       "path": "pptx-core-host.js",
-      "sha256": "sha256:f0c72cb320279b2d3f1c50c930551951b850579574a3edce673b928e353260f5",
-      "sizeBytes": 1871893,
+      "sha256": "sha256:09ec9f488ce16b9222721957d10291065953f67c7fdf8d1984fa1ed4d5f151da",
+      "sizeBytes": 1875567,
       "mimeType": "text/javascript"
     },
     {
@@ -1352,5 +1352,5 @@
       "mimeType": "text/javascript"
     }
   ],
-  "runtimeHash": "sha256:ed87f358b1a3d5f7ba1f24301367ade1be1b98d20d32b5d9367826016bfb7175"
+  "runtimeHash": "sha256:dcaa6187c853c8862a8188e29f689e8ae2ab546ed4b151829a0fd9151a060c90"
 }

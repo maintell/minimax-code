@@ -3,7 +3,7 @@ import path from 'node:path';
 import { withPptPreviewTaskStop } from './ppt-task-stop-cascade.js';
 import { bunnyMemoryRoot, createBunnyMediaDescriptionRepository, createBunnyRoundBudgetExtension, } from '../../service/bunny/index.js';
 import { createAssignmentPermissionDecisions } from '../../service/assignment/index.js';
-import { readLocalPermissionMode } from '../../service/permission/index.js';
+import { createProtectedRootDecisions, readLocalPermissionMode, runtimeStateProtectedRoots, } from '../../service/permission/index.js';
 import { createRuntimeAssignmentExecutionExtension } from './assignment-snapshot-product.js';
 import { withAssignmentTurnSettlement } from './assignment-turn-settlement.js';
 import { createTurnAgentKindResolver } from './turn-agent-kind.js';
@@ -13,24 +13,23 @@ import { agentHomeDirectories } from './agent-homes.js';
 import { currentBetaResolutionContext, getRuntimeBuildEnv, getRuntimeRegion, isLocalSourceProvenanceEnabled, resolveBetaFeature, } from '@mavis/config';
 import { resolveBunnyHomeDir } from '@mavis/shared/local-runtime-paths';
 import { createRuntimeAuthSubmissionPreparation } from './runtime-execution-auth.js';
-import { productOutputReviewPolicy, resolveSafetyApiBase, SAFETY_SCENE, } from '../../service/content-safety/index.js';
+import { resolveSafetyApiBase, SAFETY_SCENE } from '../../service/content-safety/index.js';
 import { createPtcScriptHost, readPtcScriptCatalog, renderPtcScriptCatalog, } from '@mavis/agent-tools';
-import { report } from '../../service/turn-system/index.js';
-import { BUNNY_DATABASE_DIR, BUNNY_TRASH_DIR, } from '../../service/session-system/index.js';
+import { BUNNY_DATABASE_DIR, BUNNY_TRASH_DIR, sessionIsCoordinator, } from '../../service/session-system/index.js';
 import { isCommandLineRuntimeOwner } from '../agent/profile-source.js';
 import { combineLocalTurnToolPolicyGuards, createGoalBudgetToolPolicyGuard, } from '../agent/goal-budget-tool-policy.js';
 import { createGoalFinalReply } from '../agent/goal-final-reply.js';
 import { createRuntimeSourceReferenceExtension } from '../agent/source-reference-extension.js';
 import { createBuiltinCoordinatorAgents } from '../agent/agent-surface-policy.js';
 import { createPlanEntrySubmissionPreparation, } from '../../service/plan/index.js';
-import { withSessionClioTurnSettlement, } from '../../service/session-clio/index.js';
-import { combineAgentEventObservers, contextResetSessions, composeTurnSubmissionPreparations, createContentReviewSlowEventObserver, createGoalTurnSubmissionPreparation, createSubmissionMemoryMetricsPreparation, createLocalAgentHost, createLocalNetworkRecovery, createSessionLLMRetryEventObserver, createPromptSuggestionService, createSideMessageFallbackLog, createSteerFaultFilePort, createTurnFaultFilePort, hasPriorityUserQueueItem, initializeTurnSystem, requireAgentRuntime, } from '../../service/turn-system/index.js';
+import { withSessionClioTurnSettlement } from '../../service/session-clio/index.js';
+import { combineAgentEventObservers, contextResetSessions, composeTurnSubmissionPreparations, createGoalTurnSubmissionPreparation, createSubmissionMemoryMetricsPreparation, createLocalAgentHost, createLocalNetworkRecovery, createContentReviewSlowEventObserver, createSessionLLMRetryEventObserver, createPromptSuggestionService, createSideMessageFallbackLog, createSteerFaultFilePort, createTurnFaultFilePort, hasPriorityUserQueueItem, initializeTurnSystem, requireAgentRuntime, requireHarnessHistory, report, } from '../../service/turn-system/index.js';
 import { closeRuntimeTurnSystem } from './runtime-services-lifecycle.js';
 import { createRuntimeUndeliveredSideMessages } from './runtime-user-applications.js';
 import { createQuestionnaireAnswerAdmissionPreparation, createQuestionnaireAnswerSteeringMarker, observeQuestionnaireAnswerSteering, } from './questionnaire-answer-admission.js';
 import { createRuntimeQueueSelection, createWaitingForUserQueueWake, } from './runtime-queue-selection.js';
 import { createRuntimeTurnAdmissionOptions } from './runtime-services-composition.js';
-import { scopeCoordinatorTurnExtensions, } from './coordinator-turn-scope.js';
+import { scopeCoordinatorTurnExtensions } from './coordinator-turn-scope.js';
 import { createApprovedTitleHandler, createReplyTitleReviewHandler, createConsumedSteeringHandler, createQueueWakeFailureReporter, createTurnSystemMessageDelivery, } from './turn-message-delivery.js';
 /** A Turn detached from its deleted Goal goes on as an ordinary Turn. */
 function createRuntimeGoalFinalReply(goalPort) {
@@ -90,7 +89,8 @@ function createRuntimePromptSuggestions(input) {
 /**
  * The product with what coordinator-owned Sessions add to it: their `agentKind`
  * label, Bunny's home readable to Bunny, and assignment-aware permission
- * decisions over the ordinary policy.
+ * decisions over the ordinary policy. The app's own state (databases,
+ * credentials, session history) is denied to every Session's writes first.
  */
 function withCoordinatorCapabilities(input) {
     const { roster } = input.sessionSystem.coordinatorOwnership;
@@ -104,7 +104,10 @@ function withCoordinatorCapabilities(input) {
         agentHomeDirectories: (agentName) => agentHomeDirectories(roster, input.options.dataDir, agentName),
         permission: {
             ...input.product.permission,
-            decisions: createAssignmentPermissionDecisions({
+            decisions: createProtectedRootDecisions({
+                sessions: input.sessionSystem.repositories.sessions,
+                roots: runtimeStateProtectedRoots(input.options.dataDir),
+            }, createAssignmentPermissionDecisions({
                 sessions: input.sessionSystem.repositories.sessions,
                 tasks: input.sessionSystem.repositories.assignmentTasks,
                 ownership: input.sessionSystem.coordinatorOwnership,
@@ -118,7 +121,7 @@ function withCoordinatorCapabilities(input) {
                     path.join(resolveBunnyHomeDir(input.options.dataDir), BUNNY_DATABASE_DIR),
                     path.join(resolveBunnyHomeDir(input.options.dataDir), BUNNY_TRASH_DIR),
                 ],
-            }),
+            })),
         },
     };
 }
@@ -292,7 +295,7 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
     const { plan } = dependencies;
     const { llmRetry, reviewOfflineWait } = createRuntimeLlmRetry(input);
     const { suggestions, promptSuggestion } = createRuntimePromptSuggestions(input);
-    let agentRuntime;
+    let agentHost;
     const queueSelection = createTurnQueueSelection(input, plan, dependencies.planEntryEnabled);
     input.options.compatibility.backgroundTasks.bindRuntimeOwner({
         ownerId: input.runtimeOwnerIdentity.createOwnerId('background-task'),
@@ -335,6 +338,11 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
         // consumeSteering directly — the wrapped handler above would publish a
         // `session.start` no ended Turn should emit.
         commitSteeringTeardownProjection: (steer) => input.messageDelivery.consumeSteering(steer),
+        // The teardown commit has no Agent config, so a coordinator's fall-to-session
+        // peer message would keep the ordinary session_send reply note its catalog
+        // hides. The shared reader answers from the built-in roster, the same rule
+        // the tool authority uses, and treats an unreadable Session as ordinary.
+        receiverIsCoordinator: (sessionId) => sessionIsCoordinator(input.sessionSystem, sessionId),
         // An AskUser v2 answer steered into a Stopped/abnormally ended Turn falls
         // into the conversation through the teardown commit. injected_at is
         // written only here, after BOTH the display row and the canonical history
@@ -347,11 +355,13 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
             const goalFinalReply = createRuntimeGoalFinalReply(input.goalPort);
             const consumeSteering = createConsumedSteeringHandler(input.messageDelivery, input.sessionSystem, input.writeGlobalEvent, input.product.executor.reportFailure);
             const production = await createLocalAgentHost({
+                pluginHooks: dependencies.pluginHooks,
                 product: withTitleReviewCapability(input),
                 db: input.options.db,
                 preparation: input.preparation,
                 sessions: input.sessionSystem,
                 safety: input.safety,
+                skillReceipts: input.skillReceipts,
                 ...capabilities,
                 turnCapabilities: input.turnCapabilities,
                 promptSuggestion,
@@ -374,6 +384,8 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
                 reviewOfflineWait,
                 // 送审等了 15 秒以上时发 `content.review.slow`，界面在输入框上方提示检查电脑负荷。
                 onSlowReview: createContentReviewSlowEventObserver(input.writeGlobalEvent),
+                // 服务端审核开关：开着的轮次交给模型网关审核；关着、请求失败或读不到时在本地送审。
+                gatewayReviewEnabled: input.safety.serverReviewEnabled,
                 normalExtensions: [
                     ...createCoordinatorTurnExtensions(input),
                     ...(!isLocalSourceProvenanceEnabled(input.options.runtimeOwnerKind)
@@ -391,7 +403,7 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
                 ...ptcScriptHostOptions(input, ptcScriptsSwitch(input)),
                 eventObserver: combineAgentEventObservers(...(input.channelSystem ? [input.channelSystem.terminalReplies] : []), 
                 // Before the lifecycle: it records each event before the terminal one is published.
-                input.bunnyTurnSilence, input.turnLifecycleEvents, input.bunnyStateObserver, input.bunnyTurnTiming),
+                input.bunnyTurnSilence, input.turnLifecycleEvents, dependencies.extensionObserver, input.bunnyStateObserver, input.bunnyTurnTiming),
                 turnTiming: input.bunnyTurnTiming,
                 turnFaults: createRuntimeTurnFaults(input),
                 segmentMediaDescriptions: createBunnyMediaDescriptionRepository({
@@ -407,7 +419,7 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
                 ...(isCommandLineRuntimeOwner(input.options.runtimeOwnerKind)
                     ? { cliProductPolicy: true }
                     : {}),
-                ...productOutputReviewPolicy(input.options.runtimeOwnerKind),
+                ...(input.options.runtimeOwnerKind === 'tui' ? { tuiProductPolicy: true } : {}),
                 ...(input.options.getRunawayGuardConfig
                     ? { getRunawayGuardConfig: input.options.getRunawayGuardConfig }
                     : {}),
@@ -417,13 +429,15 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
                     : {}),
                 getSegmentContextConfig: input.options.getBunnyContextConfig,
             });
-            agentRuntime = bindRuntimePtcStore(input, production);
+            agentHost = production;
+            bindRuntimePtcStore(input, production);
             return production.host;
         },
+        harnessHistory: lateBoundHarnessHistory(() => agentHost?.history),
         disposeRuntimeSession: async (sessionId) => {
             suggestions.cancel(sessionId);
             try {
-                await requireAgentRuntime(agentRuntime).disposeSession(sessionId);
+                await requireAgentRuntime(agentHost?.lifecycle).disposeSession(sessionId);
             }
             finally {
                 await dependencies.disposeMcpSession(sessionId);
@@ -462,9 +476,16 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
     });
     input.options.compatibility.backgroundTasks.bindNotificationReceipts(turnSystem.receipts);
     queueSelection.bindDispatchQueue((sessionId) => turnSystem.turns.dispatchQueue(sessionId));
-    return withRuntimeTurnSystemLifecycle(turnSystem, suggestions, queueSelection, async () => {
-        await agentRuntime?.close?.();
-    });
+    return withRuntimeTurnSystemLifecycle(turnSystem, { suggestions, queueSelection, agentHost });
+}
+/** The production harness history exists only after `createHost`; bind it per call. */
+function lateBoundHarnessHistory(current) {
+    return {
+        inspectContinuation: (request) => requireHarnessHistory(current()).inspectContinuation(request),
+        rewind: (request) => requireHarnessHistory(current()).rewind(request),
+        fork: (request) => requireHarnessHistory(current()).fork(request),
+        inspectForkBoundary: (request) => requireHarnessHistory(current()).inspectForkBoundary(request),
+    };
 }
 /**
  * Queue selection whose AskUser countdown wake dispatches through the Turn
@@ -472,29 +493,6 @@ export async function initializeRuntimeTurnSystem(input, dependencies) {
  * dispatch is bound afterwards; only timers armed by queue classification
  * call it, and classification runs inside the Turn System.
  */
-function createRuntimeSubmissionPreparation(input, plan) {
-    return composeTurnSubmissionPreparations(createRuntimeAuthSubmissionPreparation(input.options.executionAuthMode, input.product.preparation.modelResolver.authContextGetter), 
-    // Counts submissions that passed auth; it never rejects one.
-    createSubmissionMemoryMetricsPreparation(input.options.metrics), createPlanEntrySubmissionPreparation(plan), createGoalTurnSubmissionPreparation({
-        prepare: input.goalPort.prepareTurnAdmission,
-        hasPendingPlan: (sessionId) => plan.lifecycleFence.blocks({ sessionId }),
-        hasPriorityMailboxWork: async (sessionId) => hasPriorityUserQueueItem(await input.sessionSystem.queue.committed.list(sessionId)),
-    }), input.options.compatibility.sessionHandoff.hosted.submissionPreparation, 
-    // Last: it only records that a v2 questionnaire answer reached the model.
-    createQuestionnaireAnswerAdmissionPreparation({
-        markAnswerAdmitted: markQuestionnaireAnswerDelivered(input),
-        readQueuedOrigins: async (sessionId, itemId) => {
-            const item = await input.sessionSystem.queue.committed.get(sessionId, itemId);
-            return item
-                ? [
-                    item.message.origin,
-                    ...(item.immediateSendBatch?.members.map((member) => member.message.origin ?? member.provenance.sourceContext?.origin) ?? []),
-                ]
-                : [];
-        },
-        ...(input.options.logger ? { logger: input.options.logger } : {}),
-    }));
-}
 function createTurnQueueSelection(input, plan, planEntryEnabled) {
     let dispatchQueue;
     const selection = createRuntimeQueueSelection({
@@ -565,10 +563,27 @@ function releaseMiniAppTurn(memory) {
         }
     };
 }
-/** Adds the prompt-suggestion port and stops suggestions and countdown wake timers on close. */
-function withRuntimeTurnSystemLifecycle(turnSystem, suggestions, queueSelection, closeAgentHostResources) {
+/**
+ * Adds the prompt-suggestion port and the harness lifecycle (Plugin Hook
+ * Session events and close), and stops suggestions and countdown wake timers
+ * on close.
+ */
+function withRuntimeTurnSystemLifecycle(turnSystem, owners) {
+    const { suggestions, queueSelection } = owners;
+    const harness = requireAgentRuntime(owners.agentHost?.lifecycle);
+    // One close behind both seams: the Turn System's own close releases the Host's
+    // resources (the PTC session store's temp tree) even when `turnSystem.close()`
+    // fails, and `closeHarness` hands the same close to the services lifecycle.
+    // Memoized, so a lifecycle that wraps its own cleanup runs it exactly once.
+    let harnessClosing;
+    const closeAgentHostResources = () => {
+        harnessClosing ??= harness.close();
+        return harnessClosing;
+    };
     return {
         ...turnSystem,
+        pluginHooks: harness.pluginHooks,
+        closeHarness: closeAgentHostResources,
         turns: {
             ...turnSystem.turns,
             promptSuggestion: {
@@ -584,14 +599,16 @@ function withRuntimeTurnSystemLifecycle(turnSystem, suggestions, queueSelection,
     };
 }
 /**
- * Binds the PTC session store so a committed context reset reaches it, and
- * returns the Host lifecycle the caller keeps for Session disposal. With
+ * Binds the PTC session store so a committed context reset reaches it. With
  * `beta.ptcStore` off there is no store: the binding is told so, and stops
  * remembering resets for a store that will never exist.
+ *
+ * The Host lifecycle stays on the composition the caller keeps
+ * (`agentHost.lifecycle`), which is what Session disposal and the runtime
+ * close both read.
  */
 function bindRuntimePtcStore(input, production) {
     input.options.prepared?.ptcStoreBinding?.bind(production.ptcSessionStore);
-    return production.lifecycle;
 }
 /**
  * `sessionTitle.enabled: false` disables title generation: wire a no-op so no
@@ -634,6 +651,29 @@ function createAskUserPolicySource(input) {
         readConfig: () => Reflect.get(input.product.preparation.configBuilder.config(), 'askUser'),
         isGoalActive: async (sessionId) => (await input.goalPort.getBySession(sessionId))?.status === 'active',
     };
+}
+function createRuntimeSubmissionPreparation(input, plan) {
+    return composeTurnSubmissionPreparations(createRuntimeAuthSubmissionPreparation(input.options.executionAuthMode, input.product.preparation.modelResolver.authContextGetter), 
+    // Counts submissions that passed auth; it never rejects one.
+    createSubmissionMemoryMetricsPreparation(input.options.metrics), createPlanEntrySubmissionPreparation(plan), createGoalTurnSubmissionPreparation({
+        prepare: input.goalPort.prepareTurnAdmission,
+        hasPendingPlan: (sessionId) => plan.lifecycleFence.blocks({ sessionId }),
+        hasPriorityMailboxWork: async (sessionId) => hasPriorityUserQueueItem(await input.sessionSystem.queue.committed.list(sessionId)),
+    }), input.options.compatibility.sessionHandoff.hosted.submissionPreparation, 
+    // Last: it only records that a v2 questionnaire answer reached the model.
+    createQuestionnaireAnswerAdmissionPreparation({
+        markAnswerAdmitted: markQuestionnaireAnswerDelivered(input),
+        readQueuedOrigins: async (sessionId, itemId) => {
+            const item = await input.sessionSystem.queue.committed.get(sessionId, itemId);
+            return item
+                ? [
+                    item.message.origin,
+                    ...(item.immediateSendBatch?.members.map((member) => member.message.origin ?? member.provenance.sourceContext?.origin) ?? []),
+                ]
+                : [];
+        },
+        ...(input.options.logger ? { logger: input.options.logger } : {}),
+    }));
 }
 function createRuntimeHistoryProjections(input) {
     return {

@@ -1,4 +1,4 @@
-import { isAskUserContextPolicy, isAskUserPolicy, isPluginRecommendationPluginName, PLUGIN_RECOMMENDATION_DISMISSED_MAX, } from '@mavis/config';
+import { isAskUserContextPolicy, isAskUserPolicy, isPluginRecommendationPluginName, isWorktreeKeepCount, PLUGIN_RECOMMENDATION_DISMISSED_MAX, } from '@mavis/config';
 import { LocalConfigValidationError } from './raw-config.js';
 // BYOK trees ('minimax_api', 'custom_provider') are intentionally excluded
 // from both whitelists below: they hold plaintext API keys and must only be
@@ -19,15 +19,19 @@ const LOCAL_CONFIG_MUTABLE_FIELDS = new Set([
     'memory',
     'review',
     'worktreeRefreshBeforeCreate',
+    'worktreeAutoCleanupEnabled',
+    'worktreeKeepCount',
     'agents',
     'dataContribution',
     'askUser',
     'promptSuggestion',
     'quotaAutoResume',
     'nextStepBox',
+    'advisor',
     'bunny',
     'pluginRecommendation',
     'subagent',
+    'productionParity',
 ]);
 // Roots whose child keys are open-ended (model ids, agent names, beta flags…).
 // A dotted write only has to name the root; the leaf key cannot be enumerated.
@@ -51,6 +55,7 @@ const EXACT_DOTTED_MUTABLE_ROOTS = new Set([
     'promptSuggestion',
     'quotaAutoResume',
     'nextStepBox',
+    'advisor',
     'bunny',
     'pluginRecommendation',
     'subagent',
@@ -70,6 +75,7 @@ const EXACT_DOTTED_MUTABLE_FIELDS = new Set([
     'promptSuggestion.enabled',
     'quotaAutoResume.enabled',
     'nextStepBox.enabled',
+    'advisor.enabled',
     'bunny.enabled',
     'pluginRecommendation.enabled',
     'pluginRecommendation.dismissedPlugins',
@@ -86,11 +92,14 @@ export const DANGEROUS_CONFIG_PATH_SEGMENTS = new Set(['__proto__', 'prototype',
 export function isPlainRecord(value) {
     return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
+// The merge request limits stay config.yaml-only; Settings writes these two preferences.
 const EXACT_MUTABLE_LEAVES = new Set([
     'miniAppSuggestion.enabled',
     'permission.policyOwner',
     'permission.storageWriteVersion',
     'permission.nativeDelete',
+    'mergeRequests.createAsDraft',
+    'mergeRequests.githubMergeMethod',
 ]);
 export function assertMutableConfigField(field) {
     if (EXACT_MUTABLE_LEAVES.has(field))
@@ -163,6 +172,11 @@ const LOCAL_CONFIG_VALUE_VALIDATORS = new Map([
         'worktreeRefreshBeforeCreate',
         (value) => validateBoolean(value, 'Invalid worktreeRefreshBeforeCreate'),
     ],
+    [
+        'worktreeAutoCleanupEnabled',
+        (value) => validateBoolean(value, 'Invalid worktreeAutoCleanupEnabled'),
+    ],
+    ['worktreeKeepCount', (value) => validateWorktreeKeepCount(value)],
     ['review.mode', (value) => validateReviewMode(value)],
     ['review.turnDiffCard', (value) => validateTurnDiffCardMode(value)],
     ['review', (value, field) => validateReviewConfigRecord(requireConfigRecord(field, value))],
@@ -189,6 +203,7 @@ const LOCAL_CONFIG_VALUE_VALIDATORS = new Map([
         'nextStepBox.enabled',
         (value) => validateBoolean(value, 'nextStepBox.enabled must be a boolean'),
     ],
+    ['advisor.enabled', (value) => validateBoolean(value, 'advisor.enabled must be a boolean')],
     [
         'pluginRecommendation.enabled',
         (value) => validateBoolean(value, 'pluginRecommendation.enabled must be a boolean'),
@@ -211,8 +226,18 @@ const LOCAL_CONFIG_VALUE_VALIDATORS = new Map([
         'nextStepBox',
         (value, field) => validateEnabledOnlyConfigRecord(field, requireConfigRecord(field, value)),
     ],
+    [
+        'advisor',
+        (value, field) => validateEnabledOnlyConfigRecord(field, requireConfigRecord(field, value)),
+    ],
     ['subagent.maxConcurrentPerSession', (value) => validateSubagentMaxConcurrentPerSession(value)],
     ['subagent', (value, field) => validateSubagentConfigRecord(requireConfigRecord(field, value))],
+    [
+        'mergeRequests.createAsDraft',
+        (value) => validateBoolean(value, 'mergeRequests.createAsDraft must be a boolean'),
+    ],
+    ['mergeRequests.githubMergeMethod', (value) => validateGithubMergeMethod(value)],
+    ['productionParity', (value) => validateBoolean(value, 'productionParity must be a boolean')],
 ]);
 export function validateLocalConfigValue(field, value) {
     if (field.startsWith('permission'))
@@ -240,7 +265,7 @@ function validateModelVariant(value) {
 function validateDataContributionConfigRecord(value) {
     return validateEnabledOnlyConfigRecord('dataContribution', value);
 }
-/** Sections that hold only the user's `enabled` choice (dataContribution, promptSuggestion, nextStepBox). */
+/** Sections that hold only the user's `enabled` choice (dataContribution, promptSuggestion, nextStepBox, advisor). */
 export function validateEnabledOnlyConfigRecord(field, value) {
     const invalidKey = Object.keys(value).find((key) => key !== 'enabled');
     if (invalidKey) {
@@ -322,6 +347,11 @@ export function validateSubagentConfigRecord(value) {
         }
         : {};
 }
+function validateWorktreeKeepCount(value) {
+    if (isWorktreeKeepCount(value))
+        return value;
+    throw new LocalConfigValidationError(`Invalid worktreeKeepCount "${String(value)}": expected a positive integer`);
+}
 function validateSubagentMaxConcurrentPerSession(value) {
     if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0)
         return value;
@@ -341,6 +371,12 @@ export function validateReviewConfigRecord(value) {
             ? { turnDiffCard: validateTurnDiffCardMode(value.turnDiffCard) }
             : {}),
     };
+}
+// GitLab follows each merge request's own settings, so only GitHub has a preferred method.
+function validateGithubMergeMethod(value) {
+    if (value === 'squash' || value === 'merge' || value === 'rebase')
+        return value;
+    throw new LocalConfigValidationError(`Invalid mergeRequests.githubMergeMethod "${String(value)}"`);
 }
 function validateReviewMode(value) {
     if (value === 'inline' || value === 'subagent')

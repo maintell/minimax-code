@@ -1,0 +1,348 @@
+import { readPtcExecutionDetails } from '@mavis/agent-core/tools';
+import { readGenuineUserQueryText } from './genuine-user-query.js';
+const TOOL_RESULT_REMOVED_TEXT = '[Tool result removed by context compaction.]';
+const PTC_RETURN_REMOVED_TEXT = '[run_code return removed by context compaction.]';
+const MEDIA_REMOVED_TEXT = '[Media removed by context compaction.]';
+/** Hall: every tool result body is replaced; ToolRound pairing stays intact. */
+export function buildAllToolResultsCandidate(messages) {
+    const replacements = new Map();
+    let trimmedRoundCount = 0;
+    parseToolRounds(messages).forEach((round) => {
+        const replacementCountBeforeRound = replacements.size;
+        round.resultIndexes.forEach((index) => {
+            const message = messages[index];
+            if (!message || message.role !== 'toolResult') {
+                throw new TypeError('Context compaction history contains an invalid tool result.');
+            }
+            const callId = readNonEmpty(message, 'toolCallId');
+            if (!callId || !round.toolCallsById.get(callId)?.name)
+                return;
+            if (isRemovedToolResult(message))
+                return;
+            const ptcDetails = readPtcExecutionDetails(message);
+            if (ptcDetails) {
+                const replacement = trimPtcToolReturn(message, ptcDetails);
+                if (replacement)
+                    replacements.set(index, replacement);
+                return;
+            }
+            replacements.set(index, {
+                ...message,
+                content: [{ type: 'text', text: TOOL_RESULT_REMOVED_TEXT }],
+            });
+        });
+        if (replacements.size > replacementCountBeforeRound)
+            trimmedRoundCount += 1;
+    });
+    return {
+        messages: replacements.size === 0
+            ? messages
+            : messages.map((message, index) => replacements.get(index) ?? message),
+        trimmedResultCount: replacements.size,
+        trimmedRoundCount,
+    };
+}
+export function buildAttachmentFreeCandidate(messages) {
+    const replacements = new Map();
+    let replacedBlockCount = 0;
+    messages.forEach((message, index) => {
+        const content = Reflect.get(message, 'content');
+        if (!Array.isArray(content))
+            return;
+        const nextContent = content.filter((block) => {
+            if (!isStructuredMediaBlock(block))
+                return true;
+            replacedBlockCount += 1;
+            return false;
+        });
+        if (nextContent.length !== content.length) {
+            const replacement = { ...message };
+            Reflect.set(replacement, 'content', nextContent.length > 0 ? nextContent : [{ type: 'text', text: MEDIA_REMOVED_TEXT }]);
+            replacements.set(index, replacement);
+        }
+    });
+    return {
+        messages: replacements.size === 0
+            ? messages
+            : messages.map((message, index) => replacements.get(index) ?? message),
+        replacedBlockCount,
+    };
+}
+export function buildMinimalGenuineQueryCandidate(messages) {
+    const text = findLatestGenuineUserQueryText(messages);
+    if (text === undefined)
+        return undefined;
+    return [{ role: 'user', content: [{ type: 'text', text }], timestamp: 0 }];
+}
+export function buildMiddleDeletionCandidate(messages, fits) {
+    const closures = buildHistoryClosures(messages);
+    const protectedClosures = collectProtectedClosures(messages, closures);
+    const deletionOrder = middleOutOrder(closures.flatMap((_closure, index) => (protectedClosures.has(index) ? [] : [index])));
+    const removedIndexes = new Set();
+    for (const closureIndex of deletionOrder) {
+        closures[closureIndex]?.messageIndexes.forEach((index) => removedIndexes.add(index));
+        const candidate = messages.filter((_message, index) => !removedIndexes.has(index));
+        parseToolRounds(candidate);
+        if (fits(candidate))
+            return candidate;
+    }
+    return undefined;
+}
+/**
+ * The irreducible remainder of middle deletion: closure 0 plus every closure
+ * containing a user message. Used for content-free failure diagnostics only.
+ */
+export function buildProtectedSkeletonCandidate(messages) {
+    const closures = buildHistoryClosures(messages);
+    const protectedClosures = collectProtectedClosures(messages, closures);
+    const keptIndexes = new Set();
+    closures.forEach((closure, closureIndex) => {
+        if (!protectedClosures.has(closureIndex))
+            return;
+        closure.messageIndexes.forEach((index) => keptIndexes.add(index));
+    });
+    return messages.filter((_message, index) => keptIndexes.has(index));
+}
+function collectProtectedClosures(messages, closures) {
+    const protectedClosures = new Set([0]);
+    closures.forEach((closure, closureIndex) => {
+        if (closure.messageIndexes.some((messageIndex) => messages[messageIndex]?.role === 'user')) {
+            protectedClosures.add(closureIndex);
+        }
+    });
+    return protectedClosures;
+}
+function isRemovedToolResult(message) {
+    const onlyBlock = message.content.length === 1 ? message.content[0] : undefined;
+    return (onlyBlock?.type === 'text' &&
+        (onlyBlock.text === TOOL_RESULT_REMOVED_TEXT || onlyBlock.text === PTC_RETURN_REMOVED_TEXT));
+}
+function trimPtcToolReturn(message, details) {
+    const forced = details.host_forced_content;
+    const hasNonReturnFact = details.retained_facts.some((fact) => fact.kind !== 'plugin_feedback' && fact.kind !== 'approval');
+    if (!forced) {
+        if (hasNonReturnFact)
+            return undefined;
+        return {
+            ...message,
+            content: [{ type: 'text', text: PTC_RETURN_REMOVED_TEXT }],
+        };
+    }
+    const onlyBlock = message.content.length === 1 ? message.content[0] : undefined;
+    if (onlyBlock?.type !== 'text')
+        return undefined;
+    const prefix = forced.endsWith('\n') ? forced : `${forced}\n`;
+    if (!onlyBlock.text.startsWith(prefix) || onlyBlock.text.length === prefix.length)
+        return undefined;
+    return {
+        ...message,
+        content: [{ type: 'text', text: `${prefix}${PTC_RETURN_REMOVED_TEXT}` }],
+    };
+}
+/**
+ * Keeps only what pairs under the {@link parseToolRounds} rule: each Assistant tool call with one
+ * result among the tool results directly after it. Drops results outside a round, results naming
+ * no call of their round or repeating one, calls without id or name, repeated call ids, calls left
+ * without a result, and Assistant messages left with no content. Other messages and blocks stay
+ * as they are; a round that already pairs keeps its message objects.
+ *
+ * Stricter than `withoutUnpairedToolCalls` (engine/history/history-records.ts), which rewind and
+ * fork use, on purpose: that one follows `isSettledHistoryPrefix` and needs only a call id, while
+ * the result here must pass `parseToolRounds`, which also needs a name and unique call ids. A call
+ * without a name that has its result stays after rewind or fork and is left out only of the
+ * checkpoint input.
+ */
+export function settleToolRoundHistory(messages) {
+    const settled = [];
+    const counts = { droppedToolCalls: 0, droppedToolResults: 0, droppedAssistantMessages: 0 };
+    let start = 0;
+    while (start < messages.length) {
+        let end = start + 1;
+        while (messages[end]?.role === 'toolResult')
+            end += 1;
+        settled.push(...settleRoundMessages(messages[start], messages.slice(start + 1, end), counts));
+        start = end;
+    }
+    return { messages: settled, ...counts };
+}
+function settleRoundMessages(head, results, counts) {
+    if (!head || head.role === 'toolResult') {
+        counts.droppedToolResults += results.length + (head ? 1 : 0);
+        return [];
+    }
+    if (head.role !== 'assistant' || !Array.isArray(head.content)) {
+        counts.droppedToolResults += results.length;
+        return [head];
+    }
+    const callIds = new Set(head.content.flatMap((block) => {
+        const call = readToolCallBlock(block);
+        return call ? [call] : [];
+    }));
+    const answered = new Set();
+    const paired = results.filter((result) => {
+        const callId = readNonEmpty(result, 'toolCallId');
+        const keep = callId !== undefined && callIds.has(callId) && !answered.has(callId);
+        if (keep)
+            answered.add(callId);
+        else
+            counts.droppedToolResults += 1;
+        return keep;
+    });
+    const kept = new Set();
+    const content = head.content.filter((block) => {
+        if (block.type !== 'toolCall')
+            return true;
+        const callId = readToolCallBlock(block);
+        const keep = callId !== undefined && answered.has(callId) && !kept.has(callId);
+        if (keep)
+            kept.add(callId);
+        else
+            counts.droppedToolCalls += 1;
+        return keep;
+    });
+    if (content.length === 0) {
+        counts.droppedAssistantMessages += 1;
+        return [];
+    }
+    return [content.length === head.content.length ? head : { ...head, content }, ...paired];
+}
+/** The id of a tool call block that has both an id and a name. */
+function readToolCallBlock(block) {
+    if (Reflect.get(block, 'type') !== 'toolCall')
+        return undefined;
+    const id = readNonEmpty(block, 'id');
+    return id && readNonEmpty(block, 'name') ? id : undefined;
+}
+export function parseToolRounds(messages) {
+    const rounds = [];
+    for (let index = 0; index < messages.length; index += 1) {
+        const message = messages[index];
+        if (!message)
+            continue;
+        const calls = readRoundToolCalls(message);
+        if (!calls)
+            continue;
+        const toolCallsById = indexToolCalls(calls);
+        const resultIndexes = settleToolRound(messages, index, calls.length, toolCallsById);
+        rounds.push({ assistantIndex: index, resultIndexes, toolCallsById });
+        index += resultIndexes.length;
+    }
+    return rounds;
+}
+function buildHistoryClosures(messages) {
+    const roundsByAssistantIndex = new Map(parseToolRounds(messages).map((round) => [round.assistantIndex, round]));
+    const closures = [];
+    for (let index = 0; index < messages.length; index += 1) {
+        const round = roundsByAssistantIndex.get(index);
+        if (!round) {
+            closures.push({ messageIndexes: [index] });
+            continue;
+        }
+        closures.push({ messageIndexes: [round.assistantIndex, ...round.resultIndexes] });
+        index += round.resultIndexes.length;
+    }
+    return closures;
+}
+function findLatestGenuineUserQueryText(messages) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (!message)
+            continue;
+        if (!isUserQueryCandidate(message))
+            continue;
+        if (!hasUserQueryProvenance(message))
+            continue;
+        const queryText = readGenuineUserQueryText(message);
+        if (!queryText?.trim() || /^\/compact(?:\s|$)/iu.test(queryText.trim()))
+            continue;
+        return queryText;
+    }
+    return undefined;
+}
+function hasUserQueryProvenance(message) {
+    return (Object.hasOwn(message, 'genuineUserQueryText') || Object.hasOwn(message, 'canonicalTextRange'));
+}
+function isUserQueryCandidate(message) {
+    return message.role === 'user' && !Reflect.get(message, 'archonCompaction');
+}
+function middleOutOrder(closureIndexes) {
+    if (closureIndexes.length === 0)
+        return [];
+    const order = [];
+    const middle = Math.floor((closureIndexes.length - 1) / 2);
+    for (let distance = 0; order.length < closureIndexes.length; distance += 1) {
+        const backward = middle - distance;
+        const backwardIndex = closureIndexes[backward];
+        if (backwardIndex !== undefined)
+            order.push(backwardIndex);
+        if (distance === 0)
+            continue;
+        const forward = middle + distance;
+        const forwardIndex = closureIndexes[forward];
+        if (forwardIndex !== undefined)
+            order.push(forwardIndex);
+    }
+    return order;
+}
+function readRoundToolCalls(message) {
+    if (message.role === 'toolResult') {
+        throw new TypeError('Context compaction history contains an orphan tool result.');
+    }
+    if (message.role !== 'assistant')
+        return undefined;
+    const calls = readToolCalls(message);
+    return calls.length === 0 ? undefined : calls;
+}
+function indexToolCalls(calls) {
+    const toolCallsById = new Map();
+    calls.forEach((call) => {
+        if (toolCallsById.has(call.id)) {
+            throw new TypeError('Context compaction history contains a duplicate tool call.');
+        }
+        toolCallsById.set(call.id, call);
+    });
+    return toolCallsById;
+}
+function settleToolRound(messages, assistantIndex, callCount, toolCallsById) {
+    const resultIndexes = [];
+    const matched = new Set();
+    while (resultIndexes.length < callCount) {
+        const resultIndex = assistantIndex + resultIndexes.length + 1;
+        matched.add(readSettledCallId(messages[resultIndex], toolCallsById, matched));
+        resultIndexes.push(resultIndex);
+    }
+    return resultIndexes;
+}
+function readSettledCallId(result, toolCallsById, matched) {
+    if (!result || result.role !== 'toolResult') {
+        throw new TypeError('Context compaction history ends before all tool results settle.');
+    }
+    const callId = readNonEmpty(result, 'toolCallId');
+    if (!callId || !toolCallsById.has(callId) || matched.has(callId)) {
+        throw new TypeError('Context compaction history contains an invalid tool result.');
+    }
+    return callId;
+}
+function readToolCalls(message) {
+    return message.content.flatMap((block) => {
+        if (block.type !== 'toolCall')
+            return [];
+        const id = readNonEmpty(block, 'id');
+        const name = readNonEmpty(block, 'name');
+        if (!id || !name) {
+            throw new TypeError('Context compaction history contains an invalid tool call.');
+        }
+        return [{ id, name, arguments: Reflect.get(block, 'arguments') }];
+    });
+}
+function isStructuredMediaBlock(block) {
+    if (!block || typeof block !== 'object')
+        return false;
+    const type = Reflect.get(block, 'type');
+    return type === 'image' || type === 'video';
+}
+function readNonEmpty(value, key) {
+    const field = Reflect.get(value, key);
+    return typeof field === 'string' && field.trim() ? field.trim() : undefined;
+}
+//# sourceMappingURL=history-reduction.js.map

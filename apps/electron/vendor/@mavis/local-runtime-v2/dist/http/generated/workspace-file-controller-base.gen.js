@@ -220,6 +220,11 @@ export class WorkspaceFileControllerBase {
         void req;
         throw new NotImplementedError('removeManagedWorkspaceGitWorktreesBatch');
     }
+    async restoreSessionWorktree(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('restoreSessionWorktree');
+    }
     async listFsDirs(ctx, req) {
         void ctx;
         void req;

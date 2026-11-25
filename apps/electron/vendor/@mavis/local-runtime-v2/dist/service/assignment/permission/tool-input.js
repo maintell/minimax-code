@@ -1,64 +1,24 @@
+import { ASSIGNMENT_TOOL_COMMANDS, isProjectApprovedAssignmentTool, } from '@mavis/agent-tools/namespaced-tools';
 import { BUNNY_AGENT_NAME } from '@mavis/shared/agent-avatar';
 import { isAssignedByBunny } from '../../session-system/index.js';
-const ASSIGNMENT_COMMANDS = {
-    assignment_create: 'session create',
-    assignment_send: 'session send',
-    assignment_cancel: 'assignment cancel',
-    assignment_stop: 'assignment stop',
-};
-/**
- * The assignment tools the hosted project-approval rule turns into an ask.
- *
- * `checkAssignmentPermission` reads only `session create` (a `project` arg) and
- * `session send` (`report_back`); `assignment cancel` / `assignment stop` map to
- * commands it never inspects, so they already keep the ordinary policy — and its
- * deny rules — untouched.
- */
-export function isProjectApprovedAssignmentTool(toolName) {
-    const command = ASSIGNMENT_COMMANDS[toolName];
-    return command === 'session create' || command === 'session send';
-}
-/** An assignment tool is checked as the `mavis` command it stands for. */
-export function assignmentPermissionInput(input) {
-    const command = ASSIGNMENT_COMMANDS[input.toolName];
-    if (!command)
-        return input;
-    return { ...input, toolName: 'mavis', toolInput: { command, args: mappedArgs(command, input) } };
-}
-/**
- * A plan built for the `mavis` command an assignment tool maps to records that
- * command as its original input, so the gate would reject it against the real
- * tool call. Assignment tools have no input rewrite; they run with their own input.
- */
-export function withoutExecutionPlan(decision) {
-    if (decision.behavior === 'deny' || !('executionPlan' in decision))
-        return decision;
-    const planless = { ...decision };
-    delete planless.executionPlan;
-    return planless;
-}
-/** Bunny's assignment tools always report back; saying so puts them under project approval. */
-function mappedArgs(command, input) {
-    if (command === 'session create' || command === 'session send')
-        return { ...input.toolInput, report_back: true };
-    return input.toolInput;
-}
+export { isProjectApprovedAssignmentTool };
 /**
  * Bunny assigning work into its own space directory: a create without a
  * project resolving to a space directory, or a follow-up to such a task.
  * Only this never asks; other callers and project targets keep project approval.
+ *
+ * Read from the tool's own name and its own arguments, like every other reader
+ * of an assignment call.
  */
-export async function isDefaultWorkspaceAssignment({ sessions, tasks, resolveProject, }, callerSessionId, input) {
-    const args = input.args;
-    if (typeof args !== 'object' || args === null)
-        return false;
-    if (input.command !== 'session create' && input.command !== 'session send')
+export async function isDefaultWorkspaceAssignment({ sessions, tasks, resolveProject, }, callerSessionId, toolName, args) {
+    const command = ASSIGNMENT_TOOL_COMMANDS[toolName];
+    if (command !== 'session create' && command !== 'session send')
         return false;
     const caller = await sessions.get(callerSessionId);
     if (!caller || caller.archived || caller.agentName !== BUNNY_AGENT_NAME)
         return false;
-    if (input.command === 'session create')
-        return isDefaultCreate(args, () => resolveProject?.(callerSessionId, input));
+    if (command === 'session create')
+        return isDefaultCreate(args, () => resolveProject?.(callerSessionId, toolName, args));
     const target = await sendTarget(sessions, callerSessionId, args);
     if (!target?.isDefaultWorkspace)
         return false;
@@ -68,8 +28,6 @@ async function isDefaultCreate(args, resolveProject) {
     const project = Reflect.get(args, 'project');
     if (project !== undefined)
         return typeof project === 'string' && project.trim() === 'default';
-    if (Reflect.get(args, 'report_back') !== true)
-        return false;
     return (await resolveProject()) === 'default';
 }
 async function sendTarget(sessions, callerSessionId, args) {

@@ -1,6 +1,8 @@
 import { withMiniMaxCodeUserAgent } from '@mavis/shared';
 import { managedBackendRoutingHeaders, } from '@mavis/agent-tools/desktop';
 const MANAGED_PROVIDER_USER_AGENT = 'MiniMaxAgent';
+/** 托管模型请求所属的本地 turn id，网关写进诊断和审核记录。 */
+const TURN_ID_HEADER = 'X-Mavis-Turn-Id';
 /**
  * Turn phase of each model request (initial, iteration, compaction), read by
  * biz-gateway. Only managed Token Plan requests carry it: BYOK and third-party
@@ -27,6 +29,8 @@ export function buildLocalProviderHeaders(input) {
     if (input.managedProvider) {
         headers['User-Agent'] = MANAGED_PROVIDER_USER_AGENT;
         Object.assign(headers, managedBackendRoutingHeaders(input.routingContext, currentBuildEnv()));
+        if (input.turnId?.trim())
+            headers[TURN_ID_HEADER] = input.turnId;
     }
     return headers;
 }

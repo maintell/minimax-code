@@ -4,6 +4,7 @@ export function toModelInfo(entry) {
         providerId: String(record.providerId ?? ''),
         modelId: String(record.modelId ?? ''),
         ...(record.displayName !== undefined ? { displayName: String(record.displayName) } : {}),
+        ...(typeof record.hint === 'string' && record.hint.trim() ? { hint: record.hint.trim() } : {}),
         ...(record.configurationSource === 'manual' || record.configurationSource === 'discovered'
             ? { configurationSource: record.configurationSource }
             : {}),

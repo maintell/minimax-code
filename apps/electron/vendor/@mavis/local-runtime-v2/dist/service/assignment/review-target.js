@@ -79,11 +79,57 @@ function renderSelectionRef(ref) {
         parts.push(`摘要=${safe(ref.summary)}`);
     return parts.join(' ');
 }
-/** The block appended to a review task's first message, or `''` when there is nothing to add. */
-export function reviewTargetSection(target) {
+/**
+ * What a review task has to end its reply with.
+ *
+ * `parseVerdict` reads a verdict out of the reviewer's own text and nothing else: a fenced code
+ * block, else the first balanced object, carrying `outcome` (or `verdict`) in
+ * `pass | fail | partial`, a `summary`, and `evidence` entries with a `ref` and an optional
+ * `kind` and `detail`. Output it cannot read is still recorded, as a `partial` marked
+ * `parseFailed` — but its evidence is gone, so the conclusion the assigner reads says the
+ * review checked nothing. Nothing else in the runtime asks for that shape, so a review
+ * dispatched without this contract reliably produces that degraded verdict.
+ *
+ * It rides on the review dispatch's first message, which is the one place every review task is
+ * guaranteed to read: the reviewer has no tool that reaches the task it checks, and this block
+ * is where the materials it may read are named.
+ *
+ * Only while `bunny.verdictGate` is on — see {@link reviewTargetSection}.
+ */
+const REVIEW_VERDICT_CONTRACT = [
+    '核对结论的输出格式（这一轮的结案依据，必须遵守）：',
+    '这一轮回复的最后，用一段 ```json 代码块给出你的核对结论，字段如下。系统只从这段 JSON 读结论；',
+    '读不到就记成 partial 并标记「不是结构化结论」，你列的证据会全部丢失，等于没核对。',
+    '{',
+    '  "outcome": "pass | fail | partial",',
+    '  "summary": "一句话结论",',
+    '  "evidence": [',
+    '    {',
+    '      "kind": "file | command | output | url | other",',
+    '      "ref": "路径:行号、你跑过的命令、URL 或输出位置",',
+    '      "detail": "你在那里看到了什么"',
+    '    }',
+    '  ]',
+    '}',
+    'outcome 的含义：pass=达到完成标准；fail=没达到，指名道姓说出差在哪；partial=材料不足或只核对了一部分，无法判断。',
+    'evidence 至少给一条你真的打开看过的东西，并写出位置；没有证据的 pass 不算核对通过。',
+    '这段 JSON 决定这个任务能不能关闭，所以只写你确实核对过的内容，不要把没看过的写成看过。',
+].join('\n');
+/**
+ * The block appended to a review task's first message, or `''` when there is nothing to add.
+ *
+ * `verdictGate` is `bunny.verdictGate` as the runtime gate itself reads it, and it decides
+ * whether the contract rides along — not what the contract says. The contract tells the reviewer
+ * that its JSON decides whether the checked task can close, which is true only while the gate is
+ * installed. With the switch off nothing reads a verdict: `assignment_claim_verdict` is not
+ * registered, no review link is built, and `assignment_summary` closes the checked task on its
+ * own, so a review task told to produce a verdict would be writing for a reader that does not
+ * exist. Off, this returns byte for byte what it returned before the contract existed.
+ */
+export function reviewTargetSection(target, verdictGate) {
     if (!target)
         return '';
     const rendered = renderReviewTarget(target);
-    return `\n\n${rendered}`;
+    return verdictGate ? `\n\n${rendered}\n\n${REVIEW_VERDICT_CONTRACT}` : `\n\n${rendered}`;
 }
 //# sourceMappingURL=review-target.js.map

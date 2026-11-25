@@ -95,6 +95,7 @@ async function checkLocalPermission(ctx, request) {
             ruleContents: decision.ruleContents ?? buildLocalPermissionRuleContents(toolName, input),
             persistWholeToolRuleOnReply: true,
             reason: decision.reason,
+            ...(decision.permissionMode ? { permissionMode: decision.permissionMode } : {}),
         });
         return json({
             behavior: 'ask',

@@ -21,6 +21,7 @@ export function baseCtx(overrides = {}) {
         model: {},
         history: [],
         userInput: { text: 'hi' },
+        sendsUserMessage: true,
         ...overrides,
     };
 }

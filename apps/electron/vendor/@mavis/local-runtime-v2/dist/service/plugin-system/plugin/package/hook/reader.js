@@ -15,6 +15,7 @@ export async function readPluginHooks(root, input) {
     return {
         hooks: parsed.handlers,
         diagnostics: projectPluginHookDiagnostics(parsed.diagnostics),
+        modules: parsed.modules,
     };
 }
 //# sourceMappingURL=reader.js.map

@@ -87,6 +87,15 @@ function showCopyImageMenu(imageSrc) {
     ]);
     menu.popup();
 }
+function clipboardHasPlainText() {
+    try {
+        return clipboard.availableFormats().includes('text/plain');
+    }
+    catch (error) {
+        console.error('[ContextMenu] Read clipboard formats failed:', error);
+        return false;
+    }
+}
 function setupImageContextMenuIPC() {
     ipcMain.handle(IPC_CHANNELS.SYSTEM_SHOW_IMAGE_CONTEXT_MENU, async (event, params) => {
         const isEn = getIsEn();
@@ -156,6 +165,14 @@ function setupContextMenuForWebContents(webContents) {
                 label: isEn ? 'Paste' : '粘贴',
                 role: 'paste',
             }));
+            // Excel 等来源会同时放入文字和图片，普通粘贴会变成图片附件；
+            // pasteAndMatchStyle 只向页面提供 text/plain。
+            if (clipboardHasPlainText()) {
+                menu.append(new MenuItem({
+                    label: isEn ? 'Paste as Plain Text' : '粘贴为文字',
+                    role: 'pasteAndMatchStyle',
+                }));
+            }
             // 如果有选中文字，显示剪切选项
             if (params.selectionText) {
                 menu.insert(0, new MenuItem({

@@ -4,4 +4,5 @@ export { CUA_VERSION, CUA_BUNDLE_ID, componentInstallRoot, discoverComponent, } 
 export { mapRequestToCuaTool, normalizeCuaResult, callCuaToolWithDeliveryMode, validateClickAction, } from './mapping.js';
 export { prepareInstalledPackagedComponent } from './packaged-component.js';
 export { reclaimProfileDaemons } from './daemon.js';
+export { isComputerUseOsSupported } from './os-support.js';
 //# sourceMappingURL=index.js.map

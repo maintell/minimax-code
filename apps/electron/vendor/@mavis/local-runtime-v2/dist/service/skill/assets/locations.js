@@ -1,4 +1,4 @@
-import { access, readdir } from 'node:fs/promises';
+import { readdir, stat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 export async function resolveBuiltinSkillsDir() {
@@ -40,7 +40,9 @@ function dedupePaths(paths) {
 }
 export async function isDirectory(path) {
     try {
-        await access(path);
+        // `stat` rather than `access`: Electron's asar fs shim misreports directories to `access`.
+        if (!(await stat(path)).isDirectory())
+            return false;
         const entries = await readdir(path, { withFileTypes: true });
         return entries.some((entry) => entry.isDirectory());
     }

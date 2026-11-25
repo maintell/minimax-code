@@ -136,6 +136,7 @@ function normalizeTab(value, now) {
         createdAt,
         lastActiveAt: normalizeTimestamp(raw.lastActiveAt, createdAt),
         ...(navigationHistory ? { navigationHistory } : {}),
+        ...(raw.owner === 'agent' ? { owner: 'agent' } : {}),
     };
 }
 function normalizeSession(value, now) {
@@ -276,6 +277,25 @@ export class PersistentBrowserRegistry {
         session.updatedAt = now;
         this.schedulePersist();
         return cloneSession({ ...session, tabs: [tab] }).tabs[0] ?? null;
+    }
+    /** Records who owns a page; `user` clears the Agent marker. */
+    setTabOwner(sessionId, persistentTabId, owner) {
+        const session = this.findMutableSession(sessionId);
+        const tab = session?.tabs.find((item) => item.persistentTabId === persistentTabId);
+        if (!tab)
+            return false;
+        if (owner === 'agent') {
+            if (tab.owner === 'agent')
+                return true;
+            tab.owner = 'agent';
+        }
+        else {
+            if (tab.owner === undefined)
+                return true;
+            delete tab.owner;
+        }
+        this.schedulePersist();
+        return true;
     }
     selectTab(sessionId, persistentTabId) {
         const session = this.findMutableSession(sessionId);

@@ -33,6 +33,13 @@ export const SAFE_BASH_FIRST_WORDS = new Set([
     'which',
     'type',
     'whereis',
+    // `where` is where.exe on Windows (zsh builtin elsewhere); PowerShell's
+    // Where-Object alias is normalised away by pureReadFirstWord.
+    'where',
+    'basename',
+    'dirname',
+    'realpath',
+    'readlink',
     'date',
     'whoami',
     'hostname',

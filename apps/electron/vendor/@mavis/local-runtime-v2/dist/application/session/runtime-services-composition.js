@@ -2,15 +2,18 @@ import { composeLocalSandboxService, } from '../../service/sandbox/index.js';
 import { ownsElectronRuntimeCapabilities } from '../agent/runtime-browser-use-composition.js';
 import { createMiniAppControlExtension, createPptPreviewExtension, wrapUpExtension, } from '@mavis/agent-extension';
 import { isBunnyEnabledInConfig } from '@mavis/config';
+import { composeSessionPluginExtensionAuthoring } from './plugin-extension-authoring.js';
 import { isBunnyAgentName } from '@mavis/shared/agent-avatar';
 import { schedulesTargetMainConversation } from '@mavis/shared/agent-coordination';
 import { prepareBackgroundTasks, } from './background-task-composition.js';
 import { createRuntimeCronSessionPorts, initializeCronService, } from '../../service/cron/index.js';
 import { hasPriorityUserQueueItem, CliSunsetNotice, composeTurnAdmissionPolicies, createDesktopSubagentConcurrency, } from '../../service/turn-system/index.js';
-import { createBunnyAssetReadExtension, renderScheduleSpaceLabel, } from '../../service/bunny/index.js';
+import { createBunnyAssetReadExtension, createBunnyScheduleOriginStore, renderScheduleSpaceLabel, } from '../../service/bunny/index.js';
+import { clearManagedSkillReceiptsOutsideHistory, logManagedSkillReceiptsCleared, ManagedSkillReceipts, } from '@mavis/shared/local-runtime-managed-skills';
 import { createRuntimePtcStoreBinding, } from './runtime-ptc-store-binding.js';
 import { composeRuntimeGlobalEventWriter } from '../events.js';
-import { SkillEnabledState } from '../../service/plugin-system/index.js';
+import { settleInBackground, SkillEnabledState } from '../../service/plugin-system/index.js';
+import { resolvePluginServiceLogger } from './plugin-service-logger.js';
 import { LegacyCredentialMigrationReceipt } from '../../service/channel-system/index.js';
 import { ComposerSendBehaviorPreference, } from '../../service/session-system/index.js';
 import { createLocalModelSystemConfigPort, resolveLocalRuntimeModelKey, } from '../../service/model-system/index.js';
@@ -20,6 +23,7 @@ import { createProductionSessionComposition, } from './runtime-session-compositi
 import { scopeToCoordinatorSessions } from './coordinator-turn-scope.js';
 import { createHostSessionMiniAppLifecycle } from './miniapp-host.js';
 import { createMemoryRecallAdmissionPolicy } from './memory-recall-admission.js';
+import { createWorktreeCleanedAdmissionPolicy } from './worktree-cleanup-admission.js';
 import { isPptPreviewPluginSkillEffective } from './ppt-preview-plugin-gate.js';
 import { composeDesktopPluginRecommendation, } from './plugin-recommendation.js';
 export function createRuntimeNormalExtensions(input) {
@@ -52,6 +56,7 @@ export function createRuntimeNormalExtensions(input) {
                 ]
                 : []),
             ...(miniAppLifecycle ? [createMiniAppControlExtension(miniAppLifecycle)] : []),
+            ...composeSessionPluginExtensionAuthoring(input.options.runtimeOwnerKind, input.pluginExtension),
             ...recommendation.extensions,
             ...(input.wrapUp ? [wrapUpExtension(input.wrapUp)] : []),
             scopeToCoordinatorSessions(createBunnyAssetReadExtension(input.bunnyAssetRead), input.bunnyAssetRead.coordinators),
@@ -66,6 +71,9 @@ export async function initializeRuntimeCron(input) {
     const mainConversationAgents = input.agents
         ? await readMainConversationScheduleAgents(input.agents)
         : undefined;
+    const scheduleOrigins = input.options.bunnyDb
+        ? createBunnyScheduleOriginStore({ db: input.options.bunnyDb, nowMs: input.nowMs })
+        : undefined;
     return initializeCronService({
         reviewContent: input.reviewContent,
         db: input.options.db,
@@ -75,10 +83,12 @@ export async function initializeRuntimeCron(input) {
             createRuntimeCronSessionPorts({
                 ...input.sessionPorts,
                 ...(mainConversationAgents ? { mainConversationAgents } : {}),
+                ...(scheduleOrigins ? { scheduleOrigin: (cronId) => scheduleOrigins.get(cronId) } : {}),
                 // The coordinator's schedules name the task space their stored prompt points at.
                 mainConversationText: (text) => renderScheduleSpaceLabel(text, () => input.sessionPorts.sessions.artifactCatalog.library.summary().spaces),
             }),
         ...(mainConversationAgents ? { mainConversationAgents } : {}),
+        ...(scheduleOrigins ? { scheduleOrigins } : {}),
         modelSelection: { resolve: (model) => resolveLocalRuntimeModelKey(input.config(), model) },
         nowMs: input.nowMs,
         recoverPendingRuns: input.options.recoverPersistedState !== false,
@@ -133,12 +143,13 @@ export function createRuntimeAgentReferenceProjection(compatibility, agentServic
                 return { status: 'authorized' };
             }
         },
+        // The harness event is host-neutral; desktop labels its own runtime here.
         emitDiagnostic: (event) => logger.info({
             stage: event.stage,
             outcome: event.outcome,
             count: event.count,
             surface: event.surface,
-            runtime: event.runtime,
+            runtime: 'desktop',
             ...(event.errorCode ? { errorCode: event.errorCode } : {}),
         }, 'agent_reference'),
     };
@@ -165,7 +176,9 @@ export function createRuntimeTurnAdmissionOptions(input, planAdmission) {
         })
         : undefined;
     return {
-        admissionPolicy: composeTurnAdmissionPolicies(planAdmission, createMemoryRecallAdmissionPolicy(), ...(desktopSubagentConcurrency ? [desktopSubagentConcurrency.admissionPolicy] : [])),
+        admissionPolicy: composeTurnAdmissionPolicies(planAdmission, 
+        // Reject before memory recall locks anything for a Turn that cannot run.
+        createWorktreeCleanedAdmissionPolicy(), createMemoryRecallAdmissionPolicy(), ...(desktopSubagentConcurrency ? [desktopSubagentConcurrency.admissionPolicy] : [])),
         ...(desktopSubagentConcurrency ? { subagentConcurrency: desktopSubagentConcurrency } : {}),
     };
 }
@@ -204,15 +217,33 @@ export function prepareRuntimeServices(options) {
         },
     };
 }
+/**
+ * The Runtime's one managed-Skill receipt store. The composition root creates it
+ * once and hands the same instance to the AgentHost gate, the first-Turn
+ * preload, the committed-compaction clear and the rewind / session-deleted
+ * clears below, so no module resolves a store of its own.
+ */
+export function createRuntimeSkillReceipts() {
+    return new ManagedSkillReceipts();
+}
 export function createServiceGlobalEventWriter(options, state, browserUse, sandbox) {
+    const logger = resolvePluginServiceLogger(options.logger);
     return composeRuntimeGlobalEventWriter({
         isClosed: () => state.closed,
         nowMs: options.nowMs ?? Date.now,
         notifyContextReset: (sessionId) => {
             browserUse.notifyContextReset(sessionId);
+            dropRewoundSkillReceipts(sessionId, state, logger);
             options.ptcStoreBinding?.notifyContextReset(sessionId);
         },
-        notifySessionDeleted: (sessionId) => browserUse.clearSession(sessionId),
+        notifySessionDeleted: (sessionId) => {
+            browserUse.clearSession(sessionId);
+            logManagedSkillReceiptsCleared(logger, {
+                sessionId,
+                reason: 'session_deleted',
+                cleared: state.skillReceipts.clearSession(sessionId),
+            });
+        },
         notifyGreetingTurnTerminal: (turnId, status) => state.agentApplication?.notifyGreetingTurnTerminal?.(turnId, status),
         observeTurn: (input) => sandbox.observeTurn(input),
         write: (event) => {
@@ -224,6 +255,49 @@ export function createServiceGlobalEventWriter(options, state, browserUse, sandb
             options.eventBus.write(event);
         },
     });
+}
+/**
+ * A rewind drops the turns after a point, so the Skill bodies the model read in
+ * them are gone — but a Skill preloaded into the first user message is still in
+ * context, and the preload told the model not to load it again. Judging the
+ * conversation by the history it now has drops exactly the receipts that history
+ * no longer justifies, which is the same rule a committed compaction applies.
+ *
+ * Best-effort and off the publication path: the rewind already happened, so the
+ * history is read after the fact and a failed read falls back to dropping every
+ * receipt of the conversation.
+ */
+function dropRewoundSkillReceipts(sessionId, state, logger) {
+    const receipts = state.skillReceipts;
+    const history = state.canonicalHistory;
+    if (!history) {
+        logManagedSkillReceiptsCleared(logger, {
+            sessionId,
+            reason: 'context_reset',
+            cleared: receipts.clearSession(sessionId),
+        });
+        return;
+    }
+    settleInBackground(clearRewoundSkillReceipts(receipts, sessionId, history, logger));
+}
+/** The surviving history is read after the fact; a failed read drops every receipt. */
+async function clearRewoundSkillReceipts(receipts, sessionId, history, logger) {
+    try {
+        const snapshot = await history.inspectActive(sessionId);
+        clearManagedSkillReceiptsOutsideHistory(receipts, {
+            sessionId,
+            messages: snapshot.messages,
+            reason: 'context_reset',
+            logger,
+        });
+    }
+    catch {
+        logManagedSkillReceiptsCleared(logger, {
+            sessionId,
+            reason: 'context_reset',
+            cleared: receipts.clearSession(sessionId),
+        });
+    }
 }
 export function initializeRuntimeSandbox(options) {
     return composeLocalSandboxService({

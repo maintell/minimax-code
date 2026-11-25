@@ -3,7 +3,7 @@ import { parentPort } from "node:worker_threads";
 import { crc32 } from "node:zlib";
 import jszip from "jszip";
 import yauzl from "yauzl";
-import { PPTX_PREVIEW_LIMITS_V1 } from "@mavis/shared/document-preview";
+import { PPTX_PREVIEW_LIMITS_V1, isPptxStoredMediaEntryV1 } from "@mavis/shared/document-preview";
 const DEFAULT_LIMITS = Object.freeze({
     maxInputBytes: PPTX_PREVIEW_LIMITS_V1.maxInputBytes,
     maxEntries: PPTX_PREVIEW_LIMITS_V1.maxEntries,
@@ -106,9 +106,7 @@ function skipMarkup(text, index) {
         if (index === firstNonWhitespace && SAFE_XML_DECLARATION.test(declaration))
             return end + 2;
         const processingInstruction = text.slice(index + 2, end);
-        return SAFE_OFFICE_METADATA_PROCESSING_INSTRUCTION.test(processingInstruction)
-            ? end + 2
-            : null;
+        return SAFE_OFFICE_METADATA_PROCESSING_INSTRUCTION.test(processingInstruction) ? end + 2 : null;
     }
     if (text.startsWith('<!', index)) {
         return null;
@@ -599,12 +597,12 @@ class OoxmlArchiveFailure extends Error {
 function relationshipSourcePart(name) {
     if (name === '_rels/.rels')
         return '';
-    const match = /^(.*)\/_rels\/([^/]+)\.rels$/u.exec(name);
+    const match = /^(?:(.+)\/)?_rels\/([^/]+)\.rels$/u.exec(name);
     if (!match)
         return null;
     const directory = match[1] ?? '';
     const fileName = match[2] ?? '';
-    return directory && fileName ? `${directory}/${fileName}` : null;
+    return directory ? `${directory}/${fileName}` : fileName;
 }
 function resolveInternalRelationshipTarget(relsName, rawTarget) {
     const sourcePart = relationshipSourcePart(relsName);
@@ -713,7 +711,7 @@ function collectEntries(zipFile, limits) {
         zipFile.readEntry();
     });
 }
-function assertDeclaredBudgets(entries, limits) {
+function assertDeclaredBudgets(entries, limits, largeStoredMedia) {
     let totalBytes = 0;
     let mediaBytes = 0;
     for (const entry of entries) {
@@ -722,7 +720,10 @@ function assertDeclaredBudgets(entries, limits) {
         if (!Number.isSafeInteger(entry.uncompressedSize) || entry.uncompressedSize < 0) {
             throw new OoxmlArchiveFailure('invalid_source_archive', 'OOXML archive entry metadata is invalid');
         }
-        if (entry.uncompressedSize > limits.maxEntryUncompressedBytes) {
+        if (entry.uncompressedSize >
+            (largeStoredMedia.has(entry.fileName)
+                ? PPTX_PREVIEW_LIMITS_V1.maxStoredMediaEntryBytes
+                : limits.maxEntryUncompressedBytes)) {
             throw new OoxmlArchiveFailure('resource_limit_exceeded', 'OOXML archive entry exceeds the uncompressed byte limit');
         }
         totalBytes += entry.uncompressedSize;
@@ -746,7 +747,7 @@ function readEntryStream(zipFile, entry) {
         });
     });
 }
-async function readBoundedEntries(zipFile, entries, limits) {
+async function readBoundedEntries(zipFile, entries, limits, largeStoredMedia) {
     const files = entries.filter((entry) => !entry.fileName.endsWith('/'));
     const output = new Map();
     const activeStreams = new Set();
@@ -789,7 +790,10 @@ async function readBoundedEntries(zipFile, entries, limits) {
                     totalBytes += chunk.byteLength;
                     if (MEDIA_ENTRY.test(entry.fileName))
                         mediaBytes += chunk.byteLength;
-                    if (entryBytes > limits.maxEntryUncompressedBytes) {
+                    if (entryBytes >
+                        (largeStoredMedia.has(entry.fileName)
+                            ? PPTX_PREVIEW_LIMITS_V1.maxStoredMediaEntryBytes
+                            : limits.maxEntryUncompressedBytes)) {
                         stopAll(new OoxmlArchiveFailure('resource_limit_exceeded', 'OOXML archive entry exceeds the actual uncompressed byte limit'));
                         return;
                     }
@@ -865,13 +869,27 @@ function relationshipIdReference(token) {
 function validatePptxGraph(entryBytes, textByName) {
     const contentTypes = textByName.get('[Content_Types].xml');
     const rootRelationships = textByName.get('_rels/.rels');
-    const presentation = textByName.get('ppt/presentation.xml');
-    const presentationRelationships = textByName.get('ppt/_rels/presentation.xml.rels');
-    if (!contentTypes || !rootRelationships || !presentation || !presentationRelationships) {
+    if (!contentTypes || !rootRelationships)
         throw new OoxmlArchiveFailure('invalid_source_archive', 'PPTX required parts are missing');
-    }
     const contentTypeTokens = tokenizeTags(contentTypes);
     const rootRelationshipTokens = tokenizeTags(rootRelationships);
+    const officeDocuments = rootRelationshipTokens?.filter((token) => !token.closing &&
+        token.localName === 'relationship' &&
+        (attributeValue(token, 'targetmode') ?? 'Internal').toLowerCase() === 'internal' &&
+        [
+            'http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument',
+            'http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument',
+        ].includes(decodeXmlEntities(attributeValue(token, 'type') ?? '').trim()));
+    if (officeDocuments?.length !== 1)
+        throw new OoxmlArchiveFailure('invalid_source_archive', 'PPTX package officeDocument relationship is missing');
+    const presentationPart = resolveInternalRelationshipTarget('_rels/.rels', attributeValue(officeDocuments[0], 'target') ?? '');
+    if (!presentationPart)
+        throw new OoxmlArchiveFailure('invalid_source_archive', 'PPTX package officeDocument target is invalid');
+    const relsPart = posix.join(posix.dirname(presentationPart), '_rels', posix.basename(presentationPart) + '.rels');
+    const presentation = textByName.get(presentationPart);
+    const presentationRelationships = textByName.get(relsPart);
+    if (!presentation || !presentationRelationships)
+        throw new OoxmlArchiveFailure('invalid_source_archive', 'PPTX required parts are missing');
     const presentationTokens = tokenizeTags(presentation);
     const presentationRelationshipTokens = tokenizeTags(presentationRelationships);
     if (!contentTypeTokens ||
@@ -892,20 +910,8 @@ function validatePptxGraph(entryBytes, textByName) {
             .trim()
             .toLowerCase());
     }
-    if (contentTypeByPart.get('ppt/presentation.xml') !== PRESENTATION_CONTENT_TYPE) {
+    if (contentTypeByPart.get(presentationPart) !== PRESENTATION_CONTENT_TYPE) {
         throw new OoxmlArchiveFailure('invalid_source_archive', 'PPTX presentation content type is missing');
-    }
-    const officeDocument = rootRelationshipTokens.find((token) => {
-        if (token.closing || token.localName !== 'relationship')
-            return false;
-        const type = decodeXmlEntities(attributeValue(token, 'type') ?? '')
-            .trim()
-            .toLowerCase();
-        const target = resolveInternalRelationshipTarget('_rels/.rels', attributeValue(token, 'target') ?? '');
-        return type.endsWith('/officedocument') && target === 'ppt/presentation.xml';
-    });
-    if (!officeDocument) {
-        throw new OoxmlArchiveFailure('invalid_source_archive', 'PPTX package officeDocument relationship is missing');
     }
     const slideRelationships = new Map();
     for (const token of presentationRelationshipTokens) {
@@ -917,7 +923,7 @@ function validatePptxGraph(entryBytes, textByName) {
         if (!type.endsWith('/slide'))
             continue;
         const id = decodeXmlEntities(attributeValue(token, 'id') ?? '').trim();
-        const target = resolveInternalRelationshipTarget('ppt/_rels/presentation.xml.rels', attributeValue(token, 'target') ?? '');
+        const target = resolveInternalRelationshipTarget(relsPart, attributeValue(token, 'target') ?? '');
         if (id && target)
             slideRelationships.set(id, target);
     }
@@ -1002,11 +1008,20 @@ export async function sanitizeOoxmlArchive(input, limitOverrides = {}, options =
     }
     let entryBytes;
     let zipFile;
+    const largeStoredMedia = new Set();
     try {
         zipFile = await openZip(input);
         const entries = await collectEntries(zipFile, limits);
-        assertDeclaredBudgets(entries, limits);
-        entryBytes = await readBoundedEntries(zipFile, entries, limits);
+        if (options.pptxPreflight && limitOverrides.maxEntryUncompressedBytes === undefined) {
+            for (const entry of entries) {
+                if (entry.uncompressedSize > limits.maxEntryUncompressedBytes &&
+                    entry.compressedSize === entry.uncompressedSize &&
+                    isPptxStoredMediaEntryV1(entry.fileName, entry.compressionMethod))
+                    largeStoredMedia.add(entry.fileName);
+            }
+        }
+        assertDeclaredBudgets(entries, limits, largeStoredMedia);
+        entryBytes = await readBoundedEntries(zipFile, entries, limits, largeStoredMedia);
     }
     catch (error) {
         if (error instanceof OoxmlArchiveFailure)
@@ -1068,7 +1083,7 @@ export async function sanitizeOoxmlArchive(input, limitOverrides = {}, options =
         const pptxPreflight = collectPptxPreflight(entryBytes, removedExternalRelationshipCount, limits, options.pptxPreflight === true);
         const zip = new jszip();
         for (const [name, bytes] of entryBytes)
-            zip.file(name, bytes);
+            zip.file(name, bytes, largeStoredMedia.has(name) ? { compression: 'STORE' } : {});
         const bytes = await zip.generateAsync({
             type: 'uint8array',
             compression: 'DEFLATE',

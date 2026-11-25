@@ -157,7 +157,7 @@ const VERIFICATION_VERDICTS = new Set([
     'inconclusive',
 ]);
 const WORKER_PROPOSAL_TYPES = new Set(['complete', 'blocked']);
-const KICKOFF_ATTACHMENT_TYPES = new Set(['file', 'image']);
+const KICKOFF_ATTACHMENT_TYPES = new Set(['file', 'image', 'folder']);
 function isLastVerificationV1(value) {
     const item = readPlainRecord(value);
     return (item !== undefined &&
@@ -241,7 +241,15 @@ function isKickoffAttachment(value) {
         typeof item.mimeType === 'string' &&
         optionalString(item.dataUrl) &&
         optionalString(item.assetId) &&
-        optionalString(item.error));
+        optionalString(item.error) &&
+        hasValidAssetReferenceFields(item));
+}
+function hasValidAssetReferenceFields(item) {
+    return (optionalString(item.driveNodeId) &&
+        optionalString(item.drivePath) &&
+        (item.sizeBytes === undefined || isNonNegativeInteger(item.sizeBytes)) &&
+        // A folder exists only as an asset library reference.
+        (item.type !== 'folder' || (typeof item.driveNodeId === 'string' && item.driveNodeId !== '')));
 }
 function readPlainRecord(value) {
     if (!value || typeof value !== 'object' || Array.isArray(value))

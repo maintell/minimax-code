@@ -330,45 +330,6 @@ export async function publishFileCopyIfAbsent(sourcePath, filePath, validateTemp
         await syncFile(stagingPath);
     }, validateTemporary, 'copied file');
 }
-/**
- * Publishes JSONL records produced one at a time only when the target is absent. At most one
- * write buffer is held, however many records the producer writes.
- */
-export async function publishJsonlStreamIfAbsent(filePath, produce, validateTemporary) {
-    return publishStagedFileIfAbsent(filePath, async (stagingPath) => {
-        const handle = await open(stagingPath, 'wx', 0o600);
-        try {
-            const buffered = [];
-            let bufferedBytes = 0;
-            const flush = async () => {
-                if (buffered.length === 0)
-                    return;
-                await writeInOneCall(handle, Buffer.from(buffered.join(''), 'utf8'), 'JSONL stream');
-                buffered.length = 0;
-                bufferedBytes = 0;
-            };
-            let index = 0;
-            await produce(async (record) => {
-                index += 1;
-                assertJsonSerializable(record, `record ${String(index)}`);
-                const line = JSON.stringify(record);
-                if (line === undefined)
-                    throw jsonSerializationError(`record ${String(index)}`);
-                buffered.push(line, '\n');
-                bufferedBytes += line.length + 1;
-                if (bufferedBytes >= STREAM_CHUNK_BYTES)
-                    await flush();
-            });
-            await flush();
-            await handle.sync();
-        }
-        catch (error) {
-            await closeBestEffort(handle);
-            throw error;
-        }
-        await handle.close();
-    }, validateTemporary, 'JSONL stream');
-}
 async function publishFileIfAbsentWithLabel(filePath, payload, validateTemporary, label) {
     return publishStagedFileIfAbsent(filePath, async (stagingPath) => {
         const handle = await open(stagingPath, 'wx', 0o600);

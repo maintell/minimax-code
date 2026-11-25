@@ -8,7 +8,7 @@ const RECORDS_FILE = 'bunny-context-reset.jsonl';
 /** Display kind of the separator a reset leaves in the conversation (6.1). */
 const CONTEXT_RESET_DISPLAY_KIND = 'context_reset';
 /** The separator's text where a client shows no text of its own (6.1). */
-const CONTEXT_RESET_SEPARATOR_TEXT = '上下文已重新开始 · 记忆、空间和任务保留';
+const CONTEXT_RESET_SEPARATOR_TEXT = '上下文已重新开始 · 记忆、事项和任务保留';
 /** Display rows read at a time while looking back for the coordinator's last visible words (4.2). */
 const UNREPLIED_PAGE_ROWS = 500;
 /** Display rows of user input that never reached the conversation. */

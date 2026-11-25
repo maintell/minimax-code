@@ -100,6 +100,7 @@ export function createRuntimeProcessLocalApplication(input) {
             },
             mcp: owners.mcp.public,
             ...(owners.mcp.auth ? { mcpAuth: owners.mcp.auth } : {}),
+            pluginHookSessions: owners.turnSystem.pluginHooks,
             modelProvider: {
                 application: modelProviderApplication,
                 providers: modelSystem.providers,

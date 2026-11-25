@@ -2,12 +2,13 @@ import * as fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { clipboard } from "electron";
-import { BROWSER_TIMEOUTS, BrowserCore, sanitizeConsoleDiagnosticUrl, browserScriptActionDeadlineMs } from "@mavis/browser-core";
+import { BROWSER_TIMEOUTS, BrowserCore, unexpectedNavigationRetry, uncertainWriteNext, sanitizeConsoleDiagnosticUrl, browserScriptActionDeadlineMs } from "@mavis/browser-core";
 import { ElectronBrowserPageContext } from "./electron-browser-page-context";
 import { ELECTRON_BROWSER_CORE_ACTIONS } from "./electron-browser-route-policy";
 import { ElectronCdpTransport } from "./electron-cdp-transport";
 import { installBrowserJsDialogGate } from "./browser-js-dialog-gate";
-import { asString, AGENT_BROWSER_ACTIONS, OFFSCREEN_BOUNDS, asNumber, asRecord, isWithinAgentKeepalive, safeError, nowMs, normalizeUrl, agentElementPriority, MAX_AGENT_SNAPSHOT_ELEMENTS, agentSnapshotElement, agentSnapshotSummary, MAX_AGENT_SNAPSHOTS_PER_TAB, AGENT_SNAPSHOT_TTL_MS, MAX_AGENT_SNAPSHOT_PAGE_LIMIT, DEFAULT_AGENT_SNAPSHOT_PAGE_LIMIT, buildAgentSnapshotPage, MAX_AGENT_SNAPSHOT_PAGE_BYTES, urlHost, isMainDocumentNavigation, requireTextArg, asStringArray, asBoolean, requireStringArg, finiteNumber, shortcutModifier } from "./embedded-browser-manager-helpers";
+import { getBrowserJsDialogGate } from "./browser-js-dialog-registry";
+import { asString, AGENT_BROWSER_ACTIONS, OFFSCREEN_BOUNDS, asNumber, asRecord, isWithinAgentKeepalive, nowMs, safeError, normalizeUrl, agentElementPriority, MAX_AGENT_SNAPSHOT_ELEMENTS, agentSnapshotElement, agentSnapshotSummary, MAX_AGENT_SNAPSHOTS_PER_TAB, AGENT_SNAPSHOT_TTL_MS, MAX_AGENT_SNAPSHOT_PAGE_LIMIT, DEFAULT_AGENT_SNAPSHOT_PAGE_LIMIT, buildAgentSnapshotPage, MAX_AGENT_SNAPSHOT_PAGE_BYTES, urlHost, isMainDocumentNavigation, urlOrigin, requireTextArg, asStringArray, asBoolean, requireStringArg, finiteNumber, shortcutModifier } from "./embedded-browser-manager-helpers";
 const VERIFIED_FILL_SAMPLE_COUNT = 4;
 const VERIFIED_FILL_SAMPLE_DELAY_MS = 50;
 const TEXT_INPUT_COMPLETION_BUFFER_MS = 30000;
@@ -97,12 +98,17 @@ function normalizeAgentQueryArgs(args) {
             : kind === 'semantic'
                 ? ['text', 'limit']
                 : kind === 'dom' || kind === 'text'
-                    ? ['selector', 'maxChars']
-                    : kind === 'console'
-                        ? ['levels', 'filter', 'limit']
-                        : kind === 'network'
-                            ? ['status', 'resourceTypes', 'filter', 'afterSequence', 'limit']
-                            : []);
+                    ? // Same contract as the shared query schema: offset counts characters,
+                        // or matches with all: true, which alone takes limit.
+                        ['selector', 'maxChars', 'offset', 'all', ...(args.all === true ? ['limit'] : [])]
+                    : kind === 'rows'
+                        ? // Row selector plus field map; offset/limit count rows.
+                            ['selector', 'fields', 'offset', 'limit', 'maxChars']
+                        : kind === 'console'
+                            ? ['levels', 'filter', 'limit']
+                            : kind === 'network'
+                                ? ['status', 'resourceTypes', 'filter', 'afterSequence', 'limit']
+                                : []);
     const unsupportedFields = Object.keys(args).filter((field) => field !== 'kind' && args[field] !== undefined && !supportedFields.has(field));
     if (unsupportedFields.length > 0) {
         throw new Error(`Browser query kind "${kind}" does not accept ${unsupportedFields.join(', ')}`);
@@ -189,6 +195,15 @@ export class EmbeddedBrowserToolRuntime {
         if ((tool === 'fill' || tool === 'type') && asString(args.ref)) {
             return this.executeVerifiedAgentTextAction(target, tool, args, signal);
         }
+        // The controller fallback has no CDP network buffer to wait on.
+        if (tool === 'wait' && args.kind === 'network') {
+            return {
+                success: false,
+                code: 'BROWSER_CORE_UNAVAILABLE',
+                error: 'Wait kind "network" requires the shared Browser Core page connection.',
+                recovery: 'Keep the Browser tab open, inspect the page, and retry the network wait.',
+            };
+        }
         const actionArgs = await this.resolveAgentActionArgs(target, tool, args, signal);
         let result;
         switch (tool) {
@@ -218,6 +233,112 @@ export class EmbeddedBrowserToolRuntime {
                 break;
         }
         return this.stripAgentTarget(result);
+    }
+    /**
+     * One op of a Browser program (`program_op`) on the tab the manager chose,
+     * through the tab's shared Browser Core page. Core gates and times out each
+     * op itself (at most 120 s), so the host deadline sits outside it.
+     */
+    async executeAgentProgramOp(tab, op, signal) {
+        const shared = await this.ensureSharedPageContext(tab, signal);
+        if (!shared || shared === 'lost') {
+            if (tab.miniApp)
+                throw scriptPageUnavailable(tab);
+            throw new Error('BROWSER_UNAVAILABLE: The Browser page has no page connection for a program. Next: inspect the page, then run the program again.');
+        }
+        const { pageContext, webContents } = shared;
+        // Page JavaScript (the evaluate op) runs only on an HTTP(S) page or the
+        // managed Mini App, like a page script; a Mini App page takes every op only
+        // while it is the managed page. Other ops on a web page have no such
+        // check: a program may start on a blank tab.
+        const isCurrentScriptPage = tab.miniApp || op.op === 'evaluate' ? this.captureScriptPage(tab, webContents) : undefined;
+        if (op.op === 'goto' || op.op === 'back' || op.op === 'reload')
+            tab.lastLoadError = null;
+        try {
+            return await this.host.withTabOperation(tab, `browser-core:program:${typeof op.op === 'string' ? op.op : 'unknown'}`, (operationSignal) => {
+                if (isCurrentScriptPage && !isCurrentScriptPage())
+                    throw scriptPageUnavailable(tab);
+                return pageContext.executeOp(op, operationSignal ?? signal);
+            }, { signal, operationTimeoutMs: BROWSER_TIMEOUTS.longTabOperation });
+        }
+        finally {
+            this.host.refreshTabState(tab);
+        }
+    }
+    /**
+     * The tab's shared Browser Core page, created on first use and aligned with
+     * the tab's navigation generation. Undefined while the tab exposes no usable
+     * WebContents (unit hosts, early tab initialization); `lost` when a tab that
+     * had a Core page lost it.
+     */
+    async ensureSharedPageContext(tab, signal) {
+        const webContents = this.host.getWebContents(tab);
+        // Unit hosts and early tab initialization deliberately expose no
+        // WebContents. Keep the mature controller path as a compatibility seam;
+        // every real Electron Agent Browser page takes the shared Core path.
+        const unusableWebContents = !webContents ||
+            webContents.isDestroyed() ||
+            typeof webContents.executeJavaScript !== 'function' ||
+            typeof webContents.debugger?.sendCommand !== 'function';
+        if (unusableWebContents)
+            return this.sharedCoreTabs.has(tab) ? 'lost' : undefined;
+        // Install before the Core session reads transport.jsDialogs; idempotent per WebContents.
+        installBrowserJsDialogGate(webContents, {
+            isOperationActive: () => (tab.agentOperationCount ?? 0) > 0,
+            agentKeepaliveSince: () => isWithinAgentKeepalive(tab) ? (tab.lastAgentOperationAt ?? null) : null,
+        });
+        let pageContext = this.sharedPageContexts.get(webContents);
+        if (!pageContext) {
+            const controllerCdpHelper = tab.controller.getCDPHelper();
+            const controllerTransport = controllerCdpHelper && typeof controllerCdpHelper.getTransport === 'function'
+                ? controllerCdpHelper.getTransport()
+                : undefined;
+            const transport = controllerTransport instanceof ElectronCdpTransport
+                ? controllerTransport
+                : new ElectronCdpTransport(webContents);
+            const sharedCdpHelper = controllerTransport === transport ? controllerCdpHelper : undefined;
+            transport.enableOopifAutoAttach();
+            try {
+                await this.host.withTabOperation(tab, 'browser-core:transport-start', (operationSignal) => transport.start(operationSignal ?? signal), { signal, operationTimeoutMs: BROWSER_TIMEOUTS.tabOperation });
+            }
+            catch (error) {
+                // A cancelled first action can happen before the Core session is
+                // registered. Release the shared transport claim; either Core or the
+                // legacy helper will attach the same owner again on its next command.
+                await transport.close().catch(() => undefined);
+                throw error;
+            }
+            const coreSession = this.sharedBrowserCore.createSession(transport, {
+                ...(sharedCdpHelper ? { cdpHelper: sharedCdpHelper } : {}),
+                actionTimeoutMs: BROWSER_TIMEOUTS.tabOperation,
+                // Preserve the desktop Browser contract for renderer-backed page
+                // evaluation. Heavy pages can keep Electron's executeJavaScript call
+                // pending longer than Browser Core's provider-neutral 15s default.
+                commandTimeoutMs: BROWSER_TIMEOUTS.cdpCommand,
+                inputCoordinateScaleProvider: () => tab.controller.getInputCoordinateScale(),
+                beforePointerAction: (event) => tab.controller.prepareAgentCursorMove(event.point),
+                clickNavigationDetectionMs: ELECTRON_CLICK_NAVIGATION_DETECTION_MS,
+                captureScreenshot: (captureInput) => this.captureElectronCoreScreenshot(tab, captureInput),
+                readLiveFormState: () => this.host.isBrowserReadV2Enabled(),
+            });
+            const created = new ElectronBrowserPageContext({
+                webContents,
+                coreSession,
+                onDisposed: () => {
+                    this.sharedPageContexts.delete(webContents);
+                    this.sharedCoreTabs.delete(tab);
+                },
+            });
+            pageContext = created;
+            this.sharedPageContexts.set(webContents, created);
+            this.sharedCoreTabs.add(tab);
+            created.bindLifecycle();
+            // Cursor/glow scripts cannot run while a JavaScript dialog blocks the
+            // page (held for the Agent or shown to the user in the native box).
+            tab.controller.setAgentSurfacePausedProbe?.(() => getBrowserJsDialogGate(webContents)?.hasOpenDialog() === true);
+        }
+        pageContext.synchronizeGeneration(tab.navigationGeneration ?? 0);
+        return { pageContext, webContents };
     }
     captureScriptPage(tab, contents) {
         if (tab.miniApp) {
@@ -260,85 +381,27 @@ export class EmbeddedBrowserToolRuntime {
                 createIfMissing: true,
                 bounds: OFFSCREEN_BOUNDS,
             }));
-        const webContents = this.host.getWebContents(tab);
-        // Unit hosts and early tab initialization deliberately expose no
-        // WebContents. Keep the mature controller path as a compatibility seam;
-        // every real Electron Agent Browser page takes the shared Core path.
-        const unusableWebContents = !webContents ||
-            webContents.isDestroyed() ||
-            typeof webContents.executeJavaScript !== 'function' ||
-            typeof webContents.debugger?.sendCommand !== 'function';
-        if (unusableWebContents) {
-            if (tool === 'run_script')
-                throw scriptPageUnavailable(tab);
-            if (this.sharedCoreTabs.has(tab)) {
-                return {
-                    used: true,
-                    result: {
-                        success: false,
-                        code: 'BROWSER_UNAVAILABLE',
-                        error: 'The Browser page is unavailable after the shared Core session was created.',
-                        retryable: true,
-                        recovery: 'Inspect the Browser page after it is recreated before retrying the action.',
-                    },
-                };
-            }
-            return { used: false };
-        }
-        if (!webContents)
-            return { used: false };
-        // Install before the Core session reads transport.jsDialogs; idempotent per WebContents.
-        installBrowserJsDialogGate(webContents, {
-            isOperationActive: () => (tab.agentOperationCount ?? 0) > 0,
-            agentKeepaliveSince: () => isWithinAgentKeepalive(tab) ? (tab.lastAgentOperationAt ?? null) : null,
-        });
-        const isCurrentScriptPage = tool === 'run_script' ? this.captureScriptPage(tab, webContents) : undefined;
-        let pageContext = this.sharedPageContexts.get(webContents);
-        if (!pageContext) {
-            const controllerCdpHelper = tab.controller.getCDPHelper();
-            const controllerTransport = controllerCdpHelper && typeof controllerCdpHelper.getTransport === 'function'
-                ? controllerCdpHelper.getTransport()
-                : undefined;
-            const transport = controllerTransport instanceof ElectronCdpTransport
-                ? controllerTransport
-                : new ElectronCdpTransport(webContents);
-            const sharedCdpHelper = controllerTransport === transport ? controllerCdpHelper : undefined;
-            transport.enableOopifAutoAttach();
-            try {
-                await this.host.withTabOperation(tab, 'browser-core:transport-start', (operationSignal) => transport.start(operationSignal ?? signal), { signal, operationTimeoutMs: BROWSER_TIMEOUTS.tabOperation });
-            }
-            catch (error) {
-                // A cancelled first action can happen before the Core session is
-                // registered. Release the shared transport claim; either Core or the
-                // legacy helper will attach the same owner again on its next command.
-                await transport.close().catch(() => undefined);
-                throw error;
-            }
-            const coreSession = this.sharedBrowserCore.createSession(transport, {
-                ...(sharedCdpHelper ? { cdpHelper: sharedCdpHelper } : {}),
-                actionTimeoutMs: BROWSER_TIMEOUTS.tabOperation,
-                // Preserve the desktop Browser contract for renderer-backed page
-                // evaluation. Heavy pages can keep Electron's executeJavaScript call
-                // pending longer than Browser Core's provider-neutral 15s default.
-                commandTimeoutMs: BROWSER_TIMEOUTS.cdpCommand,
-                inputCoordinateScaleProvider: () => tab.controller.getInputCoordinateScale(),
-                beforePointerAction: (event) => tab.controller.prepareAgentCursorMove(event.point),
-                clickNavigationDetectionMs: ELECTRON_CLICK_NAVIGATION_DETECTION_MS,
-                captureScreenshot: (captureInput) => this.captureElectronCoreScreenshot(tab, captureInput),
-            });
-            pageContext = new ElectronBrowserPageContext({
-                webContents,
-                coreSession,
-                onDisposed: () => {
-                    this.sharedPageContexts.delete(webContents);
-                    this.sharedCoreTabs.delete(tab);
+        const shared = await this.ensureSharedPageContext(tab, signal);
+        // run_script needs this tab's live page: fail with its recovery code
+        // rather than falling back to the controller path.
+        if (tool === 'run_script' && (!shared || shared === 'lost'))
+            throw scriptPageUnavailable(tab);
+        if (shared === 'lost') {
+            return {
+                used: true,
+                result: {
+                    success: false,
+                    code: 'BROWSER_UNAVAILABLE',
+                    error: 'The Browser page is unavailable after the shared Core session was created.',
+                    retryable: true,
+                    recovery: 'Inspect the Browser page after it is recreated before retrying the action.',
                 },
-            });
-            this.sharedPageContexts.set(webContents, pageContext);
-            this.sharedCoreTabs.add(tab);
-            pageContext.bindLifecycle();
+            };
         }
-        pageContext.synchronizeGeneration(tab.navigationGeneration ?? 0);
+        if (!shared)
+            return { used: false };
+        const { pageContext, webContents } = shared;
+        const isCurrentScriptPage = tool === 'run_script' ? this.captureScriptPage(tab, webContents) : undefined;
         const clickProjection = clickAction
             ? this.createAgentClickProjection(tab, input, pageContext)
             : undefined;
@@ -346,9 +409,13 @@ export class EmbeddedBrowserToolRuntime {
         if (tool === 'navigate' || tool === 'back' || tool === 'forward' || tool === 'reload') {
             tab.lastLoadError = null;
         }
+        // Screenshot metrics split the wait for the tab render slot from the capture.
+        const operationQueuedAt = nowMs();
+        let operationStartedAt;
         const result = await this.host.withTabOperation(tab, `browser-core:${tool}`, (operationSignal) => {
             if (isCurrentScriptPage && !isCurrentScriptPage())
                 throw scriptPageUnavailable(tab);
+            operationStartedAt ?? (operationStartedAt = nowMs());
             return pageContext.execute(tool, coreInput, operationSignal ?? signal);
         }, {
             signal,
@@ -386,14 +453,19 @@ export class EmbeddedBrowserToolRuntime {
                 }),
             };
         }
-        const projected = projectSharedCoreResult(tool, result);
+        const projected = tool === 'screenshot'
+            ? withScreenshotCaptureTiming(projectSharedCoreResult(tool, result), result, (operationStartedAt ?? operationQueuedAt) - operationQueuedAt)
+            : projectSharedCoreResult(tool, result);
+        if (!clickProjection)
+            return { used: true, result: projected };
+        const projectedRecord = asRecord(projected);
+        const clickResult = tool === 'click_and_wait_for_navigation'
+            ? this.projectAgentNavigationResult(tab, clickProjection, projectedRecord)
+            : this.projectAgentClickResult(tab, clickProjection, projectedRecord);
+        // The click projections rebuild the result; keep its write-safety fields.
         return {
             used: true,
-            result: clickProjection
-                ? tool === 'click_and_wait_for_navigation'
-                    ? this.projectAgentNavigationResult(tab, clickProjection, asRecord(projected))
-                    : this.projectAgentClickResult(tab, clickProjection, asRecord(projected))
-                : projected,
+            result: { ...writeSafetyFields(projectedRecord), ...clickResult },
         };
     }
     stripAgentTarget(result) {
@@ -432,6 +504,7 @@ export class EmbeddedBrowserToolRuntime {
             width: capture.width,
             height: capture.height,
             data: capture.data,
+            ...(capture.timing ? { captureTiming: capture.timing } : {}),
         };
         const filePath = asString(input.file_path);
         if (filePath) {
@@ -752,6 +825,7 @@ export class EmbeddedBrowserToolRuntime {
         const target = this.resolveSharedPageContextTarget(pageContext, ref, frameRef);
         return target ? { backendNodeId: target.element.backendNodeId } : null;
     }
+    /** The tab's Browser Core page, once the Agent used it. */
     getSharedPageContext(tab) {
         const webContents = this.host.getWebContents(tab);
         if (!webContents || webContents.isDestroyed())
@@ -961,6 +1035,7 @@ export class EmbeddedBrowserToolRuntime {
             ...(element ? { element } : {}),
             beforeGeneration: tab.navigationGeneration ?? 0,
             beforeUrl: tab.url,
+            ...(pageContext ? { pageContext } : {}),
         };
     }
     projectAgentClickResult(tab, projection, result) {
@@ -971,12 +1046,21 @@ export class EmbeddedBrowserToolRuntime {
         const afterGeneration = tab.navigationGeneration ?? beforeGeneration;
         const afterUrl = tab.url;
         const urlChanged = afterUrl !== beforeUrl;
+        const sourceNavigation = asRecord(result.navigation);
+        const responseFacts = documentResponseFacts(sourceNavigation);
+        // Browser Core saw the click start a main-document request that has not
+        // answered yet: the page shown is still the previous one. A click refused
+        // because that load is pending (PAGE_LOADING) reports it too.
+        const loading = sourceNavigation.pending === true;
+        const pending = loading && result.success !== false;
         const navigation = {
             detected: afterGeneration !== beforeGeneration || urlChanged,
             urlChanged,
+            ...(loading ? { pending: true } : {}),
             generation: afterGeneration,
             beforeHost: urlHost(beforeUrl),
             afterHost: urlHost(afterUrl),
+            ...responseFacts,
         };
         const sourceEffect = asRecord(result.effect);
         const dispatched = typeof sourceEffect.dispatched === 'boolean'
@@ -996,21 +1080,43 @@ export class EmbeddedBrowserToolRuntime {
         const dialogHandling = projectJsDialogHandling(result);
         if (dialogHandling)
             return dialogHandling;
-        if (result.success === false) {
-            if (result.code === 'UNEXPECTED_NAVIGATION') {
-                return {
-                    success: false,
-                    code: 'UNEXPECTED_NAVIGATION',
-                    message: 'Ordinary click changed the active Browser page unexpectedly.',
-                    retryable: true,
-                    recovery: 'Inspect the current page before deciding whether to go back or retry with a newly observed target.',
-                    target,
-                    effect,
-                    navigation,
-                    ...(download ? { download } : {}),
-                    ...(duration !== undefined ? { duration } : {}),
-                };
+        const extras = {
+            ...(download ? { download } : {}),
+            ...(duration !== undefined ? { duration } : {}),
+        };
+        // The click was dispatched (or a non-GET request was sent), so the page
+        // may already have acted on it: not retryable as is (browser-write-record.ts).
+        const navigationRetry = unexpectedNavigationRetry('click', {
+            dispatched,
+            ...(responseFacts.requestMethod ? { requestMethod: responseFacts.requestMethod } : {}),
+        });
+        const unexpectedNavigation = () => {
+            if (!navigationRetry.retryable) {
+                projection.pageContext?.markLastWriteUncertain('unexpected_navigation');
             }
+            return {
+                success: false,
+                code: 'UNEXPECTED_NAVIGATION',
+                message: 'Ordinary click changed the active Browser page unexpectedly.',
+                ...navigationRetry,
+                ...(navigationRetry.retryable
+                    ? {}
+                    : {
+                        uncertainWrite: {
+                            reason: 'unexpected_navigation',
+                            message: uncertainWriteNext('click'),
+                        },
+                    }),
+                url: afterUrl,
+                target,
+                effect,
+                navigation,
+                ...extras,
+            };
+        };
+        if (result.success === false) {
+            if (result.code === 'UNEXPECTED_NAVIGATION')
+                return unexpectedNavigation();
             const error = asString(result.message, asString(result.error, 'Click failed.'));
             return {
                 success: false,
@@ -1024,22 +1130,47 @@ export class EmbeddedBrowserToolRuntime {
                 target,
                 effect,
                 navigation,
-                ...(download ? { download } : {}),
-                ...(duration !== undefined ? { duration } : {}),
+                ...(isRecord(result.interactability) ? { interactability: result.interactability } : {}),
+                ...extras,
             };
         }
-        if (navigation.detected) {
+        if (pending && !urlChanged) {
             return {
-                success: false,
-                code: 'UNEXPECTED_NAVIGATION',
-                message: 'Ordinary click changed the active Browser page unexpectedly.',
-                retryable: true,
-                recovery: 'Inspect the current page before deciding whether to go back or retry with a newly observed target.',
+                success: true,
+                message: 'The click started a page load that is still running.',
+                ...(asString(result.recovery)
+                    ? { recovery: asString(result.recovery).slice(0, 1024) }
+                    : {}),
                 target,
                 effect,
                 navigation,
-                ...(download ? { download } : {}),
-                ...(duration !== undefined ? { duration } : {}),
+                ...extras,
+            };
+        }
+        if (navigation.detected) {
+            // Desktop eval: most UNEXPECTED_NAVIGATION results were link and submit
+            // clicks, and one task clicked "Add to Wish List" again after one.
+            // A same-origin navigation the server answered is the click's
+            // intended effect when the page really changed: the URL moved, or
+            // Browser Core saw a new main document commit (a POST that re-renders
+            // the same URL). A started navigation alone may never commit. Leaving
+            // the site or an HTTP error stays a failure the model must look at.
+            const beforeOrigin = urlOrigin(beforeUrl);
+            const sameOrigin = beforeOrigin !== null && beforeOrigin === urlOrigin(afterUrl);
+            const requestSucceeded = responseFacts.httpStatus === undefined || responseFacts.httpStatus < 400;
+            const pageChanged = urlChanged || asRecord(result.navigation).detected === true;
+            if (!sameOrigin || !requestSucceeded || !pageChanged)
+                return unexpectedNavigation();
+            return {
+                success: true,
+                url: afterUrl,
+                title: tab.title,
+                message: 'The click navigated the page. Refs from earlier snapshots are no longer valid.',
+                recovery: 'Inspect or query the new page before the next interaction.',
+                target,
+                effect,
+                navigation,
+                ...extras,
             };
         }
         return {
@@ -1047,9 +1178,8 @@ export class EmbeddedBrowserToolRuntime {
             target,
             effect,
             navigation,
-            ...(download ? { download } : {}),
             ...(asString(result.recovery) ? { recovery: asString(result.recovery).slice(0, 1024) } : {}),
-            ...(duration !== undefined ? { duration } : {}),
+            ...extras,
         };
     }
     projectAgentNavigationResult(tab, projection, result) {
@@ -1074,19 +1204,28 @@ export class EmbeddedBrowserToolRuntime {
             beforeHost: urlHost(projection.beforeUrl),
             afterHost: urlHost(afterUrl),
         };
-        for (const key of ['loaded', 'awaited']) {
+        for (const key of ['loaded', 'awaited', 'pending']) {
             if (typeof sourceNavigation[key] === 'boolean')
                 navigation[key] = sourceNavigation[key];
         }
         if (typeof sourceNavigation.readyState === 'string') {
             navigation.readyState = sourceNavigation.readyState.slice(0, 32);
         }
+        Object.assign(navigation, documentResponseFacts(sourceNavigation));
         const projected = {
             success: result.success === true,
             target,
             navigation,
         };
-        for (const key of ['code', 'errorCode', 'retryable', 'recovery', 'url', 'title']) {
+        for (const key of [
+            'code',
+            'errorCode',
+            'retryable',
+            'recovery',
+            'url',
+            'title',
+            'interactability',
+        ]) {
             if (result[key] !== undefined)
                 projected[key] = result[key];
         }
@@ -1114,6 +1253,9 @@ export class EmbeddedBrowserToolRuntime {
                 ? { resolvedPosition: runtimeTarget.resolvedPosition }
                 : {}),
             ...(runtimeTarget.hitTarget ? { hitTarget: runtimeTarget.hitTarget } : {}),
+            // What the clicked control does (Browser Core's hit test): the compact
+            // result's follow-up after a click without navigation depends on it.
+            ...(typeof runtimeTarget.control === 'string' ? { control: runtimeTarget.control } : {}),
             ...(!element && runtimeTarget.rect ? { rect: runtimeTarget.rect } : {}),
         };
     }
@@ -1199,12 +1341,25 @@ export class EmbeddedBrowserToolRuntime {
             afterHost: urlHost(tab.url),
         };
         if (navigation.detected) {
+            // The controller's typing already ran when the page moved unless it
+            // reports that nothing was dispatched: only then is a retry safe.
+            const controllerEffect = asRecord(asRecord(result).effect);
+            const navigationRetry = unexpectedNavigationRetry(tool, {
+                dispatched: controllerEffect.dispatched !== false,
+            });
             return {
                 success: false,
                 code: 'UNEXPECTED_NAVIGATION',
                 message: 'Typing changed the active Browser page unexpectedly.',
-                retryable: true,
-                recovery: 'Inspect the current page before deciding whether to retry.',
+                ...navigationRetry,
+                ...(navigationRetry.retryable
+                    ? {}
+                    : {
+                        uncertainWrite: {
+                            reason: 'unexpected_navigation',
+                            message: uncertainWriteNext(tool),
+                        },
+                    }),
                 target,
                 navigation,
             };
@@ -1337,6 +1492,11 @@ export class EmbeddedBrowserToolRuntime {
         }
         if (kind === 'load')
             return { load: true, timeout: asNumber(args.timeout, 30000) };
+        if (kind === 'network') {
+            // Only Browser Core reads the CDP network buffer; the controller
+            // fallback refuses this kind (executeTool 'wait_for').
+            return { ...args, kind, timeout: asNumber(args.timeout, 30000) };
+        }
         throw new Error(`Unsupported browser wait kind: ${kind || 'missing'}`);
     }
     async queryAgentBrowser(agentTarget, args, signal) {
@@ -1368,6 +1528,14 @@ export class EmbeddedBrowserToolRuntime {
                 .filter(agentElementIsEditable);
             const page = this.createAgentSnapshot(tab, result, normalizedArgs, editableElements, 'query-editable');
             return this.formatEditableSnapshotPage(page);
+        }
+        if (kind === 'rows') {
+            return {
+                success: false,
+                code: 'BROWSER_CORE_UNAVAILABLE',
+                error: 'Query kind "rows" requires the shared Browser Core page connection.',
+                recovery: 'Keep the Browser tab open, inspect the page, and retry the rows query.',
+            };
         }
         if (kind === 'semantic') {
             return {
@@ -1449,6 +1617,17 @@ export class EmbeddedBrowserToolRuntime {
                 url: sanitizeConsoleDiagnosticUrl(state.url),
                 title: state.title,
                 ...diagnostics,
+            };
+        }
+        // The controller fallback reads only the first match from its start;
+        // paging by character or by match exists in Browser Core alone.
+        if ((kind === 'dom' || kind === 'text') &&
+            (args.all === true || asNumber(args.offset, 0) > 0)) {
+            return {
+                success: false,
+                code: 'BROWSER_CORE_UNAVAILABLE',
+                error: `Query kind "${kind}" with ${args.all === true ? 'all' : 'offset'} requires the shared Browser Core page connection.`,
+                recovery: `Keep the Browser tab open, inspect the page, and retry the ${kind} query.`,
             };
         }
         if (kind === 'dom') {
@@ -1947,12 +2126,47 @@ function sharedCoreOperationTimeout(tool, input) {
     const margin = tool === 'click_and_wait_for_navigation' || tool === 'wait' ? 1000 : 5000;
     return Math.min(BROWSER_TIMEOUTS.longTabOperation, Math.max(BROWSER_TIMEOUTS.tabOperation, Math.floor(requested) + margin));
 }
+/**
+ * Returns the projected screenshot with the provider's capture timing plus the
+ * tab render-slot wait. The runtime's post-action visual metrics read it; the
+ * Browser tool removes `captureTiming` before the result reaches the model.
+ */
+function withScreenshotCaptureTiming(projected, coreResult, queueMs) {
+    if (!isRecord(projected) || projected.success === false)
+        return projected;
+    const timing = isRecord(coreResult) && isRecord(coreResult.captureTiming) ? coreResult.captureTiming : {};
+    return { ...projected, captureTiming: { ...timing, queueMs: Math.max(0, queueMs) } };
+}
+/**
+ * Browser Core's write-record fields, and how it read the target (a CSS
+ * selector sent as ref), kept when a projection rebuilds a write result.
+ */
+function writeSafetyFields(result) {
+    const source = asRecord(result);
+    return {
+        ...(source.uncertainWrite !== undefined ? { uncertainWrite: source.uncertainWrite } : {}),
+        ...(source.writeRetryWarning !== undefined
+            ? { writeRetryWarning: source.writeRetryWarning }
+            : {}),
+        ...(source.targetInterpretedAs !== undefined
+            ? { targetInterpretedAs: source.targetInterpretedAs, targetNote: source.targetNote }
+            : {}),
+        ...(source.targetRebound !== undefined ? { targetRebound: source.targetRebound } : {}),
+    };
+}
+const SHARED_CORE_COUNT_KEYS = {
+    query: ['resetCount', 'droppedEntries', 'oldestSequence', 'unchangedRepeats'],
+    wait: ['matched', 'visible'],
+};
 export function projectSharedCoreResult(tool, result) {
     if (!result || typeof result !== 'object' || Array.isArray(result))
         return result;
     const source = result;
     const projected = {};
     const commonKeys = [
+        'targetInterpretedAs',
+        'targetNote',
+        'targetRebound',
         'success',
         'url',
         'title',
@@ -1998,32 +2212,59 @@ export function projectSharedCoreResult(tool, result) {
         'trigger',
         'awaitingUser',
         'handled',
+        'uncertainWrite',
+        'writeRetryWarning',
+        'pendingNavigation',
+        'pageControls',
+        'missingLandmark',
+        'consecutiveMisses',
+        'candidates',
+        'region',
     ];
     const actionKeys = {
-        click: ['target', 'effect', 'navigation', 'download'],
-        double_click: ['target', 'effect', 'navigation', 'download'],
-        triple_click: ['target', 'effect', 'navigation', 'download'],
-        click_and_wait_for_navigation: ['target', 'effect', 'navigation'],
+        click: ['target', 'effect', 'navigation', 'download', 'interactability'],
+        double_click: ['target', 'effect', 'navigation', 'download', 'interactability'],
+        triple_click: ['target', 'effect', 'navigation', 'download', 'interactability'],
+        click_and_wait_for_navigation: ['target', 'effect', 'navigation', 'interactability'],
         navigate: ['navigation'],
         back: ['navigation'],
         forward: ['navigation'],
         reload: ['navigation'],
         drag: ['target', 'effect', 'mode', 'dragStarted', 'dropDispatched'],
-        hover: ['target', 'effect'],
-        fill: ['target', 'effect', 'navigation'],
-        type: ['target', 'effect', 'navigation'],
-        press_key: ['target', 'effect'],
-        check: ['target', 'effect'],
-        uncheck: ['target', 'effect'],
+        hover: ['target', 'effect', 'interactability'],
+        fill: ['target', 'effect', 'navigation', 'interactability', 'inputTarget'],
+        type: ['target', 'effect', 'navigation', 'interactability', 'inputTarget'],
+        press_key: ['target', 'effect', 'navigation'],
+        check: ['target', 'effect', 'navigation', 'interactability'],
+        uncheck: ['target', 'effect', 'navigation', 'interactability'],
         select_option: [
             'target',
             'effect',
+            'navigation',
             'availableOptions',
             'availableOptionsTruncated',
             'availableOptionCount',
         ],
         scroll: ['target', 'effect'],
-        wait: ['kind', 'waitedMs'],
+        // kind "network": the finished request, or on timeout how many still load.
+        wait: ['kind', 'waitedMs', 'entry', 'pendingMatches'],
+        // text/dom paging: offsetUnit says whether offset counts characters or
+        // matches; all: true returns matches[] with totalMatches. kind "rows"
+        // pages rows[] by row index and may spill them to fullOutputPath.
+        query: [
+            'selector',
+            'offsetUnit',
+            'totalMatches',
+            'matches',
+            'totalRows',
+            'returnedRows',
+            'rows',
+            'truncatedCells',
+            'field',
+            'fullOutputPath',
+            'fullOutputRows',
+            'fullOutputComplete',
+        ],
         screenshot: ['format', 'width', 'height', 'data', 'file_path'],
         run_script: [
             'filename',
@@ -2032,6 +2273,8 @@ export function projectSharedCoreResult(tool, result) {
             'logs',
             'logsTruncated',
             'pageEvaluate',
+            // What the page JavaScript did (code, requests, writes); uncertainWrite is common.
+            'pageScript',
             'input',
             'pageErrors',
             'screenshots',
@@ -2045,6 +2288,10 @@ export function projectSharedCoreResult(tool, result) {
         // handle_js_dialog, or a click/press_key on a dialog ref, settled a dialog.
         ...(source.handled === true ? ['type', 'action'] : []),
     ]);
+    // Any action can end on a page that is still loading a new document
+    // (Browser Core's PAGE_LOADING): its navigation facts say what is loading.
+    if (isRecord(source.navigation) && source.navigation.pending === true)
+        keys.add('navigation');
     for (const key of keys) {
         if (source[key] !== undefined)
             projected[key] = source[key];
@@ -2054,6 +2301,20 @@ export function projectSharedCoreResult(tool, result) {
             projected.duration = source.durationMs;
         else if (tool === 'wait' && typeof source.waitedMs === 'number') {
             projected.duration = source.waitedMs;
+        }
+    }
+    // A network query's reset, eviction and repeat facts, and the match counts
+    // of a timed-out selector wait.
+    for (const key of SHARED_CORE_COUNT_KEYS[tool] ?? []) {
+        const value = source[key];
+        if (typeof value === 'number' && Number.isFinite(value))
+            projected[key] = value;
+    }
+    if (tool === 'query') {
+        if (typeof source.notice === 'string')
+            projected.notice = source.notice.slice(0, 2000);
+        if (typeof source.lastResetAt === 'string') {
+            projected.lastResetAt = source.lastResetAt.slice(0, 40);
         }
     }
     for (const key of ['elements', 'targets']) {
@@ -2103,6 +2364,22 @@ export function projectSharedCoreResult(tool, result) {
         projected.error = tool === 'back' ? 'Cannot go back' : 'Cannot go forward';
     }
     return projected;
+}
+/**
+ * HTTP facts Browser Core recorded for the main document an action loaded,
+ * and the URL of a document that is still loading.
+ */
+function documentResponseFacts(source) {
+    return {
+        ...(typeof source.httpStatus === 'number' ? { httpStatus: source.httpStatus } : {}),
+        ...(typeof source.redirectStatus === 'number' ? { redirectStatus: source.redirectStatus } : {}),
+        ...(typeof source.requestMethod === 'string'
+            ? { requestMethod: source.requestMethod.slice(0, 16) }
+            : {}),
+        ...(typeof source.pendingUrl === 'string'
+            ? { pendingUrl: source.pendingUrl.slice(0, 2048) }
+            : {}),
+    };
 }
 /**
  * A click either landed on a JavaScript dialog button or was interrupted by a
@@ -2190,13 +2467,27 @@ function projectSharedCoreElement(value) {
     const frame = asString(source.frame);
     if (frame)
         projected.frame = frame;
+    if (typeof source.role === 'string')
+        projected.role = source.role.slice(0, 120);
+    // Live form state (`beta.browserReadV2`), as Browser Core bounds it.
+    for (const key of ['value', 'selectedText']) {
+        if (typeof source[key] === 'string')
+            projected[key] = source[key].slice(0, 300);
+    }
+    if (source.valueTruncated === true)
+        projected.valueTruncated = true;
+    if (typeof source.checked === 'boolean')
+        projected.checked = source.checked;
+    if (typeof source.selectedCount === 'number' && Number.isFinite(source.selectedCount)) {
+        projected.selectedCount = source.selectedCount;
+    }
     return projected;
 }
 function projectSharedCoreTarget(value) {
     const projected = {};
     if (value.resolved !== undefined)
         projected.resolved = value.resolved;
-    for (const key of ['tag', 'role', 'inputType', 'name']) {
+    for (const key of ['tag', 'role', 'inputType', 'name', 'control']) {
         if (typeof value[key] === 'string')
             projected[key] = value[key].slice(0, 80);
     }
@@ -2250,6 +2541,7 @@ function projectSharedCoreEffect(value) {
         'textChanged',
         'focused',
         'matchesExpected',
+        'containsExpected',
         'hovered',
         'tooltipObserved',
         'checked',
@@ -2277,6 +2569,9 @@ function projectSharedCoreEffect(value) {
             .slice(0, 20)
             .map((item) => item.slice(0, 500));
     }
+    // check/uncheck set the input through its own click() (no pointer click, or one that missed).
+    if (value.fallback === 'element_click')
+        projected.fallback = value.fallback;
     const semantic = isRecord(value.semantic) ? value.semantic : null;
     if (semantic) {
         projected.semantic = {
@@ -2290,7 +2585,7 @@ function projectSharedCoreEffect(value) {
 }
 function projectSharedCoreNavigation(value) {
     const projected = {};
-    for (const key of ['detected', 'urlChanged', 'loaded', 'awaited']) {
+    for (const key of ['detected', 'urlChanged', 'loaded', 'awaited', 'pending']) {
         if (typeof value[key] === 'boolean')
             projected[key] = value[key];
     }
@@ -2299,7 +2594,7 @@ function projectSharedCoreNavigation(value) {
     }
     if (typeof value.readyState === 'string')
         projected.readyState = value.readyState.slice(0, 32);
-    return projected;
+    return { ...projected, ...documentResponseFacts(value) };
 }
 function boundedSharedCoreAttributes(value) {
     const attributes = asRecord(value);

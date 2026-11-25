@@ -4,7 +4,7 @@ import { MANAGED_MINIMAX_PROVIDER_ID } from '../identity.js';
 import { modelConfigForRef } from './list-models.js';
 import { resolveLegacyMinimaxModel } from './model-selection.js';
 import { CUSTOM_PROVIDER_ID_PREFIX, formatModelKey, parseSourceQualifiedModelKey, } from '../resolution/model-key.js';
-import { isMiniMaxM3ThinkingMode, isThinkingEffortDisabled, resolveMiniMaxM3ThinkingMode, normalizeModelThinkingEffort, normalizeModelThinkingEffortOptions, resolveModelThinkingMiddleEffort, modelRefForModel, } from '../resolution/model-ref.js';
+import { isMiniMaxM3ThinkingMode, isThinkingEffortDisabled, resolveMiniMaxM3ThinkingMode, normalizeModelThinkingEffort, normalizeModelThinkingEffortOptions, resolveDefaultThinkingEffort, modelRefForModel, } from '../resolution/model-ref.js';
 /**
  * The one model-selection path shared by Session definition capture and the
  * Agent Config effective preview. It intentionally returns `undefined` when
@@ -467,7 +467,9 @@ function resolveSwitchableOrCatalogEffort(input, requested) {
 }
 function resolveListedEffort(input, options, requested) {
     if (!requested) {
-        return input.defaultMissingEffortOff ? 'off' : resolveModelThinkingMiddleEffort(options);
+        return input.defaultMissingEffortOff
+            ? 'off'
+            : resolveDefaultThinkingEffort(options, input.modelConfig?.thinking?.defaultEffort);
     }
     if (requested === 'off' && !isOnOffThinkingOptions(options))
         return 'off';

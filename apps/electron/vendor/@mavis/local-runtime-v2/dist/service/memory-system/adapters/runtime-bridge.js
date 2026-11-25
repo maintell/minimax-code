@@ -108,6 +108,10 @@ function toRuntimeTool(tool) {
     const schema = TOOL_SCHEMAS[tool.name];
     return defineRuntimeTool({
         name: tool.name,
+        // Grouped under `memory` so loading `memory-manage` names them together.
+        // No `loading`, so they stay in the per-turn list and the Skill gate,
+        // which only guards on-demand tools, never stands in front of them.
+        namespace: 'memory',
         description: tool.description,
         schema,
         source: 'builtin',

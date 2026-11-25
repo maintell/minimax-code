@@ -40,6 +40,8 @@ export function initializeProductionMemoryV2System(input) {
         config,
         readPrompt,
         completion: traceMemoryPort(diagnostics, 'completion', createGlobalMemoryModelCompletion({
+            createContextCompactor: input.createContextCompactor,
+            ...(input.retrySleep ? { retrySleep: input.retrySleep } : {}),
             preparation: input.preparation,
             defaultModelName: input.defaultModelName,
             nowMs,
@@ -57,6 +59,15 @@ export function initializeProductionMemoryV2System(input) {
         diagnostics,
         execution,
         nowMs,
+        ...(input.rollout
+            ? {
+                rollout: {
+                    ...(quota ? { readPlan: () => quota.readPlan() } : {}),
+                    defaultModelName: input.defaultModelName,
+                    ...input.rollout,
+                },
+            }
+            : {}),
     });
 }
 /** 读取受控 Prompt 资产，优先用线上快照，回落到内置文件。 */
@@ -79,9 +90,17 @@ export function initializeRuntimeMemoryV2System(input) {
     if (!memory()?.v2 && memory()?.v2_enabled === undefined)
         return undefined;
     const appConfig = () => resolveMemorySystemConfig(memory());
+    const { memoryMigration } = input.options.compatibility;
+    const disableMemory = memoryMigration.disableMemoryV2?.bind(memoryMigration);
+    const setMemoryModel = memoryMigration.setMemoryV2Model?.bind(memoryMigration);
     const system = initializeProductionMemoryV2System({
+        createContextCompactor: input.createContextCompactor,
         quota: input.quota,
-        disableLegacyRecall: input.options.compatibility.memoryMigration.disableLegacyRecall,
+        rollout: {
+            ...(disableMemory ? { disableMemory } : {}),
+            ...(setMemoryModel ? { setMemoryModel } : {}),
+        },
+        disableLegacyRecall: memoryMigration.disableLegacyRecall,
         db: input.options.db,
         dataDir: input.options.dataDir,
         sessions: input.sessionSystem.repositories.sessions,

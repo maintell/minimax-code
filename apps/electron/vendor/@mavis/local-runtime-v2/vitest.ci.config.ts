@@ -2,9 +2,8 @@ import { defineConfig } from 'vitest/config';
 import base from './vitest.config.js';
 
 const mode = process.env.MAVIS_RUNTIME_CI_MODE;
-const phase = process.env.MAVIS_RUNTIME_CI_PHASE;
-if (!['affected', 'full'].includes(mode ?? '') || !['shard', 'merge'].includes(phase ?? '')) {
-  throw new Error('Runtime CI requires an explicit selection mode and reporting phase');
+if (!['affected', 'full'].includes(mode ?? '')) {
+  throw new Error('Runtime CI requires an explicit selection mode');
 }
 if (!process.env.MAVIS_RUNTIME_CI_REPORT_DIR)
   throw new Error('Runtime CI report directory is required');
@@ -21,9 +20,9 @@ export default defineConfig({
     coverage: {
       ...coverage,
       all: mode === 'full',
-      // A shard cannot meet the whole-package floor by itself. Enforce the unchanged
-      // thresholds only after every shard's test inventory and reports are verified.
-      thresholds: mode === 'full' && phase === 'merge' ? coverage.thresholds : {},
+      // A shard cannot meet the whole-package floor by itself. check:coverage:local-runtime-v2
+      // merges the verified shards' reports and checks a full run against the floor.
+      thresholds: {},
       reporter: ['json', 'text-summary'],
       reportsDirectory: process.env.MAVIS_RUNTIME_CI_REPORT_DIR,
     },

@@ -10,11 +10,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { logger, backgroundCtx } from '../host-utils.js';
-import { isSameResolvedPath } from './path-identity.js';
+import { isSameResolvedPath, namesDirectoryEntry, reachesRootInOtherCase, resolveCanonicalPath, resolveEntryLocation, resolveOperationIdentities, resolvePhysicalEntry, resolvePhysicalPath, unfoldedAbsolutePath, } from './path-identity.js';
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-/** Files that require explicit user approval to modify (§5.2) */
+/**
+ * Files that require explicit user approval to modify (§5.2). Names are
+ * lowercase and compared case-insensitively.
+ */
 export const DANGEROUS_FILES = new Set([
     '.gitconfig',
     '.gitmodules',
@@ -46,7 +49,10 @@ export const DANGEROUS_FILES = new Set([
     // Docker credentials
     '.dockercfg',
 ]);
-/** Directories where writes trigger a safety check (§5.2) */
+/**
+ * Directories where writes trigger a safety check (§5.2). Lowercase, compared
+ * case-insensitively.
+ */
 export const DANGEROUS_DIRECTORIES = [
     '.git',
     '.vscode',
@@ -100,9 +106,11 @@ const SHELL_EXPANSION_PATTERNS = [
  *     the built-in fs tools.
  * 3. Shell expansion syntax blocking (`$()`, backticks, `${}`)
  * 4. Normalization: `..` components are resolved against the working
- *    directory, so `a/b/../c` is judged exactly like `a/c`. A `..` that the
- *    platform's path semantics cannot resolve (a backslash-separated `..` on
- *    POSIX, where `\` is an ordinary filename character) is still rejected.
+ *    directory, so `a/b/../c` is judged exactly like `a/c`; the permission
+ *    check then judges the real location the path reaches (see
+ *    `resolvePathIdentities`). A `..` that the platform's path semantics
+ *    cannot resolve (a backslash-separated `..` on POSIX, where `\` is an
+ *    ordinary filename character) is still rejected.
  *
  * @returns The resolved absolute path, or an error object.
  */
@@ -245,20 +253,25 @@ export function validateGlobPattern(pattern) {
  * Check whether a file path refers to a dangerous/protected file.
  */
 export function isDangerousFile(filePath) {
-    const basename = path.basename(filePath);
-    return DANGEROUS_FILES.has(basename);
+    return DANGEROUS_FILES.has(path.basename(filePath).toLowerCase());
 }
 /**
  * Check whether a path falls within a dangerous/protected directory.
  */
 export function isInDangerousDirectory(filePath) {
-    const resolved = path.resolve(filePath);
-    const segments = resolved.split(path.sep);
-    for (const dir of DANGEROUS_DIRECTORIES) {
-        if (segments.includes(dir))
-            return true;
-    }
-    return false;
+    return dangerousDirectoryOf(filePath) !== undefined;
+}
+function dangerousDirectoryOf(filePath) {
+    const segments = lowercaseSegments(path.resolve(filePath));
+    return DANGEROUS_DIRECTORIES.find((directory) => containsSegments(segments, directory));
+}
+/** Case-folded because macOS and Windows reach `.git` through `.GIT`. */
+function lowercaseSegments(filePath) {
+    return filePath.toLowerCase().split(path.sep);
+}
+function containsSegments(segments, directory) {
+    const parts = directory.split('/');
+    return segments.some((_, start) => parts.every((part, offset) => segments[start + offset] === part));
 }
 /**
  * Git metadata files that may contain credentials even when read-only.
@@ -272,12 +285,11 @@ export function isInDangerousDirectory(filePath) {
  * so `.git/modules/*` paths must be checked with the same vigilance.
  */
 export function isSensitiveGitFile(filePath) {
-    const resolved = path.resolve(filePath);
-    const segments = resolved.split(path.sep);
+    const segments = lowercaseSegments(path.resolve(filePath));
     const gitIndex = segments.lastIndexOf('.git');
     if (gitIndex === -1)
         return false;
-    const relativeParts = segments.slice(gitIndex + 1).map((part) => part.toLowerCase());
+    const relativeParts = segments.slice(gitIndex + 1);
     if (relativeParts.length === 0)
         return false;
     const basename = relativeParts[relativeParts.length - 1];
@@ -353,6 +365,8 @@ export function isPublicKeyFile(filePath) {
 // ---------------------------------------------------------------------------
 // .env file detection
 // ---------------------------------------------------------------------------
+/** `.env.<suffix>` names that hold template values rather than secrets. */
+export const TEMPLATE_SUFFIXES = ['example', 'sample', 'template'];
 /**
  * Check if a file is a `.env` variant (excluding `.env.example` templates).
  *
@@ -372,7 +386,6 @@ export function isEnvFile(filePath) {
         return false;
     // Exclude template/example files
     const suffix = basename.slice(5).toLowerCase(); // after '.env.'
-    const TEMPLATE_SUFFIXES = ['example', 'sample', 'template'];
     if (TEMPLATE_SUFFIXES.includes(suffix))
         return false;
     return true;
@@ -471,31 +484,87 @@ export function isDangerousRemovalPath(inputPath, homeDir) {
     }
     return false;
 }
-// ---------------------------------------------------------------------------
-// Working directory boundary checks
-// ---------------------------------------------------------------------------
 /**
  * Check if a path is within the working directory.
+ *
+ * A drive root (`D:\`) or `/` workspace contains every path on that volume;
+ * on Windows the match ignores letter case.
  */
-export function pathInWorkingPath(filePath, workingDirectory) {
-    const resolved = process.platform === 'win32' ? path.resolve(filePath).toLowerCase() : path.resolve(filePath);
-    const normalizedWork = process.platform === 'win32'
-        ? path.resolve(workingDirectory).toLowerCase()
-        : path.resolve(workingDirectory);
-    return resolved === normalizedWork || resolved.startsWith(normalizedWork + path.sep);
+export function pathInWorkingPath(filePath, workingDirectory, pathApi = path) {
+    return isPathWithin(filePath, workingDirectory, pathApi);
+}
+/**
+ * The working directory and allowed working paths, matched in lexical form
+ * first. A real form (`/tmp` on macOS) is resolved only for the working
+ * directory and for a folder that one of the path's identities already reaches
+ * as written, which shares its mount with the target: a path outside a folder
+ * never waits on that folder's unresponsive mount.
+ */
+function rootMatcher(workingDirectory, allowed, identities, options = {}) {
+    const working = workingDirectory ? path.resolve(workingDirectory) : undefined;
+    // A `/` or drive-root folder is the whole volume, which only widens reads:
+    // for a write or a script run it authorises nothing.
+    const lexical = [working, ...(allowed ?? []).map((root) => path.resolve(root))].filter((root) => typeof root === 'string' &&
+        root.length > 0 &&
+        !(options.writable && isVolumeRoot(root, path)));
+    let real;
+    const realForms = () => {
+        real ??= lexical
+            .filter((root) => root === working || identities.some((id) => insideAnyRootForm(id, [root])))
+            .flatMap((root) => rootForms(root).filter((form) => !lexical.includes(form)));
+        return real;
+    };
+    return {
+        contains: (target) => insideAnyRootForm(target, lexical) || insideAnyRootForm(target, realForms()),
+    };
+}
+function workingRootMatcher(context, identities, options = {}) {
+    return rootMatcher(context.workingDirectory, context.allowedWorkingPaths, identities, options);
+}
+/** A boundary root in lexical and real form (`/var` is `/private/var` on macOS). */
+function rootForms(root) {
+    const lexical = path.resolve(root);
+    const canonical = resolveCanonicalPath(lexical);
+    return canonical && canonical !== lexical ? [lexical, canonical] : [lexical];
+}
+/** Whether every identity of one path lies inside some working root. */
+function allInsideWorkingRoots(identities, context, options = {}) {
+    const roots = workingRootMatcher(context, identities, options);
+    return identities.every((identity) => roots.contains(identity));
+}
+/**
+ * Whether a path lies inside one of the roots, taking each root in lexical and
+ * real form and in another letter case on a case-insensitive volume. Bash write
+ * targets and script runs share this with the file tools, so a `/` or
+ * drive-root folder does not authorise them.
+ */
+export function pathInAnyWorkingRoot(target, workingDirectory, allowedWorkingPaths) {
+    return rootMatcher(workingDirectory, allowedWorkingPaths, [target], { writable: true }).contains(target);
+}
+function insideAnyRootForm(target, forms) {
+    return forms.some((root) => pathInWorkingPath(target, root) || reachesRootInOtherCase(target, root));
 }
 /**
  * Check if a path is within any of the allowed working paths.
  */
-export function pathInAllowedWorkingPath(filePath, allowedPaths) {
-    const resolved = path.resolve(filePath);
-    for (const allowed of allowedPaths) {
-        const normalizedAllowed = path.resolve(allowed);
-        if (resolved === normalizedAllowed || resolved.startsWith(normalizedAllowed + path.sep)) {
-            return true;
-        }
-    }
-    return false;
+export function pathInAllowedWorkingPath(filePath, allowedPaths, pathApi = path) {
+    return allowedPaths.some((allowed) => isPathWithin(filePath, allowed, pathApi));
+}
+function isVolumeRoot(directory, pathApi) {
+    const resolved = pathApi.resolve(directory);
+    return pathApi.dirname(resolved) === resolved;
+}
+/**
+ * Boundary for writes and script execution: a `/` or drive-root workspace is
+ * the whole volume, which only widens reads, so it authorises nothing here and
+ * such a target keeps going through confirmation.
+ */
+export function pathInWritableWorkspace(filePath, workingDirectory, pathApi = path) {
+    return (!isVolumeRoot(workingDirectory, pathApi) && isPathWithin(filePath, workingDirectory, pathApi));
+}
+/** {@link pathInWritableWorkspace} over a list of allowed paths. */
+export function pathInWritableAllowedPaths(filePath, allowedPaths, pathApi = path) {
+    return allowedPaths.some((allowed) => pathInWritableWorkspace(filePath, allowed, pathApi));
 }
 // ---------------------------------------------------------------------------
 // Well-known home subdirectories (read-only convenience allow)
@@ -547,22 +616,44 @@ function isWellKnownSystemReadAllowed(resolvedPath) {
     }
     return false;
 }
-// ---------------------------------------------------------------------------
-// Temp directory detection
-// ---------------------------------------------------------------------------
+/** Temp roots of the host, computed on first use. */
+let hostTempDirectoryRoots;
+function hostTempDirectoryEnv() {
+    return { platform: process.platform, tmpdir: os.tmpdir(), realpath: fs.realpathSync.native };
+}
+function boundaryPathApiFor(platform) {
+    return platform === 'win32' ? path.win32 : path.posix;
+}
 /**
- * Cached resolved temp directory path (computed once at module load).
- * Uses os.tmpdir() which is cross-platform:
- *   macOS:   /var/folders/xx/.../T/   (per-user temp folder)
- *   Linux:   /tmp
- *   Windows: C:\Users\<user>\AppData\Local\Temp
+ * The temp directory as written plus its real form. On Windows `%TEMP%` is
+ * often an 8.3 short path (`C:\Users\ADMINI~1\...`) while agents write the
+ * long one; on macOS both `os.tmpdir()` and `/tmp` are symlinks into
+ * `/private`, and a path check compares the real location of the target too.
+ * POSIX keeps the hardcoded `/tmp` agents commonly use.
  */
-const RESOLVED_TMPDIR = path.resolve(os.tmpdir());
+function tempDirectoryRoots(env) {
+    const lexical = boundaryPathApiFor(env.platform).resolve(env.tmpdir);
+    const roots = env.platform === 'win32' ? [lexical] : [lexical, '/tmp'];
+    return [...new Set(roots.flatMap((root) => [root, ...realTempRoot(root, env)]))];
+}
+function realTempRoot(root, env) {
+    try {
+        const real = env.realpath(root);
+        return real && real !== root ? [real] : [];
+    }
+    catch {
+        return [];
+    }
+}
+function insideTempRoot(target, roots, pathApi) {
+    return roots.some((root) => isPathWithin(target, root, pathApi));
+}
 /**
  * Check if a resolved path is within the system temp directory.
  *
  * Temp directories stay useful for low-friction reads. Writes are handled by
- * the selected workspace / allow-rule boundary in {@link isPathAllowed}.
+ * the selected workspace / allow-rule boundary in {@link isPathAllowed} and
+ * the `allowTempWrite` fallback of `evaluatePathCapability`.
  * Sensitive checks (system-sensitive paths, .env files, credential files,
  * sensitive git metadata) run BEFORE temp read allowance, so dangerous files
  * in temp dirs (e.g. /tmp/.env, /tmp/id_rsa) are still caught.
@@ -571,33 +662,42 @@ const RESOLVED_TMPDIR = path.resolve(os.tmpdir());
  *   - the per-user `os.tmpdir()` path (e.g. /var/folders/.../T/)
  *   - the canonical /tmp prefix (agents often hardcode /tmp/...)
  * Covers, on Windows:
- *   - `os.tmpdir()` only (C:\Users\<user>\AppData\Local\Temp). There is no
+ *   - `os.tmpdir()` (C:\Users\<user>\AppData\Local\Temp) in any letter case,
+ *     written either as the 8.3 short path or the long path. There is no
  *     POSIX-style /tmp to fall back to.
+ *
+ * `env` is for tests; production reads the host platform and `os.tmpdir()`.
  */
-export function isTempDirectory(resolvedPath) {
-    if (resolvedPath === RESOLVED_TMPDIR || resolvedPath.startsWith(RESOLVED_TMPDIR + path.sep)) {
+export function isTempDirectory(resolvedPath, env) {
+    const roots = env
+        ? tempDirectoryRoots(env)
+        : (hostTempDirectoryRoots ??= tempDirectoryRoots(hostTempDirectoryEnv()));
+    const { platform, realpath } = env ?? hostTempDirectoryEnv();
+    const pathApi = boundaryPathApiFor(platform);
+    if (insideTempRoot(resolvedPath, roots, pathApi))
         return true;
+    // A short-name target (`...\ADMINI~1\...`) matches only through its real
+    // long form. Other paths skip the filesystem lookup.
+    // The temp root is always local, so a UNC path never needs the (possibly
+    // blocking) network lookup.
+    if (platform !== 'win32' || !resolvedPath.includes('~') || /^[\\/]{2}/.test(resolvedPath)) {
+        return false;
     }
-    if (process.platform !== 'win32') {
-        if (resolvedPath === '/tmp' || resolvedPath.startsWith('/tmp/')) {
-            return true;
-        }
-    }
-    return false;
+    return insideTempRoot(resolveExistingPath(resolvedPath, realpath, pathApi), roots, pathApi);
 }
 // ---------------------------------------------------------------------------
 // Internal whitelist paths
 // ---------------------------------------------------------------------------
 /** Resolve existing parents too, so a directory alias cannot hide a protected read. */
-function resolveExistingPath(filePath) {
+function resolveExistingPath(filePath, realpath = fs.realpathSync, pathApi = path) {
     try {
-        return fs.realpathSync(filePath);
+        return realpath(filePath);
     }
     catch {
-        const parent = path.dirname(filePath);
+        const parent = pathApi.dirname(filePath);
         return parent === filePath
             ? filePath
-            : path.join(resolveExistingPath(parent), path.basename(filePath));
+            : pathApi.join(resolveExistingPath(parent, realpath, pathApi), pathApi.basename(filePath));
     }
 }
 /**
@@ -731,11 +831,15 @@ function trustedSessionOwnedRoot(root, protectedRoots) {
     }
     return undefined;
 }
-/** True when `target` is `root` itself or lives inside it. */
-function isPathWithin(target, root) {
-    const relative = path.relative(root, target);
+/**
+ * True when `target` is `root` itself or lives inside it. Separator-aware
+ * (`/a/bc` is not inside `/a/b`), correct for a drive root or `/`, and on
+ * Windows case-insensitive because `path.win32.relative` is.
+ */
+function isPathWithin(target, root, pathApi = path) {
+    const relative = pathApi.relative(root, target);
     return (relative === '' ||
-        (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative)));
+        (!relative.startsWith(`..${pathApi.sep}`) && relative !== '..' && !pathApi.isAbsolute(relative)));
 }
 /**
  * Check if a path is in the internal whitelist (always writable by the system).
@@ -791,6 +895,17 @@ export function isInternalWhitelistedPath(filePath, context) {
     }
     return false;
 }
+/** The internal whitelist, also under the real data directory when it is a symlink. */
+function isInternalWhitelistedLocation(filePath, context) {
+    if (isInternalWhitelistedPath(filePath, context))
+        return true;
+    if (!context.dataDir)
+        return false;
+    const realDataDir = resolveCanonicalPath(path.resolve(context.dataDir));
+    return (realDataDir !== undefined &&
+        realDataDir !== path.resolve(context.dataDir) &&
+        isInternalWhitelistedPath(filePath, { ...context, dataDir: realDataDir }));
+}
 // ---------------------------------------------------------------------------
 // Rule matching for file paths
 // ---------------------------------------------------------------------------
@@ -817,6 +932,16 @@ export function matchPathRule(filePath, ruleContent) {
     }
     // Exact match
     return resolved === path.resolve(ruleContent);
+}
+/** The first deny rule that a bare tool deny or any target matches. */
+function matchDenyRule(toolRules, targets) {
+    return toolRules.find((rule) => {
+        if (rule.ruleBehavior !== 'deny')
+            return false;
+        const ruleContent = rule.ruleValue.ruleContent;
+        // A bare tool deny denies all operations for this tool.
+        return !ruleContent || targets.some((target) => matchPathRule(target, ruleContent));
+    });
 }
 /**
  * Checks that are never skipped, whatever the boundary: system secrets,
@@ -917,23 +1042,32 @@ export function isPathAllowed(filePath, rules, context, toolName = 'edit', actio
     // unlocks every fs tool.
     const toolRules = rules.filter((r) => (r.ruleValue.toolName === toolName || r.ruleValue.toolName === FS_UMBRELLA_TOOL_NAME) &&
         ruleSupportsPathAction(r, action));
-    // Step 1: Deny rule matching
-    for (const rule of toolRules) {
-        if (rule.ruleBehavior !== 'deny')
-            continue;
-        if (!rule.ruleValue.ruleContent) {
-            // Bare tool deny — denies all operations for this tool
-            return {
-                allowed: false,
-                reason: { type: 'rule', rule },
-            };
-        }
-        if (matchPathRule(resolved, rule.ruleValue.ruleContent)) {
-            return {
-                allowed: false,
-                reason: { type: 'rule', rule },
-            };
-        }
+    // Step 1: Deny rule matching, on the path as written before touching the
+    // disk, then on every other location the operation reaches.
+    const lexicalDeny = matchDenyRule(toolRules, [resolved]);
+    if (lexicalDeny)
+        return { allowed: false, reason: { type: 'rule', rule: lexicalDeny } };
+    // Every location this operation can reach: the lexical path, the hops of a
+    // symlink on its final component and its real path. The file tools have no
+    // OS sandbox behind them, so a boundary holds only when every identity is
+    // inside it, and a deny rule or protected name on any identity applies.
+    // Deleting or moving a symlink acts on the link itself, not on its target.
+    const unfolded = unfoldedAbsolutePath(filePath, context.workingDirectory, context.homeDir);
+    const entryOnly = action === 'delete' && namesDirectoryEntry(filePath);
+    const identities = resolveOperationIdentities(filePath, resolved, unfolded, action);
+    const deny = identities && matchDenyRule(toolRules, identities);
+    if (deny)
+        return { allowed: false, reason: { type: 'rule', rule: deny } };
+    if (!identities) {
+        return {
+            allowed: false,
+            reason: {
+                type: 'safetyCheck',
+                description: `Path could not be resolved to its real location. Path: ${resolved}`,
+                category: 'unresolvablePath',
+                classifierApprovable: false,
+            },
+        };
     }
     // Runtime state can contain credentials and session data. Check before ALL
     // implicit allowances, including workspace/temp and internal aliases. A grep
@@ -944,9 +1078,11 @@ export function isPathAllowed(filePath, rules, context, toolName = 'edit', actio
     // as `sessionOwnedReadablePaths`, see `isProtectedRuntimeRead`. The category
     // names what this is — private runtime data — so logs and telemetry do not
     // mistake a missing runtime grant for a credential-file access.
+    // Every location counts: a shell walking `link/..` from a link to
+    // `~/.minimax/memory` lands at `~/.minimax/config.yaml`.
     const runtimeReadScope = createRuntimeReadScope(context);
     if (READ_ONLY_TOOLS.has(toolName) &&
-        isProtectedRuntimeRead(resolved, context, toolName === 'grep', runtimeReadScope)) {
+        identities.some((identity) => isProtectedRuntimeRead(identity, context, toolName === 'grep', runtimeReadScope))) {
         return {
             allowed: false,
             reason: {
@@ -957,8 +1093,9 @@ export function isPathAllowed(filePath, rules, context, toolName = 'edit', actio
             },
         };
     }
-    // Step 2: Internal path whitelist
-    if (isInternalWhitelistedPath(resolved, context)) {
+    // Step 2: Internal path whitelist. Every location must be whitelisted: a
+    // shell walking `memory/link/..` lands beside the link's target.
+    if (identities.every((identity) => isInternalWhitelistedLocation(identity, context))) {
         return {
             allowed: true,
             reason: { type: 'internalWhitelist', path: resolved },
@@ -979,36 +1116,58 @@ export function isPathAllowed(filePath, rules, context, toolName = 'edit', actio
     //   - .env.example / .env.sample / .env.template and SSH public keys
     //     remain safe positive controls (excluded by isEnvFile / handled by
     //     isPublicKeyFile callers).
+    //   - A `/` or drive-root workspace widens reads to the whole volume, but
+    //     never waives this check, so `~/.netrc` there still asks.
     const isReadOnlyTool = READ_ONLY_TOOLS.has(toolName);
-    const isInWorkDir = pathInWorkingPath(resolved, context.workingDirectory) ||
-        (context.allowedWorkingPaths != null &&
-            pathInAllowedWorkingPath(resolved, context.allowedWorkingPaths));
+    // A `/` or drive-root workspace only widens reads: it neither waives the
+    // dangerous-file check nor authorises a write.
+    const isInWorkDir = allInsideWorkingRoots(identities, context, { writable: true });
     const skipDangerousCheck = isReadOnlyTool && isInWorkDir;
+    // A shell walking `link/..` lands beside the link's target, which the folded
+    // `resolved` path hides.
+    const physical = unfolded === undefined
+        ? undefined
+        : entryOnly
+            ? resolvePhysicalEntry(unfolded)
+            : resolvePhysicalPath(unfolded);
+    const location = entryOnly ? resolveEntryLocation(resolved) : resolveCanonicalPath(resolved);
+    const landing = physical !== undefined && physical !== location ? physical : undefined;
+    // A read through a project symlink to elsewhere (`npm link`, a shared folder)
+    // stays allowed as before; it still gets every safety check above and below,
+    // which run on all locations it reaches. Where a shell lands must be inside too.
+    const readRoots = workingRootMatcher(context, landing ? [resolved, landing] : [resolved]);
+    const readsInsideAsWritten = isReadOnlyTool &&
+        readRoots.contains(resolved) &&
+        (landing === undefined || readRoots.contains(landing));
     // Critical: never skipped — system secrets, credential / private-key files,
     // .env files and sensitive git metadata (see `criticalSafetyReason`).
-    const criticalReason = criticalSafetyReason(resolved);
-    if (criticalReason)
-        return { allowed: false, reason: criticalReason };
-    if (!skipDangerousCheck && isDangerousFile(resolved)) {
+    for (const identity of identities) {
+        const criticalReason = criticalSafetyReason(identity);
+        if (criticalReason)
+            return { allowed: false, reason: criticalReason };
+    }
+    const dangerousFile = skipDangerousCheck ? undefined : identities.find(isDangerousFile);
+    if (dangerousFile) {
         return {
             allowed: false,
             reason: {
                 type: 'safetyCheck',
-                description: `Protected user or tool configuration file. Path: ${resolved}`,
+                description: `Protected user or tool configuration file. Path: ${dangerousFile}`,
                 category: 'protectedFile',
                 classifierApprovable: true,
             },
         };
     }
-    if (!skipDangerousCheck && isInDangerousDirectory(resolved)) {
-        const protectedDirectory = DANGEROUS_DIRECTORIES.find((d) => resolved.split(path.sep).includes(d));
-        const category = protectedDirectory === '.git' ? 'gitDirectory' : 'protectedDirectory';
+    for (const identity of skipDangerousCheck ? [] : identities) {
+        const protectedDirectory = dangerousDirectoryOf(identity);
+        if (!protectedDirectory)
+            continue;
         return {
             allowed: false,
             reason: {
                 type: 'safetyCheck',
-                description: `Protected configuration or credential directory (${protectedDirectory ?? 'unknown'}). Path: ${resolved}`,
-                category,
+                description: `Protected configuration or credential directory (${protectedDirectory}). Path: ${identity}`,
+                category: protectedDirectory === '.git' ? 'gitDirectory' : 'protectedDirectory',
                 classifierApprovable: true,
             },
         };
@@ -1055,10 +1214,12 @@ export function isPathAllowed(filePath, rules, context, toolName = 'edit', actio
     }
     // Step 3.5: Temp directory read auto-allow.
     //
-    // Reads from temp stay low-friction. Writes to temp are still writes outside
-    // the selected workspace unless the temp path is also covered by workspace /
-    // sandbox / user allow rules below.
-    if (READ_ONLY_TOOLS.has(toolName) && isTempDirectory(resolved)) {
+    // Reads from temp stay low-friction. Writes fall through to the workspace /
+    // sandbox / allow-rule checks below; a caller that passes `allowTempWrite`
+    // to `evaluatePathCapability` (bash, apply_patch, write/edit/append) then
+    // allows a non-sensitive temp write that only failed the workspace boundary.
+    // Every location must be in temp: a symlink there may point anywhere.
+    if (READ_ONLY_TOOLS.has(toolName) && identities.every((identity) => isTempDirectory(identity))) {
         return {
             allowed: true,
             reason: { type: 'tempDirectory', path: resolved },
@@ -1079,41 +1240,45 @@ export function isPathAllowed(filePath, rules, context, toolName = 'edit', actio
     // subdirectories via the dangerous-directory list.
     if (READ_ONLY_TOOLS.has(toolName) &&
         context.homeDir &&
-        isWellKnownHomeReadAllowed(resolved, context.homeDir)) {
+        identities.every((identity) => rootForms(context.homeDir).some((home) => isWellKnownHomeReadAllowed(identity, home)))) {
         return {
             allowed: true,
             reason: { type: 'workingDirectory', path: resolved },
         };
     }
     // Step 3.7: explicitly non-sensitive system documentation reads.
-    if (READ_ONLY_TOOLS.has(toolName) && isWellKnownSystemReadAllowed(resolved)) {
+    if (READ_ONLY_TOOLS.has(toolName) && identities.every(isWellKnownSystemReadAllowed)) {
         return {
             allowed: true,
             reason: { type: 'workingDirectory', path: resolved },
         };
     }
-    // Step 4: Working directory boundary check
-    if (pathInWorkingPath(resolved, context.workingDirectory)) {
+    // Step 4: Working directory boundary check. For a write every identity must
+    // be inside the working directory or an allowed working path, so a symlink
+    // or `..` that reaches outside does not inherit the boundary; a read needs
+    // only its path as written.
+    if (isInWorkDir || readsInsideAsWritten) {
         return {
             allowed: true,
             reason: { type: 'workingDirectory', path: resolved },
         };
     }
-    if (context.allowedWorkingPaths &&
-        pathInAllowedWorkingPath(resolved, context.allowedWorkingPaths)) {
-        return {
-            allowed: true,
-            reason: { type: 'workingDirectory', path: resolved },
-        };
-    }
-    // Step 5: Sandbox allow list
-    if (context.sandboxAllowPaths && pathInAllowedWorkingPath(resolved, context.sandboxAllowPaths)) {
+    // Step 5: Sandbox allow list. Like the working directory, a read needs its
+    // path as written and where a shell lands, so a skill installed as a symlink
+    // stays readable; a write needs every identity inside, and a `/` or
+    // drive-root entry only widens reads.
+    const sandboxRoots = context.sandboxAllowPaths
+        ?.filter((root) => isReadOnlyTool || !isVolumeRoot(root, path))
+        .flatMap(rootForms);
+    const sandboxTargets = isReadOnlyTool ? (landing ? [resolved, landing] : [resolved]) : identities;
+    if (sandboxRoots && sandboxTargets.every((target) => insideAnyRootForm(target, sandboxRoots))) {
         return {
             allowed: true,
             reason: { type: 'sandbox' },
         };
     }
-    // Step 6: Allow rule matching
+    // Step 6: Allow rule matching. A shell walking `link/..` lands beside the
+    // link's target; a rule must cover that place too, not only the folded path.
     for (const rule of toolRules) {
         if (rule.ruleBehavior !== 'allow')
             continue;
@@ -1124,7 +1289,8 @@ export function isPathAllowed(filePath, rules, context, toolName = 'edit', actio
                 reason: { type: 'rule', rule },
             };
         }
-        if (matchPathRule(resolved, rule.ruleValue.ruleContent)) {
+        if (matchPathRule(resolved, rule.ruleValue.ruleContent) &&
+            (landing === undefined || matchPathRule(landing, rule.ruleValue.ruleContent))) {
             return {
                 allowed: true,
                 reason: { type: 'rule', rule },

@@ -23,11 +23,7 @@ import { isMavisTeamCommand, teamDisabledFailure } from './commands/team.js';
 //   handleCommunicationSend,
 // } from './commands/communication.js';
 import { handleCronCreate, handleCronOnce, handleCronSelf, handleCronDelete, handleCronGet, handleCronList, handleCronSessions, handleCronTrigger, handleCronUpdate, } from './commands/cron.js';
-import { handleDriveFilesDelete, handleDriveFilesDownload, handleDriveFilesGet, handleDriveFilesList, handleDriveFilesSearch, 
-// Disabled: handleDriveFilesUpload — see HANDLERS entry below.
-// handleDriveFilesUpload,
-handleDriveNodesMove, handleDriveNodesRename, } from './commands/drive.js';
-import { handleAgentHelp, handleCronHelp, handleDriveHelp, handleSessionHelp, HELP_GROUPS, } from './commands/help.js';
+import { handleAgentHelp, handleCronHelp, handleSessionHelp, HELP_GROUPS, } from './commands/help.js';
 import { handleSessionGet, handleSessionList, handleSessionMessages, handleSessionUpdate, } from './commands/session.js';
 import { errorToFailure, failure } from './output.js';
 import { COMMAND_SCHEMAS, KNOWN_COMMANDS } from './schemas.js';
@@ -70,18 +66,6 @@ const HANDLERS = {
     // 'communication peers': handleCommunicationPeers,
     // 'communication send': handleCommunicationSend,
     // 'communication messages': handleCommunicationMessages,
-    'drive files list': handleDriveFilesList,
-    'drive files get': handleDriveFilesGet,
-    'drive files delete': handleDriveFilesDelete,
-    'drive files search': handleDriveFilesSearch,
-    'drive files download': handleDriveFilesDownload,
-    // Disabled: 'drive files upload' is intentionally not registered. Keeps the
-    // handler + upload-flow code in tree so re-enabling is just uncommenting
-    // here and in `schemas.ts` COMMAND_SCHEMAS.
-    // 'drive files upload': handleDriveFilesUpload,
-    'drive nodes move': handleDriveNodesMove,
-    'drive nodes rename': handleDriveNodesRename,
-    'drive help': handleDriveHelp,
 };
 /**
  * 把 args 树里所有 `agent_id` / `session_id` / `parent_session_id` 字段中值为

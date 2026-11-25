@@ -1,4 +1,4 @@
-import { resolveEffectivePtc } from '@mavis/config';
+import { memoryV2OffConfigUpdates, resolveEffectivePtc } from '@mavis/config';
 import { closeAgentDb } from '../../infra/legacy-db/agent-db.js';
 import { createLocalWorkspaceGitFacade, listFileTree, searchFiles, scanWorkspace, ManagedWorktreeService, } from '../../service/workspace/index.js';
 import { resolveTaskTarget } from '../../service/agent/index.js';
@@ -15,8 +15,9 @@ import { createBackgroundTaskNotificationProjection, } from './background-task-n
 import { createV1WorkspaceLocalActionsPort, createV1WorkspaceIndexingWorker, } from './workspace-local-actions.js';
 import {} from './initialize.js';
 import { updateLocalConfigFile } from '../../infra/config/update.js';
+import { createV1McpOptions, createV1PluginOptions, createV1SkillRuntimeOptions, } from './v1-runtime-options.js';
 import {} from '../../service/channel-system/index.js';
-import { createV1CanvasCompatibility, createV1CommerceCompatibility, createV1AttachmentRegistration, legacyCollisionMigrationId, resolveDelegatableAgentReference, createV1AgentHostProductCapabilities, createV1MiniAppToolRules, } from './agent-product-capabilities.js';
+import { createV1CanvasCompatibility, createV1CommerceCompatibility, createV1AttachmentRegistration, legacyCollisionMigrationId, resolveDelegatableAgentReference, createV1AgentHostProductCapabilities, createV1MiniAppToolRules, createV1ExtensionPermission, } from './agent-product-capabilities.js';
 import { createV1SessionCompatibility } from './session-capabilities.js';
 /**
  * Legacy Agent storage scope for the V2 cutover. Takes no lock: the caller
@@ -108,9 +109,23 @@ function buildBackgroundTaskCompatibility(api, notifications) {
 function createQuestionnaireService(host) {
     return new LocalQuestionnaireService(host.apiHost.questionnaireServiceDeps());
 }
+/**
+ * The three host seams the sidebar tools, the later desktop tools and the UI
+ * reply route bind through. Grouped so adding one does not grow the already
+ * saturated compatibility factory.
+ */
+function desktopToolHostPorts(api) {
+    return {
+        sidebarTools: { bind: (owner) => api.bindSidebarTools(owner) },
+        desktopAgentTools: {
+            bind: (owner) => api.bindDesktopAgentTools(owner),
+        },
+        uiRequests: { bind: (broker) => api.bindUiRequestBroker(broker) },
+    };
+}
 /** Projects the runtime-owned reference bridges into the concrete HTTP host. */
 export function createV1RuntimeCompatibility(bridges, factories = { createQuestionnaireService }) {
-    const { conversation, cron: bridge, cronAgentCleanup: agentCleanup, events: globalEvents, mcp, skill, pluginHookPermissions, safety, } = bridges;
+    const { conversation, cron: bridge, cronAgentCleanup: agentCleanup, events: globalEvents, mcp, skill, pluginHookPermissions, mergeRequests, safety, } = bridges;
     return {
         configureHostOptions: (options, agentResolver, ports) => ({
             ...options,
@@ -118,6 +133,7 @@ export function createV1RuntimeCompatibility(bridges, factories = { createQuesti
             mcpRuntime: mcp.capability,
             skillRuntime: skill.capability,
             pluginHookPermissionStore: pluginHookPermissions.capability,
+            mergeRequests: mergeRequests.port,
             contentSafety: safety.capability,
             agentResolver,
             disableLegacyConversation: true,
@@ -136,7 +152,7 @@ export function createV1RuntimeCompatibility(bridges, factories = { createQuesti
         createServiceCompatibility: (host, options, hostedCloudHandoff) => {
             const api = host.apiHost;
             const notifications = createBackgroundTaskNotificationProjection(api);
-            const processLocal = createV1ProcessLocalSupport(host, notifications);
+            const processLocal = createV1ProcessLocalSupport(host, notifications, mergeRequests.port);
             const workspaceIndexing = createV1WorkspaceIndexingWorker(api);
             const workspaceLocalActions = createV1WorkspaceLocalActionsPort(api);
             const listRunningWorktreeDirs = async () => (await api.listAllSessions())
@@ -196,9 +212,8 @@ export function createV1RuntimeCompatibility(bridges, factories = { createQuesti
                     },
                 },
                 promptConfig: api.configGetter().promptConfig,
-                promptSnapshots: {
-                    bind: (source) => api.bindPromptSnapshots(source),
-                },
+                promptSnapshots: { bind: (source) => api.bindPromptSnapshots(source) },
+                ...desktopToolHostPorts(api),
                 internalTurnPromptReads: {
                     bind: (registry) => api.bindInternalTurnPromptReads(registry),
                 },
@@ -215,6 +230,8 @@ export function createV1RuntimeCompatibility(bridges, factories = { createQuesti
                 events: { bindPublisher: globalEvents.bindPublisher },
                 ...(options.miniAppSurface ? { miniAppSurface: options.miniAppSurface } : {}),
                 miniAppToolRules: createV1MiniAppToolRules(() => host.apiHost.permissionRouteContext()),
+                extensionPermission: createV1ExtensionPermission(() => host.apiHost.permissionRouteContext()),
+                extensionTaskHost: () => host.apiHost,
                 safety: {
                     bind: safety.bind,
                     apiVersion: 'v2',
@@ -237,20 +254,7 @@ export function createV1RuntimeCompatibility(bridges, factories = { createQuesti
                 sessionV2: createV1SessionCompatibility(host),
                 commerce: createV1CommerceCompatibility(api),
                 canvas: createV1CanvasCompatibility(api),
-                sessionHandoff: {
-                    hosted: hostedCloudHandoff,
-                    workspace: {
-                        scan: scanSessionHandoffWorkspace,
-                    },
-                    cloud: {
-                        authContextGetter: options.authContextGetter ?? (() => undefined),
-                        ...(options.authContextInvalidator
-                            ? { authContextInvalidator: options.authContextInvalidator }
-                            : {}),
-                        routingHeadersGetter: () => managedBackendRoutingHeaders(options.routingContextGetter?.()),
-                        fetchImpl: options.fetchImpl ?? globalThis.fetch,
-                    },
-                },
+                sessionHandoff: createV1SessionHandoffCompatibility(hostedCloudHandoff, options),
                 workspace: {
                     prepareSessionStart: (sessionId) => api.prepareWorkspaceIndexingForSessionStart(sessionId),
                     captureRevisionAfterTurn: (sessionId) => api.captureWorkspaceRevisionAfterTurn(sessionId),
@@ -258,31 +262,30 @@ export function createV1RuntimeCompatibility(bridges, factories = { createQuesti
                     prewarmWorkspace: (workspaceDir) => api.prewarmWorkspaceIndexing(workspaceDir),
                     closeWorkspacePrewarm: () => api.closeWorkspaceIndexingPrewarm(),
                 },
-                plugin: {
-                    dataDir: host.dataDir,
-                    configGetter: api.configGetter,
-                    authContextGetter: options.authContextGetter ?? (() => undefined),
-                    routingContextGetter: () => options.routingContextGetter?.(),
-                    fetchImpl: options.fetchImpl ?? globalThis.fetch,
-                    ...(options.appVersion ? { appVersion: options.appVersion } : {}),
-                    metrics: host.metricsClient,
-                },
+                plugin: createV1PluginOptions(host, options, api),
                 skillRuntime: createV1SkillRuntimeOptions(host, options, skill.bind),
                 pluginHookPermissions: { bind: pluginHookPermissions.bind },
-                mcp: {
-                    enableLiveMcp: options.enableLiveMcp === true,
-                    builtinMatrix: false,
-                    matrixWebSearchOnly: false,
-                    bindRuntime: mcp.bind,
-                    diagnostics: host.observability,
-                    ...(options.mcpLogger ? { logger: options.mcpLogger } : {}),
-                    ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
-                },
+                mergeRequests: { bind: mergeRequests.bind },
+                mcp: createV1McpOptions(host, options, mcp.bind),
             };
         },
         bindHandleRequest: (handleRequest) => bridge.bindHandleRequest(handleRequest),
         failConversation: (error) => conversation.fail(error),
         shutdownConversation: (error) => conversation.shutdown(error),
+    };
+}
+function createV1SessionHandoffCompatibility(hosted, options) {
+    return {
+        hosted,
+        workspace: { scan: scanSessionHandoffWorkspace },
+        cloud: {
+            authContextGetter: options.authContextGetter ?? (() => undefined),
+            ...(options.authContextInvalidator
+                ? { authContextInvalidator: options.authContextInvalidator }
+                : {}),
+            routingHeadersGetter: () => managedBackendRoutingHeaders(options.routingContextGetter?.()),
+            fetchImpl: options.fetchImpl ?? globalThis.fetch,
+        },
     };
 }
 function createV1MemoryMigrationCompatibility(api) {
@@ -291,6 +294,19 @@ function createV1MemoryMigrationCompatibility(api) {
             // 主 Agent 的旧目录别名属于同一个召回来源。
             const names = agentName === 'main' || agentName === 'mavis' ? ['main', 'mavis'] : [agentName];
             await api.updateConfig(Object.fromEntries(names.map((name) => [`memory.legacyRecallDisabledAgents.${name}`, true])));
+        },
+        async disableMemoryV2() {
+            // 与新安装、旧版关闭迁移写同一组字段。
+            await api.updateConfig(memoryV2OffConfigUpdates());
+        },
+        async setMemoryV2Model({ modelName, reasoningEffort }) {
+            // 记忆只用一个模型：两个模型字段同写，与设置页保存一致。
+            await api.updateConfig({
+                'memory.v2.captureModel': modelName,
+                'memory.v2.consolidationModel': modelName,
+                'memory.v2.captureReasoningEffort': reasoningEffort,
+                'memory.v2.consolidationReasoningEffort': reasoningEffort,
+            });
         },
     };
 }
@@ -346,9 +362,9 @@ export async function cleanupFailedV1Startup(v1, closeV1, warn) {
         }
     }
 }
-function createV1ProcessLocalSupport(host, notifications) {
+function createV1ProcessLocalSupport(host, notifications, mergeRequests) {
     return {
-        peripherals: createPeripheralApplication(host, notifications),
+        peripherals: createPeripheralApplication(host, notifications, mergeRequests),
         bindPermissionShellResolver: (resolve) => host.apiHost.bindPermissionShellResolver(resolve),
     };
 }
@@ -372,7 +388,7 @@ function toQuestionnaireRecord(record) {
 function readEffectivePtc(host) {
     return resolveEffectivePtc(host.apiHost.configGetter()).mode === 'ptc';
 }
-function createPeripheralApplication(host, notifications) {
+function createPeripheralApplication(host, notifications, mergeRequests) {
     const questionnaires = new LocalQuestionnaireService(host.apiHost.questionnaireServiceDeps());
     const resolveQuestionnaireAgentName = async (name) => {
         const requested = name.trim();
@@ -426,7 +442,7 @@ function createPeripheralApplication(host, notifications) {
             }),
         },
         workspace: {
-            git: createLocalWorkspaceGitFacade(),
+            git: createLocalWorkspaceGitFacade(mergeRequests),
             listFileTree: async ({ workspaceDir, path = '', signal }) => {
                 signal?.throwIfAborted();
                 const entries = await listFileTree(workspaceDir, path);
@@ -470,6 +486,12 @@ function createPeripheralApplication(host, notifications) {
                 await host.apiHost.updateConfig({ field: 'beta.ptc', set: enabled });
                 return readEffectivePtc(host);
             },
+            getAdvisorEnabled: async () => host.apiHost.configGetter().advisor?.enabled === true,
+            setAdvisorEnabled: async ({ enabled }) => {
+                // The writer behind the Desktop advisor setting; an explicit value wins over the default.
+                await host.apiHost.updateConfig({ field: 'advisor.enabled', set: enabled });
+                return host.apiHost.configGetter().advisor?.enabled === true;
+            },
         },
         backgroundTasks: {
             list: async ({ ownerSessionId, statuses, kinds, undeliveredOnly, limit, includeNotification, }) => {
@@ -485,31 +507,6 @@ function createPeripheralApplication(host, notifications) {
                 return includeNotification ? notifications.annotate(ownerSessionId, items) : items;
             },
         },
-    };
-}
-function createV1SkillRuntimeOptions(host, options, bindRuntime) {
-    const api = host.apiHost;
-    return {
-        management: {
-            runtimeOwnerKind: options.runtimeOwnerKind,
-            electronHost: options.capabilities?.electronHost === true,
-            resolveAgentWriteTarget: (name) => api.agentRuntimePort.resolveAgentWriteTarget(name),
-            hub: {
-                nowMs: options.nowMs,
-                fetch: options.fetchImpl,
-                authContextGetter: options.authContextGetter,
-                routingContextGetter: options.routingContextGetter,
-            },
-        },
-        configGetter: api.configGetter,
-        registryDiagnostics: options.skillRegistryDiagnostics,
-        resolveAgentReadScope: (name) => api.agentRuntimePort.resolveAgentReadScope(name),
-        resourceAmbiguityTelemetry: {
-            emitBusEvent: (type, payload) => api.emitBusEvent(type, payload),
-            metrics: host.apiHost.metrics,
-        },
-        metricsClient: host.metricsClient,
-        bindRuntime,
     };
 }
 function createV1GoalHostCapabilities(host) {

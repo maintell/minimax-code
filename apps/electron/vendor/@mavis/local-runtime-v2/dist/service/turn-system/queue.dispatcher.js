@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { createUserMessageId } from '../session-system/index.js';
-import { parseBackgroundTaskDeliveryOrigin } from './agent-host/contracts.js';
+import { parseBackgroundTaskDeliveryOrigin } from '@mavis/harness';
 import { agentHostModelFromQueue } from './agent-host/index.js';
 export function createQueueDispatcher(options) {
     const states = new Map();
@@ -51,6 +51,11 @@ export function createQueueDispatcher(options) {
         dispatch,
         continuePaused: (sessionId) => continuePaused(context, sessionId),
         quiesceSession: (sessionId) => quiesceSession(context, sessionId),
+        resumeSession: async (sessionId) => {
+            context.blockedSessions.delete(sessionId);
+            if (!context.closed)
+                await dispatch(sessionId);
+        },
         close: () => {
             if (closePromise)
                 return closePromise;

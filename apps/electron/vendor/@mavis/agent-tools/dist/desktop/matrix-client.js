@@ -1,5 +1,5 @@
 import { getGlobalDispatcher, fetch as undiciFetch } from 'undici';
-import { MatrixAuthRequiredError } from '../cloud/matrix-tools/types.js';
+import { MatrixAuthRequiredError, } from '../cloud/matrix-tools/types.js';
 import { getDesktopMatrixEndpoint, isManagedMatrixBaseUrl, normalizeMatrixBaseUrl, } from './matrix-env.js';
 const MATRIX_USER_AGENT = 'MiniMaxAgent';
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -12,8 +12,11 @@ export class DesktopGatewayHttpError extends Error {
     pathname;
     statusCode;
     errorCode;
+    responsePreview;
     backend;
-    constructor(pathname, statusCode, errorCode, responsePreview = '', 
+    constructor(pathname, statusCode, errorCode, 
+    /** First 500 characters of the response body. */
+    responsePreview = '', 
     /** Whose credential the request carried, so a 401 names the right one. */
     backend) {
         // Preserve the pre-existing error text for every non-WebSearch caller.
@@ -21,8 +24,19 @@ export class DesktopGatewayHttpError extends Error {
         this.pathname = pathname;
         this.statusCode = statusCode;
         this.errorCode = errorCode;
+        this.responsePreview = responsePreview;
         this.backend = backend;
         this.name = 'DesktopGatewayHttpError';
+    }
+}
+/**
+ * No access token is available for the gateway (signed out, or MATRIX_TOKEN missing). Still a
+ * MatrixAuthRequiredError, so generic Matrix callers keep their auth-required handling.
+ */
+export class DesktopMatrixAuthError extends MatrixAuthRequiredError {
+    constructor(message, reason = 'managed_login') {
+        // Keeps the MatrixAuthRequiredError name so separately bundled readers still match it.
+        super(reason, message);
     }
 }
 export class DesktopMatrixClient {
@@ -65,8 +79,12 @@ export class DesktopMatrixClient {
     async getGatewayJson(pathname, signal, timeoutMs) {
         return this.requestGatewayJson({ method: 'GET', pathname, signal, timeoutMs });
     }
+    /**
+     * One JSON request to the gateway with any method. A non-2xx answer throws
+     * DesktopGatewayHttpError and `base_resp` is left to the caller.
+     */
     async requestGatewayJson(request) {
-        const { method, pathname, body, signal, timeoutMs } = request;
+        const { method, pathname, query, body, signal, timeoutMs } = request;
         const requestTimeoutMs = timeoutMs ?? this.timeoutMs;
         const scoped = createScopedAbortSignal(signal, requestTimeoutMs);
         try {
@@ -83,7 +101,7 @@ export class DesktopMatrixClient {
             if (dispatcher !== undefined) {
                 setFetchDispatcher(init, dispatcher);
             }
-            const res = await this.fetchImpl(`${this.baseUrl}${pathname}`, init);
+            const res = await this.fetchImpl(`${this.baseUrl}${pathname}${buildQueryString(query)}`, init);
             const text = await res.text();
             if (!res.ok) {
                 throw new DesktopGatewayHttpError(pathname, res.status, readGatewayErrorCode(text), text.slice(0, 500), this.managedEndpoint ? 'managed' : 'custom');
@@ -141,8 +159,8 @@ export class DesktopMatrixClient {
         const token = this.explicitAccessToken ?? this.getManagedAccessToken();
         if (!token) {
             throw this.useManagedAuth
-                ? new MatrixAuthRequiredError('managed_login', 'Matrix tools require a managed-login access token.')
-                : new MatrixAuthRequiredError('matrix_token', 'Matrix tools require MATRIX_TOKEN for non-managed MATRIX_BASE_URL.');
+                ? new DesktopMatrixAuthError('Matrix tools require a managed-login access token.')
+                : new DesktopMatrixAuthError('Matrix tools require MATRIX_TOKEN for non-managed MATRIX_BASE_URL.', 'matrix_token');
         }
         return {
             'User-Agent': MATRIX_USER_AGENT,
@@ -158,6 +176,17 @@ export class DesktopMatrixClient {
         const authContext = this.authContextGetter ? this.authContextGetter() : this.authContext;
         return authContext?.accessToken?.trim() || undefined;
     }
+}
+function buildQueryString(query) {
+    if (!query)
+        return '';
+    const search = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+        if (value !== undefined)
+            search.set(key, String(value));
+    }
+    const serialized = search.toString();
+    return serialized ? `?${serialized}` : '';
 }
 function readGatewayErrorCode(text) {
     if (!text)

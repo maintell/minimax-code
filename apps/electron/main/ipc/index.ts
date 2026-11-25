@@ -35,6 +35,7 @@ import { setupCuPermissionIPC } from "./cuPermission.ipc";
 import { setupPPTPreviewIPC } from "./pptPreview.ipc";
 import { setupDocumentPreviewIPC } from "./documentPreview.ipc";
 import { setupPreviewClipboardIPC } from "./previewClipboard.ipc";
+import { setupMcodeToolsAssetsIPC, createSpacePreviewStaging } from "./mcodeToolsAssets.ipc";
 import { setupEmbeddedBrowserIPC } from "./embeddedBrowser.ipc";
 import { setupBrowserBackendIPC } from "./browserBackend.ipc.js";
 import { setupBrowserWebviewIPC } from "./browserWebview.ipc.js";
@@ -43,6 +44,7 @@ import { setupUiMetricsIPC } from "./uiMetrics.ipc.js";
 import { setupMiniAppIPC } from "./miniApp.ipc";
 import { setupMiniAppComposerIPC } from "./miniAppComposer.ipc";
 import { setupMiniAppAgentIPC } from "./miniAppAgent.ipc";
+import { setupMiniAppFilesIPC } from "./miniAppFiles.ipc.js";
 import { setupMiniAppHostIPC } from "./miniAppHost.ipc.js";
 import { setupMiniAppToolIPC } from "./miniAppTool.ipc";
 import { setupMiniAppSpeechIPC } from "./miniAppSpeech.ipc";
@@ -179,6 +181,10 @@ export async function setupAllIPC(options) {
         shutdownCuPreview();
     };
     setupPreviewClipboardIPC();
+    setupMcodeToolsAssetsIPC({
+        session: options.sharedAuthSession,
+        onAccessTokenInvalidated: resyncSharedRuntimeProjection,
+    });
     const disposeOSSSharedAuth = configureOSSSharedAuthSession(options.sharedAuthSession, {
         onAccessTokenInvalidated: resyncSharedRuntimeProjection,
     });
@@ -186,12 +192,18 @@ export async function setupAllIPC(options) {
     const disposeFeedbackLogQueue = setupFeedbackLogQueue({
         authSession: options.sharedAuthSession,
     });
+    // Read-only presentation previews of Space files download through the shared Desktop session.
+    const spacePreviews = createSpacePreviewStaging({
+        session: options.sharedAuthSession,
+        onAccessTokenInvalidated: resyncSharedRuntimeProjection,
+    });
     let documentPreview;
     let disposePptQueries;
     let disposePptEditing;
     let disposeMiniAppComposer;
     let disposeMiniAppTool;
     let disposeMiniAppHost;
+    let disposeMiniAppFiles;
     let disposeMiniAppAgent;
     let disposeMiniAppSpeech;
     let disposeBrowserBackend;
@@ -210,8 +222,10 @@ export async function setupAllIPC(options) {
             onSenderDestroyed: (senderId) => {
                 options.onDocumentPreviewSenderDestroyed?.(senderId);
                 void sshProjects.releasePreviewSender(senderId);
+                void spacePreviews.releaseSender(senderId);
             },
             stageRemoteWorkspaceSource: (input) => sshProjects.stageRemotePreviewSource(input),
+            stageSpacePreviewSource: ({ senderId, driveNodeId, signal }) => spacePreviews.stage({ senderId, nodeId: driveNodeId, signal }),
             ...(options.documentPreviewLogger ? { logger: options.documentPreviewLogger } : {}),
         });
         setupPPTPreviewIPC();
@@ -226,6 +240,7 @@ export async function setupAllIPC(options) {
         disposeMiniAppComposer = setupMiniAppComposerIPC();
         disposeMiniAppAgent = setupMiniAppAgentIPC();
         disposeMiniAppHost = setupMiniAppHostIPC();
+        disposeMiniAppFiles = setupMiniAppFilesIPC();
         disposeMiniAppTool = setupMiniAppToolIPC();
         disposeMiniAppSpeech = setupMiniAppSpeechIPC();
         setupBrowserProfileImportIPC();
@@ -238,6 +253,7 @@ export async function setupAllIPC(options) {
         disposeMiniAppComposer?.();
         disposeMiniAppAgent?.();
         disposeMiniAppHost?.();
+        disposeMiniAppFiles?.();
         disposeMiniAppTool?.();
         disposeMiniAppSpeech?.();
         disposeBrowserBackend?.();
@@ -251,6 +267,7 @@ export async function setupAllIPC(options) {
             await Promise.all([
                 ...(documentPreview ? [documentPreview.shutdown()] : []),
                 sshProjects.shutdown(),
+                spacePreviews.dispose(),
             ]);
         }
         catch (shutdownError) {
@@ -267,6 +284,7 @@ export async function setupAllIPC(options) {
         disposeMiniAppComposer?.();
         disposeMiniAppAgent?.();
         disposeMiniAppHost?.();
+        disposeMiniAppFiles?.();
         disposeMiniAppTool?.();
         disposeMiniAppSpeech?.();
         disposeBrowserBackend?.();
@@ -276,14 +294,16 @@ export async function setupAllIPC(options) {
         disposeModelMenuPopup();
         disposeFeedbackLogQueue();
         disposeOSSSharedAuth();
-    }, shutdownCuPermission);
+    }, shutdownCuPermission, () => spacePreviews.dispose());
 }
-function createLifecycleIPCHandle(documentPreview, sshProjects, disposeIPCResources, shutdownCuPermission) {
+function createLifecycleIPCHandle(documentPreview, sshProjects, disposeIPCResources, shutdownCuPermission, disposeSpacePreviews) {
     return Object.freeze({
         shutdown: async () => {
             shutdownCuPermission();
             await disposeIPCResources();
+            // Sources release before their Space copies are deleted.
             await Promise.all([documentPreview.shutdown(), sshProjects.shutdown()]);
+            await disposeSpacePreviews();
         },
     });
 }
@@ -329,6 +349,8 @@ export { setupPPTPreviewIPC } from "./pptPreview.ipc";
 export { setupDocumentPreviewIPC } from "./documentPreview.ipc";
 
 export { setupPreviewClipboardIPC } from "./previewClipboard.ipc";
+
+export { setupMcodeToolsAssetsIPC } from "./mcodeToolsAssets.ipc";
 
 export { setupEmbeddedBrowserIPC } from "./embeddedBrowser.ipc";
 

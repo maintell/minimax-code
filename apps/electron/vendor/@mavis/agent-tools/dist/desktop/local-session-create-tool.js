@@ -2,20 +2,28 @@ import { defineRuntimeTool } from '@mavis/agent-core/tools';
 import { Type } from '@sinclair/typebox';
 import { sessionCommandErrorKind } from './local-mavis.js';
 import { withDesktopCompletenessReport } from './ptc-result-projection.js';
+import { readSessionCreateScope } from './session-create-scope.js';
 export const SessionCreateToolDef = {
     name: 'session_create',
+    namespace: 'session.dispatch',
     loading: 'on_demand',
     description: 'Create a new parallel session and deliver its first message. ' +
         'Call this only when the user explicitly asks for a new session. ' +
         'When the result must come back, say so inside content and name this session: ' +
-        'ask the other session to session send the result to this session_id once it is done.',
+        'ask the other session to send the result back to this session_id once it is done. ' +
+        'Naming project, workspace_dir or an existing_worktree asks the user to approve that project first.',
     schema: Type.Object({
         content: Type.String({ description: 'First message. Empty content is rejected.' }),
         agent_name: Type.Optional(Type.String({
             description: 'Target Agent, or "me" for the current Agent. Omit for the current Agent.',
         })),
         title: Type.Optional(Type.String({ description: 'Session title. Omit to let it be named.' })),
-        workspace_dir: Type.Optional(Type.String({ description: 'Absolute workspace path. Omit for the Agent default.' })),
+        project: Type.Optional(Type.String({
+            description: 'Project to work in: its workspace_dir or name from project_list. The absolute path of a directory inside a registered project also works and the session runs in that directory. Not the default project, which has no directory. Returns candidates when nothing matches.',
+        })),
+        workspace_dir: Type.Optional(Type.String({
+            description: 'Absolute workspace path; prefer project. Pass one of the two, or neither for the Agent default.',
+        })),
         location: Type.Optional(Type.Object({
             mode: Type.Union([
                 Type.Literal('current'),
@@ -49,6 +57,9 @@ export function buildLocalSessionCreateTool(deps) {
             const location = readLocation(input.location);
             if (typeof location === 'string')
                 return failure('SESSION_CREATE_INVALID_LOCATION', location);
+            const workspace = await readWorkspace(deps.sessionAdapter, input);
+            if ('failure' in workspace)
+                return workspace.failure;
             const agentName = await resolveAgent(deps.agentAdapter, ctx, input.agent_name, signal);
             if (!agentName)
                 return failure('SESSION_CREATE_UNKNOWN_AGENT', '无法解析的 agent_name');
@@ -59,7 +70,7 @@ export function buildLocalSessionCreateTool(deps) {
                     agentName,
                     content,
                     ...(input.title ? { title: input.title } : {}),
-                    ...(input.workspace_dir ? { workspaceDir: input.workspace_dir } : {}),
+                    ...(workspace.dir ? { workspaceDir: workspace.dir } : {}),
                     ...(location ? { location } : {}),
                     ...(input.model ? { model: input.model } : {}),
                 }, signal);
@@ -112,6 +123,36 @@ function readLocation(input) {
         return 'location.mode=existing_worktree 需要 worktree_dir';
     return { mode: 'existing-worktree', worktreeDir };
 }
+/**
+ * Where the session works: the directory `project` resolves to, `workspace_dir`,
+ * or nothing for the Agent default, read the way the project approval reads it,
+ * so the session starts in the directory the user approved.
+ */
+async function readWorkspace(adapter, input) {
+    const scope = readSessionCreateScope(input);
+    if (scope.kind === 'both')
+        return {
+            failure: failure('SESSION_CREATE_INVALID_ARGUMENT', 'project 和 workspace_dir 只能填一个'),
+        };
+    if (scope.kind === 'workspace_dir')
+        return { dir: scope.value };
+    if (scope.kind !== 'project')
+        return {};
+    if (!adapter.resolveSessionProject)
+        return { failure: failure('SESSION_CREATE_UNKNOWN_PROJECT', '当前运行环境没有登记的项目') };
+    try {
+        return { dir: (await adapter.resolveSessionProject(scope.value)).directory };
+    }
+    catch (error) {
+        if (!(error instanceof Error) || !('candidates' in error))
+            return { failure: failureFromError(error) };
+        return {
+            failure: failure('SESSION_CREATE_UNKNOWN_PROJECT', error.message, {
+                candidates: error.candidates,
+            }),
+        };
+    }
+}
 async function resolveAgent(agentAdapter, ctx, requested, signal) {
     const name = requested?.trim();
     if (!name || name === 'me')
@@ -141,6 +182,8 @@ function failure(code, message, extra = {}) {
         text,
         content: [{ type: 'text', text }],
         isError: true,
+        // The metric label and the failure log read the code from here.
+        details: { ok: false, errorCode: code },
         // PTC failures keep only the outcome; the reason is r.error.
         programmatic: { data: { ok: false } },
     };

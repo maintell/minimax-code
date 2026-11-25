@@ -1,5 +1,24 @@
-import { parseRequestMediaConfig } from '@mavis/config';
+import { parseRequestMediaConfig, resolveBrowserCompactInspect, resolveBrowserPtcAutoScreenshot, } from '@mavis/config';
 import { initializeBrowserUseService, } from '../../service/browser-use/index.js';
+/**
+ * The Browser Use config snapshot of one read; `browser.compactInspect` is on unless turned off.
+ * @internal
+ */
+export function readRuntimeBrowserUseConfig(config, env = process.env) {
+    const beta = config.beta;
+    return {
+        ...(beta?.filePanelBrowser === undefined
+            ? {}
+            : { filePanelBrowserEnabled: beta.filePanelBrowser }),
+        ...(beta?.browserUseTooling === undefined
+            ? {}
+            : { browserUseToolingEnabled: beta.browserUseTooling }),
+        ptcPostActionScreenshot: resolveBrowserPtcAutoScreenshot({
+            ptcAuto: config.browser?.screenshot?.ptcAuto,
+        }),
+        compactInspect: resolveBrowserCompactInspect(config.browser?.compactInspect, env),
+    };
+}
 export function ownsElectronRuntimeCapabilities(runtimeOwnerKind) {
     return runtimeOwnerKind === undefined || runtimeOwnerKind === 'electron';
 }
@@ -11,17 +30,8 @@ export function createRuntimeBrowserUseComposition(options) {
     const service = initializeBrowserUseService({
         ...(options.browserUse?.adapter ? { adapter: options.browserUse.adapter } : {}),
         ...(options.browserUse?.toolExposure ? { toolExposure: options.browserUse.toolExposure } : {}),
-        readConfig: () => {
-            const beta = options.compatibility.agentHost.preparation.configBuilder.config().beta;
-            return {
-                ...(beta?.filePanelBrowser === undefined
-                    ? {}
-                    : { filePanelBrowserEnabled: beta.filePanelBrowser }),
-                ...(beta?.browserUseTooling === undefined
-                    ? {}
-                    : { browserUseToolingEnabled: beta.browserUseTooling }),
-            };
-        },
+        ...(options.metrics ? { metrics: options.metrics } : {}),
+        readConfig: () => readRuntimeBrowserUseConfig(options.compatibility.agentHost.preparation.configBuilder.config()),
         getImageEncoding: () => {
             let requestMedia;
             try {

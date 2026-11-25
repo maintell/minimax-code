@@ -70,7 +70,9 @@ export class BrowserSnapshotSupport {
             };
         }
         else if (offset > 0) {
-            const latest = session.snapshot ? getBrowserSnapshot(session, session.snapshot.id) : undefined;
+            const latest = session.snapshot
+                ? getBrowserSnapshot(session, session.snapshot.id)
+                : undefined;
             if (latest && (latest.continuationKind ?? 'inspect') === 'inspect') {
                 return this.snapshotPage(latest, offset, limit);
             }
@@ -334,10 +336,14 @@ function toElementRecord(generation, element) {
         ...(element.frameOffset ? { frameOffset: { ...element.frameOffset } } : {}),
         ...(element.inputStrategy === 'focused-keyboard' ? { virtualEditor: true } : {}),
         attributes: { ...element.attributes },
+        ...(element.formState ? { formState: { ...element.formState } } : {}),
     };
 }
 async function scanPageUnderstanding(session) {
-    const rootElements = await session.cdpHelper.getInteractiveElements(session.commandSignal);
+    const scanOptions = session.readLiveFormState?.() === true
+        ? { formState: true, passwordFields: (session.passwordFields ??= new Set()) }
+        : {};
+    const rootElements = await session.cdpHelper.getInteractiveElements(session.commandSignal, scanOptions);
     const roots = [session.cdpHelper.getLastSemanticPageTree()].filter((tree) => tree !== null);
     const elements = [...rootElements];
     const frames = session.transport.listAttachedFrames?.() ?? [];
@@ -390,7 +396,7 @@ async function scanPageUnderstanding(session) {
         const scoped = new AttachedFrameTransport(session.transport, frame);
         const helper = new CDPHelper(scoped);
         const [frameElements, offsetResolution] = await Promise.all([
-            helper.getInteractiveElements(session.commandSignal),
+            helper.getInteractiveElements(session.commandSignal, scanOptions),
             resolveOffset(frame),
         ]);
         const offset = offsetResolution.offset;

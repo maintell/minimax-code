@@ -148,6 +148,8 @@ async function appendLocalTask(args) {
                 allowTerminal: true,
             }),
             mode: steered.mode,
+            subSessionId: childSessionId,
+            subTurnId: steered.turnId,
         };
     }
     if (!admittedTaskId) {
@@ -168,7 +170,12 @@ async function appendLocalTask(args) {
             admission,
         });
     }
-    return { taskId: admittedTaskId, mode: steered.mode };
+    return {
+        taskId: admittedTaskId,
+        mode: steered.mode,
+        subSessionId: childSessionId,
+        subTurnId: steered.turnId,
+    };
 }
 function requireAppendConversation(host, sourceTaskId) {
     if (!host.runtimeConversation) {
@@ -339,6 +346,9 @@ function mapTurnRejection(error, sourceTaskId, occupancy) {
             code: 'TASK_CHILD_NOT_FOUND',
             taskId: sourceTaskId,
         });
+    }
+    if (error.reason === 'policy:worktree:cleaned') {
+        return appendError(`The worktree of task child session ${error.sessionId} was cleaned up automatically. The user must restore it in MiniMax Code Desktop; do not retry.`, { status: 409, code: 'TASK_CHILD_WORKTREE_CLEANED', taskId: sourceTaskId });
     }
     if (error.reason === 'session-deleting') {
         return appendError(`Task child session is being deleted: ${error.sessionId}`, {

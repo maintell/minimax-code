@@ -8,6 +8,7 @@ export const STARTUP_RECOVERY_STEP_NAMES = [
     'goal-takeover',
     'plan-lifecycle-recovery',
     'cron-recovery',
+    'plugin-extension-recovery',
     'assignment-recovery',
 ];
 /** How long close waits for the active step before releasing services anyway. */

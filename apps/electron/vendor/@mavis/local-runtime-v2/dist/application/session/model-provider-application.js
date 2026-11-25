@@ -3,7 +3,7 @@ import { ThinkingLevel } from '@mavis/protocol';
 import { getRuntimePresetKey, resolveModelAvailability, resolveModelReplacement, } from '@mavis/config';
 import { LocalModelProviderError, MANAGED_MINIMAX_PROVIDER_ID, formatModelKey, freezeManagedQueueModel, savedSessionModel, isLegacyMinimaxProvider, listLocalRuntimeModels, modelConfigForRef, modelRefForModel, parseSourceQualifiedModelKey, resolveLegacyMinimaxModel, validateAdvisorModel, isAdvisorReleased, } from '../../service/model-system/index.js';
 import { AgentServiceError } from '../../service/agent/index.js';
-import { advisorWriteNeedsValidation, nextAdvisorSelection, readStoredAdvisor, toAdvisorSelectionError, toAdvisorSelectionView, toDefaultAdvisorConfig, } from './model-provider-advisor.js';
+import { advisorWriteNeedsValidation, nextAdvisorSelection, readStoredAdvisor, toAdvisorSelectionError, toAdvisorSelectionView, toDefaultAdvisorConfig, toDefaultAdvisorSelectionView, } from './model-provider-advisor.js';
 /** Cross-capability model catalog and selection workflow owned by Runtime V2. */
 export class ModelProviderApplication {
     deps;
@@ -16,8 +16,10 @@ export class ModelProviderApplication {
     /** The catalog plus its advisor: the Session's with `sessionId`, else the new-conversation default. */
     async listWithAdvisor(input = {}) {
         const { models, session, config } = await this.readCatalog(input);
-        const stored = input.sessionId ? session?.advisor : config.defaultAdvisor;
-        return { models, advisor: toAdvisorSelectionView(this.catalogConfig(), stored) };
+        const advisor = input.sessionId
+            ? toAdvisorSelectionView(this.catalogConfig(), session?.advisor)
+            : toDefaultAdvisorSelectionView(this.catalogConfig(), config.defaultAdvisor);
+        return { models, advisor };
     }
     /**
      * One scope's advisor without the catalog: the Session's with `sessionId`, else the
@@ -27,7 +29,7 @@ export class ModelProviderApplication {
     async readAdvisor(input = {}) {
         const config = this.catalogConfig();
         if (!input.sessionId)
-            return toAdvisorSelectionView(config, config.defaultAdvisor);
+            return toDefaultAdvisorSelectionView(config, config.defaultAdvisor);
         const session = await this.deps.sessions.get(input.sessionId);
         return toAdvisorSelectionView(config, session?.advisor);
     }
@@ -67,21 +69,21 @@ export class ModelProviderApplication {
         const selection = this.resolveAdvisorWrite(session ? session.advisor : config.defaultAdvisor, input);
         if (input.sessionId) {
             await this.deps.sessions.updateAdvisor(input.sessionId, selection);
+            return toAdvisorSelectionView(this.catalogConfig(), selection);
         }
-        else {
-            await this.selectDefaultAdvisor(selection);
-        }
-        return toAdvisorSelectionView(this.catalogConfig(), selection);
+        await this.selectDefaultAdvisor(selection);
+        return toDefaultAdvisorSelectionView(this.catalogConfig(), selection);
     }
     /**
      * The selection a write of `input` over `stored` stores, checked the way SelectAdvisorModel
      * checks it; nothing is written. A new side chat's draft is a whole selection: no `stored`.
-     * A build without the advisor refuses every write, including one that turns it off.
+     * With `beta.advisor: false` every write is refused, including one that turns it off. The global
+     * switch does not: a write while it is off is stored and used once it is on again.
      */
     resolveAdvisorWrite(stored, input) {
         const config = this.catalogConfig();
         if (!isAdvisorReleased(config)) {
-            throw new LocalModelProviderError(403, 'The advisor is not available in this build.', 'ADVISOR_DISABLED');
+            throw new LocalModelProviderError(403, 'The advisor is turned off (beta.advisor: false in config.yaml).', 'ADVISOR_DISABLED');
         }
         const selection = nextAdvisorSelection(readStoredAdvisor(config, stored), input);
         if (advisorWriteNeedsValidation(selection)) {
@@ -120,6 +122,40 @@ export class ModelProviderApplication {
         }
         // Same signal as a default model write: clients refetch ListModels, which carries the advisor.
         this.publishDefaultModelChanged();
+    }
+    /**
+     * The source-qualified model the Session's next Turn would run. Frozen Task models retain
+     * their pin except for managed legacy aliases; ordinary stale selections use their replacement.
+     * Nothing is written or refreshed.
+     * Undefined for a missing Session, or when neither the Session nor the runtime names a model.
+     */
+    async sessionModel(sessionId) {
+        const session = await this.deps.sessions.get(sessionId);
+        if (!session)
+            return undefined;
+        const config = this.deps.config();
+        const frozen = this.frozenTaskModel(session, config);
+        if (frozen)
+            return frozen;
+        const { selected } = await this.resolveListState(sessionId, session, config);
+        const model = selected ??
+            (session.sessionKind === 'channel'
+                ? undefined
+                : parseSourceQualifiedModelKey(config.defaultModel));
+        if (!model?.providerId || !model.modelId)
+            return undefined;
+        return formatModelKey(model.providerId, model.modelId);
+    }
+    frozenTaskModel(session, config) {
+        if (session.sessionKind !== 'task' || !session.frozenModel)
+            return undefined;
+        const frozen = session.frozenModel;
+        const selected = isLegacyMinimaxProvider(config, frozen.providerId)
+            ? this.resolveStaleSelection(config, frozen)
+            : frozen;
+        return selected?.providerId && selected.modelId
+            ? formatModelKey(selected.providerId, selected.modelId)
+            : undefined;
     }
     async resolveListState(sessionId, session, config) {
         const channelSelection = await this.resolveChannelSelection(sessionId, session);
@@ -206,15 +242,14 @@ export class ModelProviderApplication {
         const modelKey = formatModelKey(providerId, modelId);
         if (selection.sessionId) {
             if (session?.sessionKind === 'channel') {
-                const source = await this.selectForChannel({
+                await this.selectInChannel({
                     sessionId: selection.sessionId,
                     session,
                     selection,
+                    modelKey,
+                    catalogEntry,
+                    replacedFrom,
                 });
-                if (source === 'runtime-default') {
-                    await this.selectDefaultModel(modelKey, selection);
-                    this.publishDefaultModelChanged(replacedFrom);
-                }
                 return true;
             }
             await this.selectForSession({
@@ -358,6 +393,31 @@ export class ModelProviderApplication {
             }),
             ...managedReplacementParameters(this.deps.config(), input, session),
         }, ...(replacedFrom ? [{ replacedFrom }] : []));
+    }
+    /**
+     * The bound Agent stays authoritative for an IM channel Session: its document, or the
+     * runtime default for an AUTO Agent, takes the choice first. The Session model is then
+     * written the way a Session selection writes it, so the automatic Turns run on the new
+     * model before the next IM message arrives.
+     */
+    async selectInChannel(scope) {
+        const { sessionId, session, selection, modelKey, catalogEntry } = scope;
+        const source = await this.selectForChannel({ sessionId, session, selection });
+        if (source === 'runtime-default') {
+            await this.selectDefaultModel(modelKey, selection);
+            this.publishDefaultModelChanged(scope.replacedFrom);
+        }
+        try {
+            await this.selectForSession({ sessionId, modelKey, input: selection, catalogEntry, session });
+        }
+        catch (error) {
+            // The Agent already holds the choice, and its next IM message writes the Session back.
+            this.deps.logger?.warn({
+                session_id: sessionId,
+                model: modelKey,
+                error: error instanceof Error ? error.message : String(error),
+            }, 'channel_session_model_write_failed');
+        }
     }
     async requireModelSession(sessionId) {
         const session = await this.deps.sessions.get(sessionId);

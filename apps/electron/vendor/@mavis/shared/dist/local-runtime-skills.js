@@ -22,7 +22,7 @@ export function createDeferredSkillRuntimeCapability() {
             registry: {
                 listSkills: (...args) => requireOwner().registry.listSkills(...args),
                 listRuntimeSkills: (...args) => requireOwner().registry.listRuntimeSkills(...args),
-                renderCatalog: (...args) => requireOwner().registry.renderCatalog(...args),
+                listCatalogEntries: (...args) => requireOwner().registry.listCatalogEntries(...args),
                 readSkillByName: (...args) => requireOwner().registry.readSkillByName(...args),
                 getSkillDetail: (...args) => requireOwner().registry.getSkillDetail(...args),
                 listSkillFiles: (...args) => requireOwner().registry.listSkillFiles(...args),
@@ -32,7 +32,7 @@ export function createDeferredSkillRuntimeCapability() {
                 refresh: (...args) => requireOwner().registry.refresh(...args),
             },
             listRuntimeSkills: (...args) => requireOwner().listRuntimeSkills(...args),
-            renderCatalog: (...args) => requireOwner().renderCatalog(...args),
+            listCatalogEntries: (...args) => requireOwner().listCatalogEntries(...args),
             readSkillByName: (...args) => requireOwner().readSkillByName(...args),
             setSkillEnabled: (...args) => requireOwner().setSkillEnabled(...args),
             hasBuiltinSkill: (...args) => requireOwner().hasBuiltinSkill(...args),
@@ -42,7 +42,7 @@ export function createDeferredSkillRuntimeCapability() {
             resolveBuiltinSkillNames: (...args) => requireOwner().resolveBuiltinSkillNames(...args),
             readNativeSkill: (...args) => requireOwner().readNativeSkill(...args),
             listHostedRuntimeSkills: (...args) => requireOwner().listHostedRuntimeSkills(...args),
-            renderHostedCatalog: (...args) => requireOwner().renderHostedCatalog(...args),
+            listHostedCatalogEntries: (...args) => requireOwner().listHostedCatalogEntries(...args),
         },
         bind: (value) => {
             if (current)

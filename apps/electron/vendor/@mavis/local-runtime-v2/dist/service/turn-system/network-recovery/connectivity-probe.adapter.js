@@ -2,8 +2,14 @@ import { lookup } from 'node:dns/promises';
 import { connect, isIP } from 'node:net';
 import { networkInterfaces } from 'node:os';
 const PROBE_TIMEOUT_MS = 3_000;
-/** A HEAD through a proxy or a tunnel may need a TLS handshake on top of the connect. */
-const FETCH_PROBE_TIMEOUT_MS = 5_000;
+/**
+ * How long a HEAD may take before the endpoint counts as unreachable. A
+ * degraded link still answers, only slowly: requests on one took 10 to 20
+ * seconds while the service stayed up. Within this budget a slow answer is
+ * online and keeps the bounded retries; only a link that gives no answer at
+ * all is waited out as offline.
+ */
+const FETCH_PROBE_TIMEOUT_MS = 15_000;
 /** Connect failures that mean no route to the endpoint, not a refusing endpoint. */
 const UNREACHABLE_CONNECT_CODES = new Set([
     'ENETUNREACH',

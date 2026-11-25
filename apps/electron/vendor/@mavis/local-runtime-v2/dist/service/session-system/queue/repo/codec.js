@@ -128,11 +128,15 @@ function claimFieldsAbsent(value) {
 }
 function isAttachment(value) {
     return (record(value) &&
-        (value.type === 'file' || value.type === 'image') &&
+        (value.type === 'file' || value.type === 'image' || value.type === 'folder') &&
         typeof value.filePath === 'string' &&
         typeof value.fileName === 'string' &&
         typeof value.mimeType === 'string' &&
-        [value.dataUrl, value.assetId, value.error].every(optionalString));
+        [value.dataUrl, value.assetId, value.error, value.driveNodeId, value.drivePath].every(optionalString) &&
+        optionalSizeBytes(value.sizeBytes));
+}
+function optionalSizeBytes(value) {
+    return value === undefined || (Number.isSafeInteger(value) && Number(value) >= 0);
 }
 function isQuoted(value) {
     return record(value) && typeof value.text === 'string' && optionalString(value.senderName);

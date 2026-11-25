@@ -4808,7 +4808,7 @@ export const MODELS = {
                 cacheWrite: 0,
             },
             contextWindow: 1048576,
-            maxTokens: 32768,
+            maxTokens: 262144,
         },
         "gemini-flash-latest": {
             id: "gemini-flash-latest",
@@ -5213,7 +5213,7 @@ export const MODELS = {
                 cacheWrite: 0,
             },
             contextWindow: 1048576,
-            maxTokens: 65536,
+            maxTokens: 262144,
         },
     },
     "groq": {

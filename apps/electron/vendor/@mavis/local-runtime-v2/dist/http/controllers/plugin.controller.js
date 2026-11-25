@@ -151,6 +151,9 @@ class PluginReasonError extends AppError {
     }
 }
 function throwPluginSystemError(error) {
+    if (error.code === 'PLUGIN_CACHE_BUSY') {
+        throw new AppError(503, error.code, 'Plugin files are in use. Try again shortly.', true);
+    }
     const mapped = mapPluginSystemAppError(error.code);
     if (!mapped)
         throw error;

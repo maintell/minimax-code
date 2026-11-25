@@ -27,6 +27,7 @@ export function composeProcessLocalApplication(input) {
     const tools = input.miniAppTools;
     return {
         ...application,
+        ...(input.pluginHookSessions ? { pluginHookSessions: input.pluginHookSessions } : {}),
         ...(input.mcpAuth ? { mcpAuth: input.mcpAuth } : {}),
         ...(input.miniAppAgent
             ? { miniAppAgent: createProcessLocalMiniAppAgentApplication(input.miniAppAgent) }

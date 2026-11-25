@@ -16,6 +16,7 @@ import { LocalModelResolver } from '../src/service/model-system/index.js';
 import {
   createProductionAgentPreparation,
   createGlobalMemoryModelCompletion,
+  createMemoryContextCompactor,
 } from '../src/service/turn-system/index.js';
 import { resolveBuiltinPromptAssetsDir } from '../src/service/prompt-config/index.js';
 import { MemoryV2ModelGateway } from '../src/service/memory-system/adapters/model-gateway.js';
@@ -86,7 +87,7 @@ export async function createMemoryRealHarness(caseName: string) {
     const preparation = createProductionAgentPreparation({
       configBuilder: {
         config: () => appConfig,
-        skills: { listRuntimeSkills: async () => ({ skills: [] }), renderCatalog: async () => '' },
+        skills: { listRuntimeSkills: async () => ({ skills: [] }), listCatalogEntries: async () => [] },
       },
       modelResolver: resolver,
     });
@@ -103,6 +104,7 @@ export async function createMemoryRealHarness(caseName: string) {
         config,
         readPrompt: (kind) => readFile(join(assets, promptNames[kind]), 'utf8'),
         completion: createGlobalMemoryModelCompletion({
+          createContextCompactor: createMemoryContextCompactor,
           preparation,
           defaultModelName: () => appConfig.defaultModel ?? 'minimax/MiniMax-M3',
           nowMs,

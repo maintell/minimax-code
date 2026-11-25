@@ -1,4 +1,5 @@
-import { basename } from 'node:path';
+import { basename, posix } from 'node:path';
+import { isLegacyAssetNodeId } from '@mavis/shared/drive-assets';
 import { isInlineDisplayDataUrl, } from '../../service/session-system/index.js';
 export class AttachmentRegistrationError extends Error {
     reason;
@@ -12,17 +13,37 @@ export class AttachmentRegistrationError extends Error {
 }
 export async function materializeLocalAttachmentInputs(registration, input) {
     const sources = (input.attachments ?? []).flatMap((attachment, index) => {
-        const source = toRegistrationSource(attachment, index);
+        const source = toAttachmentSource(attachment, index);
         return source ? [source] : [];
     });
     if (sources.length === 0)
         return emptyMaterializedAttachments();
+    // A native Drive asset is reference-only: the agent downloads it with the
+    // space skill when it needs the contents. Everything else, legacy `cs_`
+    // items included, keeps the single all-or-nothing batch registration.
+    const plainSources = sources.filter((source) => source.registration !== undefined);
+    const registered = plainSources.length > 0
+        ? await registerPlainAttachments(registration, input, plainSources)
+        : [];
+    let plainIndex = 0;
+    const materialized = sources.map((source) => withSize({
+        ...(source.registration ? { registered: registered[plainIndex++] } : {}),
+        ...(source.drive ? { drive: source.drive } : {}),
+    }, source.sizeBytes));
+    return {
+        executionAttachments: materialized.map(toExecutionAttachment),
+        displayAttachments: materialized.map(toDisplayAttachment),
+        wireAttachments: materialized.map(toWireAttachment),
+        discardCreated: createDiscardCreated(registration, input.sessionId, registered),
+    };
+}
+async function registerPlainAttachments(registration, input, sources) {
     let registered;
     try {
         registered = await registration.register({
             sessionId: input.sessionId,
             ...(input.turnId ? { turnId: input.turnId } : {}),
-            attachments: sources.map(({ attachment }) => attachment),
+            attachments: sources.map((source) => source.registration),
         });
     }
     catch (error) {
@@ -34,18 +55,52 @@ export async function materializeLocalAttachmentInputs(registration, input) {
     if (registered.length !== sources.length) {
         throw new TypeError('Attachment registration returned an invalid result count.');
     }
-    const materialized = registered.map((attachment, index) => validateRegisteredAttachment(attachment, index));
-    return {
-        executionAttachments: materialized.map(toExecutionAttachment),
-        displayAttachments: materialized.map((attachment, index) => toDisplayAttachment(attachment, sources[index]?.sizeBytes)),
-        wireAttachments: materialized.map((attachment, index) => toWireAttachment(attachment, sources[index]?.sizeBytes)),
-        discardCreated: createDiscardCreated(registration, input.sessionId, registered),
-    };
+    return registered.map((attachment, index) => validateRegisteredAttachment(attachment, index));
 }
 export function attachmentRegistrationResponse(error) {
     return error.reason === 'too-large'
         ? { status: 413, key: 'local_attachment_too_large', message: error.message }
         : { status: 415, key: 'local_attachment_unreadable', message: error.message };
+}
+function toAttachmentSource(input, index) {
+    const drive = driveAssetAttachment(input, index);
+    // Any local source a caller still sends for a native asset is ignored.
+    if (drive && !isLegacyAssetNodeId(drive.driveNodeId)) {
+        return withSize({ drive }, drive.type === 'folder' ? undefined : input.meta?.sizeBytes);
+    }
+    const registration = toRegistrationSource(input, index);
+    if (!registration)
+        return undefined;
+    return withSize({ registration: registration.attachment, ...(drive ? { drive } : {}) }, registration.sizeBytes);
+}
+function driveAssetAttachment(input, index) {
+    const driveNodeId = nonEmpty(input.local?.driveNodeId);
+    if (!driveNodeId)
+        return undefined;
+    const drivePath = nonEmpty(input.local?.drivePath);
+    const meta = input.meta ?? {};
+    const mimeType = nonEmpty(meta.mimeType);
+    const type = driveAssetType(meta.attachmentType, mimeType);
+    return {
+        type,
+        fileName: driveAssetFileName(meta.fileName, drivePath, index),
+        ...(mimeType && type !== 'folder' ? { mimeType } : {}),
+        driveNodeId,
+        ...(drivePath ? { drivePath } : {}),
+    };
+}
+function driveAssetType(attachmentType, mimeType) {
+    if (attachmentType === 'folder')
+        return 'folder';
+    return attachmentType === 'image' || mimeType?.startsWith('image/') ? 'image' : 'file';
+}
+function driveAssetFileName(fileName, drivePath, index) {
+    return (nonEmpty(fileName) ??
+        nonEmpty(drivePath ? posix.basename(drivePath) : undefined) ??
+        `attachment-${String(index)}`);
+}
+function withSize(value, sizeBytes) {
+    return sizeBytes !== undefined ? { ...value, sizeBytes } : value;
 }
 function toRegistrationSource(input, index) {
     const local = localAttachmentSource(input);
@@ -107,6 +162,20 @@ function withoutRedundantInlinePreview(input) {
     return { ...input, dataUrl: undefined };
 }
 function toExecutionAttachment(input) {
+    // A legacy `cs_` item runs as its registered copy, without asset facts.
+    if (input.registered)
+        return toRegisteredExecutionAttachment(input.registered);
+    const drive = input.drive;
+    return {
+        type: drive.type,
+        fileName: drive.fileName,
+        ...(drive.mimeType ? { mimeType: drive.mimeType } : {}),
+        driveNodeId: drive.driveNodeId,
+        ...(drive.drivePath ? { drivePath: drive.drivePath } : {}),
+        ...(input.sizeBytes !== undefined ? { sizeBytes: input.sizeBytes } : {}),
+    };
+}
+function toRegisteredExecutionAttachment(input) {
     return {
         type: input.type,
         ...(nonEmpty(input.filePath) ? { filePath: input.filePath } : {}),
@@ -117,24 +186,40 @@ function toExecutionAttachment(input) {
         ...(nonEmpty(input.assetId) ? { assetId: input.assetId } : {}),
     };
 }
-function toDisplayAttachment(input, sizeBytes) {
+function toDisplayAttachment(input) {
+    const { registered, drive, sizeBytes } = input;
+    // A registered copy (validated non-empty mimeType) wins over the Drive reference.
+    const identity = registered ?? drive;
     return {
         meta: {
-            attachmentType: input.type,
-            fileName: input.fileName,
-            mimeType: input.mimeType,
+            attachmentType: identity.type,
+            fileName: identity.fileName,
+            ...(identity.mimeType ? { mimeType: identity.mimeType } : {}),
             ...(sizeBytes !== undefined ? { sizeBytes } : {}),
         },
-        local: {
-            ...(nonEmpty(input.assetId) ? { assetId: input.assetId } : {}),
-            ...(nonEmpty(input.filePath) ? { filePath: input.filePath } : {}),
-            ...(nonEmpty(input.desktopPath) ? { desktopPath: input.desktopPath } : {}),
-            ...(nonEmpty(input.dataUrl) ? { dataUrl: input.dataUrl } : {}),
-        },
+        local: { ...registeredLocalRef(registered), ...driveLocalRef(drive) },
     };
 }
-function toWireAttachment(input, sizeBytes) {
-    const display = toDisplayAttachment(input, sizeBytes);
+function registeredLocalRef(registered) {
+    if (!registered)
+        return {};
+    return {
+        ...(nonEmpty(registered.assetId) ? { assetId: registered.assetId } : {}),
+        ...(nonEmpty(registered.filePath) ? { filePath: registered.filePath } : {}),
+        ...(nonEmpty(registered.desktopPath) ? { desktopPath: registered.desktopPath } : {}),
+        ...(nonEmpty(registered.dataUrl) ? { dataUrl: registered.dataUrl } : {}),
+    };
+}
+function driveLocalRef(drive) {
+    if (!drive)
+        return {};
+    return {
+        driveNodeId: drive.driveNodeId,
+        ...(drive.drivePath ? { drivePath: drive.drivePath } : {}),
+    };
+}
+function toWireAttachment(input) {
+    const display = toDisplayAttachment(input);
     return { meta: display.meta, local: display.local };
 }
 function emptyMaterializedAttachments() {
@@ -159,7 +244,7 @@ function createDiscardCreated(registration, sessionId, registered) {
     };
 }
 /** Classifies a registration failure caused by the source itself, not by the asset store. */
-export function registrationFailureReason(error) {
+function registrationFailureReason(error) {
     if (!error || typeof error !== 'object')
         return undefined;
     const message = Reflect.get(error, 'message');

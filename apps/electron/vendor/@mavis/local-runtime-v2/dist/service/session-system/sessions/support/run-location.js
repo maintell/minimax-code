@@ -1,11 +1,14 @@
 import { execFile as execFileCallback, spawn } from 'node:child_process';
-import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { and, eq } from 'drizzle-orm';
+import { sessions } from '../../../../infra/db/schema/sessions.js';
 import { excludeManagedWorktrees } from '../../../../infra/git/worktree-exclude.js';
+import { parseSessionExtraData } from '../repo/drizzle/codec.js';
 import { createWorktreeCreationProgressTracker, } from './worktree-creation-progress.js';
+import { generateDefaultWorktreeBranch, resolveExistingWorktreeRepository, } from '../../../workspace/index.js';
 const execFile = promisify(execFileCallback);
 const UPSTREAM_FETCH_TIMEOUT_MS = 60_000;
 export class LocalRunLocationError extends Error {
@@ -45,7 +48,7 @@ export async function applyLocalRunLocation(input, workspaceDir, nowMs, options 
     if (input.mode === 'new-worktree') {
         return createNewWorktree(input, workspaceDir, createdAt, options);
     }
-    return resolveExistingWorktree(input, workspaceDir, createdAt);
+    return resolveExistingWorktree(input, workspaceDir, createdAt, options.workspaceDirImplicit === true);
 }
 async function createNewWorktree(input, workspaceDir, createdAt, options) {
     const branch = input.newWorktreeBranch ?? input.branch ?? generateDefaultWorktreeBranch(createdAt);
@@ -65,6 +68,7 @@ async function createNewWorktree(input, workspaceDir, createdAt, options) {
             onOutput: (text) => progress.checkoutOutput(text),
         });
         if (result.code !== 0) {
+            await git(['branch', '-D', branch], workspaceDir);
             throw new LocalRunLocationError(`git worktree add failed: ${summarizeGitOutput(result.stderr) || summarizeGitOutput(result.stdout)}`, 'RUN_LOCATION_WORKTREE_ADD_FAILED');
         }
         progress.complete(targetDir);
@@ -94,10 +98,11 @@ async function createPinnedBranch(branch, baseRef, baseSha, cwd) {
         ? await git(['update-ref', branchRef, baseSha, initial.stdout.trim()], cwd)
         : initial;
     if (pin.code !== 0) {
+        await git(['branch', '-D', branch], cwd);
         throw new LocalRunLocationError(`Could not pin worktree branch: ${pin.stderr || pin.stdout}`, 'RUN_LOCATION_WORKTREE_ADD_FAILED');
     }
 }
-async function resolveExistingWorktree(input, workspaceDir, createdAt) {
+async function resolveExistingWorktree(input, fallbackWorkspaceDir, createdAt, workspaceDirImplicit) {
     if (!input.worktreeDir) {
         throw new LocalRunLocationError('runLocation.mode="existing-worktree" requires `worktreeDir`', 'RUN_LOCATION_WORKTREE_DIR_REQUIRED');
     }
@@ -107,6 +112,7 @@ async function resolveExistingWorktree(input, workspaceDir, createdAt) {
     if (!existsSync(input.worktreeDir)) {
         throw new LocalRunLocationError(`Worktree directory does not exist: ${input.worktreeDir}`, 'RUN_LOCATION_WORKTREE_NOT_FOUND');
     }
+    const workspaceDir = await requireWorktreeRepository(input.worktreeDir, fallbackWorkspaceDir, workspaceDirImplicit);
     await checkoutOptionalBranch(input.branch, input.worktreeDir);
     return {
         mode: 'existing-worktree',
@@ -115,6 +121,12 @@ async function resolveExistingWorktree(input, workspaceDir, createdAt) {
         parentRepoDir: workspaceDir,
         createdAt,
     };
+}
+async function requireWorktreeRepository(worktreeDir, workspaceDir, workspaceDirImplicit) {
+    const result = await resolveExistingWorktreeRepository(worktreeDir, workspaceDir, workspaceDirImplicit);
+    if (result.kind === 'resolved')
+        return result.repoDir;
+    throw new LocalRunLocationError(result.message, 'RUN_LOCATION_WORKTREE_NOT_IN_REPOSITORY');
 }
 async function checkoutOptionalBranch(branch, cwd) {
     if (!branch)
@@ -338,17 +350,33 @@ function summarizeGitOutput(output) {
 function gitEnv() {
     return Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('GIT_')));
 }
-function generateDefaultWorktreeBranch(nowMs) {
-    const date = new Date(nowMs);
-    const pad = (value) => String(value).padStart(2, '0');
-    const stamp = `${String(date.getFullYear())}${pad(date.getMonth() + 1)}${pad(date.getDate())}`;
-    return `feat/auto-${stamp}-${randomBytes(4).toString('hex')}`;
-}
 function optionalField(value, key) {
     const field = Reflect.get(value, key);
     return typeof field === 'string' && field.length > 0 ? { [key]: field } : {};
 }
 function bufferToString(value) {
     return Buffer.isBuffer(value) ? value.toString('utf-8') : String(value ?? '');
+}
+/**
+ * Whether the Session's worktree was cleaned and can still be restored, read
+ * inside a Turn admission transaction. Once the snapshot is known to be gone
+ * (`restorable: false`) there is nothing to wait for, so the Session runs again.
+ * Malformed metadata never blocks admission; the codec reports it elsewhere.
+ */
+export function sessionAwaitsWorktreeRestoreInTransaction(db, sessionId) {
+    const row = db
+        .select({ extraDataJson: sessions.extraDataJson })
+        .from(sessions)
+        .where(and(eq(sessions.sessionId, sessionId), eq(sessions.columnarVersion, 3)))
+        .get();
+    if (!row)
+        return false;
+    try {
+        const location = parseSessionExtraData(row.extraDataJson).runLocation;
+        return location?.cleanedAt !== undefined && location.restorable !== false;
+    }
+    catch {
+        return false;
+    }
 }
 //# sourceMappingURL=run-location.js.map

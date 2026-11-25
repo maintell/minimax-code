@@ -506,6 +506,7 @@ async function admitTurnWithSubmissionPreparation(request) {
             turnId,
             turnSequence: admitted.acceptedSequence,
             eventId: `${turnId}:pre-host-started`,
+            provenance: { source: submissionProvenance(input).source },
         });
         await preparation?.commit();
     }
@@ -566,6 +567,7 @@ async function failAcceptedBeforeRegistration(options, failure) {
             ...(failure.admitted.foreground ? { foreground: true } : {}),
         },
         error: failure.error,
+        provenance: { source: submissionProvenance(failure.input).source },
     });
     return {
         accepted: true,
@@ -590,6 +592,7 @@ async function rollbackAcceptedSubmission(options, accepted, error) {
             eventId: `${turnId}:pre-host-${status ?? 'failed'}`,
             error: failure,
             ...(status ? { status } : {}),
+            provenance: { source: submissionProvenance(input).source },
         });
         revoked = await options.repository.revokeAdmission({
             sessionId: input.sessionId,
@@ -649,7 +652,11 @@ async function startAcceptedTurn(options, accepted) {
     }
     catch (error) {
         const failure = await compensateStartedPreparation(preparation, error);
-        const failed = await options.coordinator.failAdmission({ admission, error: failure });
+        const failed = await options.coordinator.failAdmission({
+            admission,
+            error: failure,
+            provenance: { source: submissionProvenance(input).source },
+        });
         return {
             accepted: true,
             turnId,
@@ -675,7 +682,11 @@ async function startAcceptedTurn(options, accepted) {
     }
     catch (error) {
         const failure = await compensateStartedPreparation(preparation, error);
-        const failed = await options.coordinator.failTurn({ turn, error: failure });
+        const failed = await options.coordinator.failTurn({
+            turn,
+            error: failure,
+            provenance: { source: submissionProvenance(input).source },
+        });
         return {
             accepted: true,
             turnId,

@@ -1,16 +1,29 @@
-import { buildLocalToolRegistry, LocalTodoWriteToolDef, } from '@mavis/agent-tools/desktop';
+import { buildLocalToolRegistry, DesktopSpaceDriveBackend, LocalTodoWriteToolDef, } from '@mavis/agent-tools/desktop';
 import { MatrixWebSearchToolDef } from '@mavis/agent-tools';
-import { getConfig, resolveAgentCapabilities, } from '@mavis/config';
+import { getConfig, isBunnyVerdictGateEnabledInConfig, resolveAgentCapabilities, } from '@mavis/config';
 import { executeLocalMemoryTool } from '../../memory-system/index.js';
 import { buildLocalHostTrashRuntime } from '../../permission/index.js';
 import { resolveAgentBashEnvPolicy } from '../../../infra/process/ensure-rm-shim.js';
+import { isCoordinatorAgent } from '@mavis/shared/agent-coordination';
 import { emitLocalTodoUpdatedEvent } from '../file-changes/todo-event.js';
 import { initializeWebFetch } from '../../web-fetch/index.js';
 import { createManagedLocalWebSearchClient } from '../../web-search/index.js';
 import { LocalWebsiteDeployClient } from '../../website/index.js';
-import { buildLocalAskUserAdapter } from '../../questionnaire/index.js';
+import { createLocalUserQuestionHost } from '../../questionnaire/index.js';
+import { DESKTOP_TOOL_CATALOG_RULES } from './desktop-catalog-rules.js';
+import { LocalMatrixClient } from '../../matrix/index.js';
 import { withLocalMemoryPolicyGuidance } from './local-memory-policy-guidance.js';
 import { filterLocalBuiltinCapabilityTools } from './local-native-tool-filter.js';
+/**
+ * config.yaml `bunny.verdictGate` for the assignment tool annotations. Those annotations are fixed
+ * when the tools are built, so the switch is read here; but only when the assignment tools exist at
+ * all, so a Turn without them never reads config at build time and keeps every other setting live.
+ */
+function readBunnyVerdictGate(input) {
+    if (!input.mavisSessionAdapter)
+        return false;
+    return isBunnyVerdictGateEnabledInConfig((input.configGetter ?? getConfig)());
+}
 /** @internal Exported only for focused tests. */
 export function buildLocalNativeRuntimeTools(input) {
     const capabilities = input.builtinCapabilities ?? resolveAgentCapabilities();
@@ -31,7 +44,6 @@ export function buildLocalNativeRuntimeTools(input) {
                     emitBusEvent: input.emitBusEvent,
                 }),
             },
-            askUserAdapter: input.askUserAdapter,
             bashAdapter: input.bashAdapter,
             sandboxOperationsFactory: input.sandboxOperationsFactory,
             hostTrashRuntime: buildLocalHostTrashRuntime(input),
@@ -47,19 +59,15 @@ export function buildLocalNativeRuntimeTools(input) {
             mavisCronAdapter: input.mavisCronAdapter,
             mavisMcpAdapter: input.mavisMcpAdapter,
             mavisSessionAdapter: input.mavisSessionAdapter,
+            sidebarToolsAdapter: input.sidebarToolsAdapter,
+            sidebarManageAdapter: input.sidebarManageAdapter,
+            sessionManageAdapter: input.sessionManageAdapter,
+            appManageAdapter: input.appManageAdapter,
+            uiRequestAdapter: input.uiRequestAdapter,
+            bunnyVerdictGate: readBunnyVerdictGate(input),
             workspaceSemanticSearchAdapter: input.workspaceSemanticSearchAdapter,
-            websiteDeployAdapter: new LocalWebsiteDeployClient({
-                ...(input.authContext ? { authContext: input.authContext } : {}),
-                // The client lives for the whole Turn; a deploy late in a long Turn must use
-                // the host's current token, not the one captured when tools were built.
-                ...(input.authContextGetter ? { authContextGetter: input.authContextGetter } : {}),
-                ...(input.authContextInvalidator
-                    ? { authContextInvalidator: input.authContextInvalidator }
-                    : {}),
-                ...(input.dataDir ? { dataDir: input.dataDir } : {}),
-                ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
-                routingContextGetter: input.routingContextGetter,
-            }),
+            websiteDeployAdapter: createLocalWebsiteDeployAdapter(input),
+            space: createLocalSpaceSources(input),
             codeReviewAdapter: input.codeReviewAdapter,
         }).values(),
     ];
@@ -67,6 +75,33 @@ export function buildLocalNativeRuntimeTools(input) {
         readEnabled: input.memoryReadEnabled !== false,
         writeEnabled: input.memoryWriteEnabled !== false,
     })), capabilities);
+}
+/**
+ * The deploy client lives for the whole Turn; a deploy late in a long Turn must
+ * use the host's current token, not the one captured when tools were built.
+ */
+function createLocalWebsiteDeployAdapter(input) {
+    return new LocalWebsiteDeployClient({
+        ...(input.authContext ? { authContext: input.authContext } : {}),
+        ...(input.authContextGetter ? { authContextGetter: input.authContextGetter } : {}),
+        ...(input.authContextInvalidator
+            ? { authContextInvalidator: input.authContextInvalidator }
+            : {}),
+        ...(input.dataDir ? { dataDir: input.dataDir } : {}),
+        ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
+        routingContextGetter: input.routingContextGetter,
+    });
+}
+/** Drive-backed `space_*` tool sources for this Turn. */
+function createLocalSpaceSources(input) {
+    return {
+        backend: new DesktopSpaceDriveBackend(new LocalMatrixClient({
+            ...(input.authContext ? { authContext: input.authContext } : {}),
+            ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
+            routingContextGetter: input.routingContextGetter,
+        })),
+        ...(input.fetchImpl ? { fetchImpl: input.fetchImpl } : {}),
+    };
 }
 /**
  * `write_guard_check_total{result}`: how often the desktop write tool's
@@ -105,6 +140,11 @@ function createLocalNativeSkillReader(input) {
                 computerUseActive: input.computerUseActive === true,
                 miniappAvailable: input.miniappAvailable === true,
                 pluginRecommendationAvailable: input.pluginRecommendationAvailable === true,
+                ...namespacedToolGates(namespacedToolAvailability(input)),
+                // A coordinator owns no tool of most namespaces (the registry's
+                // coordinator allowlist), so their Skills are not offered and
+                // `skill({ name: 'agent-manage' })` finds nothing.
+                ...(isCoordinatorAgent(input.coordination) ? { coordinator: true } : {}),
                 disabledSkillNames: input.disabledBuiltinSkillNames,
                 resumeCodexAvailable: input.resumeCodexAvailable === true,
             },
@@ -131,6 +171,7 @@ export async function buildLocalTurnToolSources(input) {
             nativeTools: [],
             mcpEntries: [],
             cuRuntimeAvailable: false,
+            catalog: DESKTOP_TOOL_CATALOG_RULES,
         };
     }
     const cuRuntimeAvailable = false;
@@ -138,11 +179,14 @@ export async function buildLocalTurnToolSources(input) {
     const nativeInput = nativeToolsInput(input, builtinCapabilities);
     const nativeTools = buildTurnNativeTools(input, nativeInput);
     const mcpEntries = await buildTurnMcpEntries(input, builtinCapabilities);
+    const questions = createLocalUserQuestionHost(input.questionnaireContext);
     const skillReader = createLocalNativeSkillReader(nativeInput);
     return {
         nativeTools: nativeTools,
         mcpEntries,
         cuRuntimeAvailable,
+        catalog: DESKTOP_TOOL_CATALOG_RULES,
+        ...(questions ? { questions } : {}),
         readSkill: (name) => skillReader.readSkill(name, undefined),
     };
 }
@@ -166,7 +210,6 @@ function nativeToolsInput(input, builtinCapabilities) {
         agentName: input.agentName,
         ...nativeAgentScope(input),
         eventWriter: input.eventWriter,
-        askUserAdapter: buildLocalAskUserAdapter(input.questionnaireContext),
         bashAdapter: input.bashAdapter,
         sandboxOperationsFactory: input.sandboxOperationsFactory,
         authContext: input.authContext,
@@ -185,6 +228,11 @@ function nativeToolsInput(input, builtinCapabilities) {
         mavisCronAdapter: input.mavisCronAdapter,
         mavisMcpAdapter: input.mcpService.createMavisAdapter(input.emitBusEvent),
         mavisSessionAdapter: input.mavisSessionAdapter,
+        sidebarToolsAdapter: input.sidebarToolsAdapter,
+        sidebarManageAdapter: input.sidebarManageAdapter,
+        sessionManageAdapter: input.sessionManageAdapter,
+        appManageAdapter: input.appManageAdapter,
+        uiRequestAdapter: input.uiRequestAdapter,
         codeReviewAdapter: input.codeReviewAdapter,
         workspaceSemanticSearchAdapter: input.workspaceSemanticSearchAdapter,
         emitBusEvent: input.emitBusEvent,
@@ -200,6 +248,7 @@ function nativeToolsInput(input, builtinCapabilities) {
         memoryReadAgentNames: input.memoryReadAgentNames,
         disabledBuiltinSkillNames: input.disabledBuiltinSkillNames,
         resumeCodexAvailable: input.resumeCodexAvailable,
+        ...(input.coordination ? { coordination: input.coordination } : {}),
     };
 }
 async function buildTurnMcpEntries(input, builtinCapabilities) {
@@ -220,6 +269,56 @@ async function buildTurnMcpEntries(input, builtinCapabilities) {
         ? selectedBuiltinMcpEntries
         : selectedBuiltinMcpEntries.filter((entry) => !(entry.source === 'builtin-matrix' && entry.tool.def.name === MatrixWebSearchToolDef.name));
     return selectedMcpEntries;
+}
+/**
+ * Whether this Turn registers the Cron tools. `buildLocalToolRegistry` builds
+ * them only with both the mavis Agent adapter and the Cron adapter, and a
+ * CLI-restricted Runtime gets no Cron adapter, so `cron-manage` follows this
+ * rather than the mavis switch alone.
+ */
+function cronToolsAvailable(input) {
+    return input.mavisAgentAdapter !== undefined && input.mavisCronAdapter !== undefined;
+}
+/** The `RuntimeSkillGates` fields `resolveFeatureAwareBuiltinSkillNames` reads. */
+export function namespacedToolGates(availability) {
+    return {
+        desktopManageAvailable: availability.desktopToolsAvailable,
+        cronToolsAvailable: availability.cronToolsAvailable,
+        memoryToolsAvailable: availability.memoryToolsAvailable,
+    };
+}
+/** This Turn's own adapters, read the same way `buildLocalToolRegistry` reads them. */
+function namespacedToolAvailability(input) {
+    return {
+        desktopToolsAvailable: hasDesktopManageTools(input),
+        cronToolsAvailable: cronToolsAvailable(input),
+        memoryToolsAvailable: memoryToolsRegistered(input),
+    };
+}
+/**
+ * Whether the memory tools are registered for this Turn. `buildMemoryAdapter`
+ * and the Skill gates read this one predicate so `memory-manage` is offered
+ * exactly while its tools exist.
+ */
+export function memoryToolsRegistered(input) {
+    return (input.memoryFacade !== undefined &&
+        input.memoryEnabled !== false &&
+        input.excludeAgentResources !== true &&
+        input.memoryAgentScopeEnabled === true &&
+        !(input.memoryReadEnabled === false && input.memoryWriteEnabled === false));
+}
+/**
+ * Whether this surface has the desktop app behind it. The `sidebar.*`, `app`
+ * and `panel` Agent tools plus their Skills need the desktop window or the
+ * Electron main process, so one flag gates those groups and CLI / TUI never
+ * see them. The mavis-backed groups do not read it.
+ */
+function hasDesktopManageTools(input) {
+    return (input.sidebarToolsAdapter !== undefined ||
+        input.sidebarManageAdapter !== undefined ||
+        input.sessionManageAdapter !== undefined ||
+        input.appManageAdapter !== undefined ||
+        input.uiRequestAdapter !== undefined);
 }
 function nativeProductCapabilities(input) {
     return {
@@ -242,11 +341,7 @@ function nativeAgentScope(input) {
 }
 function buildMemoryAdapter(input) {
     const facade = input.memoryFacade;
-    if (!facade ||
-        input.memoryEnabled === false ||
-        input.excludeAgentResources ||
-        input.memoryAgentScopeEnabled !== true ||
-        (input.memoryReadEnabled === false && input.memoryWriteEnabled === false))
+    if (!facade || !memoryToolsRegistered(input))
         return undefined;
     return {
         execute: (ctx, toolInput) => executeLocalMemoryTool({

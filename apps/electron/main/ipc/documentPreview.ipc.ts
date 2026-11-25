@@ -21,7 +21,7 @@ import { openAssetPathInApp } from "../modules/document-preview/open-asset-in-ap
 import { resolveSelectedFile } from "../modules/document-preview/selected-file-authority";
 import { noopDocumentPreviewLogger } from "../modules/document-preview/logging";
 import { resolveLocalRuntimeDataDir } from "../modules/local-runtime/data-dir";
-import { issueTrustedWorkspaceCapability, isTrustedWorkspaceCapability } from "../modules/document-preview/workspace-authority";
+import { issueTrustedWorkspaceCapability, isTrustedWorkspaceCapability, issueSelectedFileCapability } from "../modules/document-preview/workspace-authority";
 import { sanitizePptElementMapResolution, resolvePptSelectionElementFromSidecar } from "../modules/ppt-preview/element-map";
 function failure(code, message, retryable = false, detail) {
     return {
@@ -136,6 +136,8 @@ function bindSenderLifecycle(sender, senderStates, onDestroyed, onMainFrameNavig
         generation: 0,
         reads: new Map(),
         selectedSources: new Set(),
+        spaceCopies: new Map(),
+        spaceOpens: new Map(),
     };
     senderStates.set(sender, state);
     const onNavigation = (_event, _url, isInPlace, isMainFrame) => {
@@ -157,6 +159,28 @@ function bindSenderLifecycle(sender, senderStates, onDestroyed, onMainFrameNavig
         onDestroyed();
     });
     return state;
+}
+async function releaseSpaceCopy(state, sourceId) {
+    const release = state?.spaceCopies.get(sourceId);
+    if (!release)
+        return;
+    state?.spaceCopies.delete(sourceId);
+    await release();
+}
+const SPACE_NODE_ID = /^[A-Za-z0-9_-]{1,128}$/u;
+/** Space core failure codes that a later attempt can fix (network, sign-in, throttling). */
+const RETRYABLE_SPACE_FAILURES = new Set([
+    'UPSTREAM',
+    'TIMEOUT',
+    'UNAUTHORIZED',
+    'RATE_LIMITED',
+    'UNAVAILABLE',
+]);
+/** Renderer-facing failure for a Space file that could not be staged. */
+function spaceStagingFailure(failureCode) {
+    if (failureCode === 'TOO_LARGE')
+        return failure('source_too_large', 'Space file is too large to preview');
+    return failure('source_not_found', 'Space file could not be downloaded for preview', failureCode === undefined || RETRYABLE_SPACE_FAILURES.has(failureCode));
 }
 export function setupDocumentPreviewIPC(options = {}) {
     const logger = options.logger ?? noopDocumentPreviewLogger;
@@ -249,6 +273,7 @@ export function setupDocumentPreviewIPC(options = {}) {
                     const released = await orchestrator.releaseSource(sender.id, sourceId, sender);
                     if (released.ok)
                         state?.selectedSources.delete(sourceId);
+                    await releaseSpaceCopy(state, sourceId);
                 }),
             ])
                 .then(() => undefined)
@@ -431,6 +456,78 @@ export function setupDocumentPreviewIPC(options = {}) {
             input: { ...record, workspaceDir: staged.workspaceDir, filePath: staged.filePath },
         };
     };
+    /**
+     * A Space file has no local copy: main downloads it into a private directory and opens that
+     * exact file read-only, like an OS-selected file. The copy lives as long as the source.
+     */
+    const openSpaceSource = async (event, claim, legacy, state, isCurrent) => {
+        const { driveNodeId, openRequestId } = claim;
+        if (legacy ||
+            event.senderFrame !== event.sender.mainFrame ||
+            Object.keys(claim).some((key) => key !== 'driveNodeId' && key !== 'openRequestId') ||
+            typeof driveNodeId !== 'string' ||
+            !SPACE_NODE_ID.test(driveNodeId) ||
+            (openRequestId !== undefined &&
+                (typeof openRequestId !== 'string' || !SPACE_NODE_ID.test(openRequestId)))) {
+            return failure('invalid_request', 'Space file authority must be exclusive');
+        }
+        const stage = options.stageSpacePreviewSource;
+        if (!stage)
+            return failure('backend_unavailable', 'Space file preview is unavailable');
+        // Closing the preview cancels the download by its open request id (see the cancel channel).
+        const controller = new AbortController();
+        const live = () => isCurrent() && !controller.signal.aborted;
+        state.reads.set(controller, '');
+        if (typeof openRequestId === 'string') {
+            state.spaceOpens.get(openRequestId)?.abort();
+            state.spaceOpens.set(openRequestId, controller);
+        }
+        let staged;
+        try {
+            staged = await stage({
+                senderId: event.sender.id,
+                driveNodeId,
+                signal: controller.signal,
+            }).catch(() => null);
+        }
+        finally {
+            state.reads.delete(controller);
+            if (typeof openRequestId === 'string' && state.spaceOpens.get(openRequestId) === controller)
+                state.spaceOpens.delete(openRequestId);
+        }
+        if (!staged || 'failureCode' in staged) {
+            return live()
+                ? spaceStagingFailure(staged?.failureCode)
+                : failure('cancelled', 'Space file opening was cancelled');
+        }
+        const capability = live() ? issueSelectedFileCapability(staged.filePath) : null;
+        if (!capability?.file) {
+            await staged.release();
+            return live()
+                ? failure('source_outside_workspace', 'Space file copy is not authorized')
+                : failure('cancelled', 'Space file opening was cancelled');
+        }
+        const fileName = path.basename(capability.file.canonicalPath);
+        const opened = await orchestrator.openSource(event.sender.id, {
+            workspaceDir: capability.canonicalPath,
+            filePath: fileName,
+            fileName,
+            mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+            workspaceCapability: capability,
+            readOnly: true,
+            pptEditingAllowed: false,
+        }, event.sender);
+        if (!opened.ok || !isCurrent()) {
+            if (opened.ok)
+                await orchestrator.releaseSource(event.sender.id, opened.value.sourceId, event.sender);
+            await staged.release();
+            return opened.ok ? failure('cancelled', 'Space file opening was cancelled') : opened;
+        }
+        // Selected sources are read-only previews: no notes save and no sidecar lookup.
+        state.selectedSources.add(opened.value.sourceId);
+        state.spaceCopies.set(opened.value.sourceId, staged.release);
+        return opened;
+    };
     const handleOpenSource = async (event, input, legacy) => {
         const state = bind(event.sender);
         const generation = state.generation;
@@ -491,6 +588,11 @@ export function setupDocumentPreviewIPC(options = {}) {
             if (opened.ok)
                 state.selectedSources.add(opened.value.sourceId);
             return opened;
+        }
+        if (input &&
+            typeof input === 'object' &&
+            Object.prototype.hasOwnProperty.call(input, 'driveNodeId')) {
+            return openSpaceSource(event, input, legacy, state, isCurrent);
         }
         const remote = await resolveRemoteWorkspace(event, input);
         if (!isCurrent())
@@ -975,6 +1077,10 @@ export function setupDocumentPreviewIPC(options = {}) {
         const state = bind(event.sender);
         if (state.destroyed)
             return { ok: true, value: null };
+        const requestId = input && typeof input === 'object' ? input.requestId : undefined;
+        // A Space preview closed while still downloading stops the download.
+        if (typeof requestId === 'string')
+            state.spaceOpens.get(requestId)?.abort();
         return orchestrator.cancel(event.sender.id, input);
     });
     ipcMain.handle(IPC_CHANNELS.DOCUMENT_PREVIEW_RELEASE, async (event, input) => {
@@ -992,6 +1098,7 @@ export function setupDocumentPreviewIPC(options = {}) {
             const released = await orchestrator.releaseSource(event.sender.id, request.sourceId, event.sender);
             if (released.ok)
                 state.selectedSources.delete(request.sourceId);
+            await releaseSpaceCopy(state, request.sourceId);
             return released;
         }
         if (typeof request.previewId === 'string') {

@@ -14,7 +14,7 @@ import { normalizeLLMError, toLLMMetricErrorKind, } from '@mavis/shared/llm-erro
 import { redactMemorySecrets } from '../secret-redactor.js';
 import { estimateCaptureTokens } from '../contracts/token-estimate.js';
 import { MANAGED_MINIMAX_PROVIDER_ID } from '../../model-system/index.js';
-import { createConsolidationWorkdirTools, } from './consolidation-workdir-tools.js';
+import { createConsolidationWorkdirTools } from './consolidation-workdir-tools.js';
 const MAX_CACHED_CONTRACTS = 16;
 /** 产物结构版本：3 起抽取与迁移都经提交工具输出，整理经工作目录文件输出。 */
 const OUTPUT_SCHEMA_VERSION = 3;
@@ -107,7 +107,8 @@ export class MemoryV2ModelGateway {
                 systemPrompt: `${cached.prompt}\n\n${CONSOLIDATION_AGENT_HARNESS}`,
                 briefing: renderConsolidationBriefing(input),
                 tools: createConsolidationWorkdirTools(input.workDir),
-                maxTurns: input.maxTurns,
+                executionMode: 'consolidation-agent',
+                maxRequests: input.maxRequests,
                 maxOutputTokens: cached.maxOutputTokens,
                 signal: input.signal,
             });
@@ -122,7 +123,11 @@ export class MemoryV2ModelGateway {
             return { status: 'ok', output: { completed: true } };
         }
         catch (error) {
-            return classifyFailure(error);
+            const failure = classifyFailure(error);
+            // 整理按错误类别决定草稿能否留到下次续跑，环境故障要说明是哪一类。
+            return failure.status === 'failed' && failure.reason === 'model-unavailable'
+                ? { ...failure, errorKind: llmErrorKind(error) }
+                : failure;
         }
     }
     async migrateLegacy(input) {
@@ -265,16 +270,19 @@ function classifyFailure(error) {
     if (retryAtMs !== undefined) {
         return retryAtMs > 0 ? { status: 'rate-limited', retryAtMs } : { status: 'rate-limited' };
     }
-    const kind = toLLMMetricErrorKind(normalizeLLMError({
-        raw: error,
-        ...(typeof error === 'string' ? { errorMessage: error } : {}),
-    }).facts);
+    const kind = llmErrorKind(error);
     if (kind === 'rate_limited' || kind === 'tpm_rate_limited')
         return { status: 'rate-limited' };
     return {
         status: 'failed',
         reason: ENVIRONMENT_FAILURE_KINDS.has(kind) ? 'model-unavailable' : 'model-request-failed',
     };
+}
+function llmErrorKind(error) {
+    return toLLMMetricErrorKind(normalizeLLMError({
+        raw: error,
+        ...(typeof error === 'string' ? { errorMessage: error } : {}),
+    }).facts);
 }
 /** 识别上游限流并取出 retryAtMs;拿不到具体时刻时返回 0 表示「限流但无重试时刻」。 */
 function rateLimitRetryAtMs(error) {
@@ -304,12 +312,15 @@ const CONSOLIDATION_AGENT_HARNESS = [
     '- 其余文件只读。',
     '',
     '约定：',
-    '1. 先完整读取 `changes.md`；INIT 分段读完全部当前材料与规则，INCREMENTAL 按变化清单读取相关材料。',
+    '1. 先完整读取 `changes.md`；INIT 分段读完本轮全部材料与规则，INCREMENTAL 按变化清单读取相关材料。',
     '2. 直接编辑 `MEMORY.md` 与 `memory_summary.md`；这是本轮唯一需要产出的两个文件。',
-    '3. INCREMENTAL 用 `edit_file` 只改变化的条目，不要整份重写 MEMORY.md；单次回复的输出有长度上限，超出时其中的工具调用会被截断且不会执行。',
-    '4. 编辑完成后结束工具调用，最终回复无格式要求；宿主读取文件校验结果。',
-    '5. 轮次与 token 预算有限，避免重复读取同一文件。',
+    '3. `changes.md`「本轮之外的来源」所列来源不在本轮，它们在 `MEMORY.md` 中的已有条目保持原样，不删除、不改写来源标注；只有该来源遗忘规则（工作目录中的 `<来源>.rules.md`）命中的内容与本轮 note 明确要求遗忘的内容可以移除。',
+    '4. INCREMENTAL 用 `edit_file` 只改变化的条目，不要整份重写 MEMORY.md；单次回复的输出有长度上限，超出时其中的工具调用会被截断且不会执行。',
+    '5. 编辑完成后结束工具调用，最终回复无格式要求；宿主读取文件校验结果。',
+    '6. 模型请求次数与 token 预算有限，避免重复读取同一文件。',
 ].join('\n');
+/** 续跑时附在简报末尾：草稿已含上次完成的修改，只补做还没处理的变化。 */
+const RESUMED_CONSOLIDATION_NOTE = '这是一次续跑：上一次整理因模型服务故障中断，工作目录中的 MEMORY.md 与 memory_summary.md 已经包含上次完成的修改。先读 changes.md 与这两份草稿，只处理草稿里还没有体现的变化，不要从头重写。';
 /** 首条用户简报：程序合成的变更事实与预算；逐行 diff 在工作目录 changes.md。 */
 function renderConsolidationBriefing(input) {
     const { changes } = input;
@@ -321,11 +332,14 @@ function renderConsolidationBriefing(input) {
         `- 更新会话文档：${changes.updatedSessionIds.length}`,
         `- 已退出选集（条目已由程序删除，勿恢复）：${changes.removedSessionIds.length}`,
         `- 产物存在用户权威修改：${changes.artifactsModified ? '是（尊重现有产物内容）' : '否'}`,
+        `- 本轮之外来源的遗忘规则有更新：${changes.forgetRuleSourceIds.length}（按 changes.md 标注的 .rules.md 移除命中内容）`,
         '',
         `MEMORY.md 生成目标预算 ${indexBudget} 字节；memory_summary.md 生成目标预算 ${summaryBudget} token，首行必须是 v2。`,
         `- note 变化：新增 ${changes.addedNotePaths.length}，修改 ${changes.updatedNotePaths.length}，移除 ${changes.removedNotePaths.length}。`,
         '请从 changes.md 开始，按 next_line_offset 读完整清单；差异截断时按路径补读。旧 note 按需读取，禁止修改或删除 note 文件。',
     ];
+    if (input.resumed)
+        lines.push('', RESUMED_CONSOLIDATION_NOTE);
     return lines.join('\n');
 }
 function consolidationPromptBudget(hardLimit) {

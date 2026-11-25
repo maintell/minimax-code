@@ -171,6 +171,9 @@ class DrizzleAssignmentTaskRepository {
     async claimVerdict(sessionId, claim) {
         return this.applied(sessionId, 'claimVerdict', T.claimVerdict(claim));
     }
+    async abandonVerdictReview(sessionId, input) {
+        return this.applied(sessionId, 'abandonVerdictReview', T.abandonVerdictReview(input));
+    }
     async finishReview(sessionId, input) {
         const { result, ...review } = input;
         return this.transition(sessionId, 'finishReview', T.finishReview(review), {

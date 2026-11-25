@@ -1,12 +1,10 @@
 import { desc } from 'drizzle-orm';
 import { bunnySpaces } from '../../../infra/db/schema/bunny-store.js';
-import { spaceDisplayName } from '../../session-system/index.js';
 function workline(space) {
     return {
         id: space.id,
-        name: spaceDisplayName(space),
+        name: space.name,
         goal: space.objective,
-        system: space.id === 'default',
         projects: space.projects,
         context: space.context,
         createdAt: space.createdAtMs,
@@ -39,6 +37,9 @@ export class BunnyWorklineService {
     sessionSpace(sessionId) {
         return this.library.sessionSpace(sessionId);
     }
+    sessionSpaces() {
+        return this.library.spaceLinks();
+    }
     async get(id) {
         const detail = this.library.getSpace(id);
         const context = this.library.readContext(id);
@@ -53,8 +54,16 @@ export class BunnyWorklineService {
     readContext(id) {
         return this.library.readContext(id);
     }
-    writeContext(id, input) {
-        return this.library.writeContext({ id, ...input });
+    /**
+     * A changed brief is announced as `workline.updated` so the panel reads it again. The space
+     * row is published as stored: the brief is not an edit of the item, so `updatedAt` and the
+     * item's place in the list stay where they were.
+     */
+    async writeContext(id, input) {
+        const written = await this.library.writeContext({ id, ...input });
+        if (written.changed)
+            this.publish(this.library.getSpace(id).space);
+        return written;
     }
     async create(input) {
         return this.publish((await this.library.saveSpace({ ...input, objective: input.goal })).space);

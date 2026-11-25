@@ -251,6 +251,60 @@ function findSection(lines, heading) {
     const next = lines.findIndex((line, index) => index > start && SECTION_BOUNDARY_RE.test(line));
     return { start, end: next < 0 ? lines.length : next };
 }
+/** 小节内最后一个非空行之后的位置；小节只有标题时紧跟标题。start 为 -1 时表示整份文件。 */
+function sectionInsertAt(lines, section) {
+    let at = section.end;
+    while (at > section.start + 1 && lines[at - 1]?.trim() === '')
+        at -= 1;
+    return at;
+}
+/**
+ * 把旧索引中来源包含缺失会话的条目块原样放回新索引（§5.6 INIT 补回）。条目块按旧索引顺序放进
+ * 新索引里同名分节的末尾（分节范围与 findSection 相同），新索引没有该分节时在文件末尾补上分节标题；
+ * 一个条目块有多个缺失来源时整块放回一次。块里的全部来源都在 restorable 里才放回：含有带遗忘规则
+ * 或已退出准入集合的来源时跳过，免得把已遗忘、已删除或已排除会话的内容带回来。
+ * restored / skipped 记录每个缺失会话放回与跳过的条目块数。
+ */
+export function restoreEntriesBySource(previousMarkdown, markdown, sources) {
+    const { sections, restored, skipped } = collectRestoreBlocks(previousMarkdown, sources);
+    let lines = markdown.split('\n');
+    for (const [name, blocks] of sections)
+        lines = insertIntoSection(lines, name, blocks);
+    return { markdown: lines.join('\n'), restored, skipped };
+}
+/** 按旧索引顺序收集可放回的条目块，按所在分节标题分组；分节外的条目归入 undefined。 */
+function collectRestoreBlocks(previousMarkdown, sources) {
+    const restored = new Map([...sources.missing].map((id) => [id, 0]));
+    const skipped = new Map([...sources.missing].map((id) => [id, 0]));
+    const sections = new Map();
+    let heading;
+    for (const part of splitEntries(previousMarkdown)) {
+        if (typeof part === 'string') {
+            if (SECTION_BOUNDARY_RE.test(part))
+                heading = part.trim();
+            continue;
+        }
+        const hits = part.sourceSessionIds.filter((id) => sources.missing.has(id));
+        const allowed = part.sourceSessionIds.every((id) => sources.restorable.has(id));
+        const counts = allowed ? restored : skipped;
+        for (const id of hits)
+            counts.set(id, (counts.get(id) ?? 0) + 1);
+        if (allowed && hits.length > 0)
+            sections.set(heading, [...(sections.get(heading) ?? []), ...part.lines]);
+    }
+    return { sections, restored, skipped };
+}
+/** 放到同名分节最后一个非空行之后；没有同名分节或条目原本不在任何分节下时追加到文件末尾。 */
+function insertIntoSection(lines, heading, blocks) {
+    const section = heading === undefined ? undefined : findSection(lines, heading);
+    if (section) {
+        const at = sectionInsertAt(lines, section);
+        return [...lines.slice(0, at), ...blocks, ...lines.slice(at)];
+    }
+    const end = sectionInsertAt(lines, { start: -1, end: lines.length });
+    const body = heading === undefined ? blocks : ['', heading, ...blocks];
+    return [...lines.slice(0, end), ...body, ...lines.slice(end)];
+}
 function extractQuotes(text) {
     return [...text.matchAll(QUOTE_RE)].map((match) => normalize(match[1])).filter(Boolean);
 }
@@ -294,21 +348,84 @@ export function insertSummaryRequestLine(input) {
     if (lines.some((line) => line.includes(input.notePath)))
         return { status: 'already-present' };
     const line = renderSummaryRequestLine(input.note, input.notePath, input.projectLabel);
+    const markdown = appendRequestLine(lines, line);
+    if (exceedsSummaryBudget(markdown, input.maxSummaryTokens))
+        return { status: 'rejected', reason: 'summary-budget-exceeded' };
+    return { status: 'inserted', markdown, line };
+}
+/** 把一行请求放到「## 记忆请求」节末尾；节不存在时紧跟首行 `v2` 新建。 */
+function appendRequestLine(lines, line) {
     const out = [...lines];
     const section = findSection(lines, REQUEST_HEADING);
     if (section) {
-        let at = section.end;
-        while (at > section.start + 1 && out[at - 1].trim() === '')
-            at -= 1;
-        out.splice(at, 0, line);
+        out.splice(sectionInsertAt(out, section), 0, line);
     }
     else {
         out.splice(1, 0, '', REQUEST_HEADING, line, '');
     }
-    const markdown = collapseBlankRuns(out).join('\n');
-    if (exceedsSummaryBudget(markdown, input.maxSummaryTokens))
-        return { status: 'rejected', reason: 'summary-budget-exceeded' };
-    return { status: 'inserted', markdown, line };
+    return collapseBlankRuns(out).join('\n');
+}
+/** 请求行行尾的 note 路径。 */
+const REQUEST_LINE_NOTE_RE = /（note: ([^）]+)）$/u;
+/** 摘要「## 记忆请求」节中带 note 路径的请求行。 */
+function listSummaryRequestLines(markdown) {
+    const lines = markdown.replace(/\r\n?/gu, '\n').split('\n');
+    const section = findSection(lines, REQUEST_HEADING);
+    if (!section)
+        return [];
+    return lines
+        .slice(section.start + 1, section.end)
+        .filter((line) => REQUEST_LINE_NOTE_RE.test(line.trim()));
+}
+/**
+ * 摘要从 before 变成 after 时，如果唯一的差异是「## 记忆请求」节新增的请求行（保存 note 时程序直接
+ * 写入），返回这些新增行；没有差异返回空数组；有任何其他差异（例如用户手改）返回 undefined。
+ * 整理续跑据此决定把请求行补进草稿，还是放弃草稿，免得覆盖别处的修改。
+ */
+export function addedSummaryRequestLines(before, after) {
+    if (before === after)
+        return [];
+    const existing = new Set(listSummaryRequestLines(before));
+    const added = listSummaryRequestLines(after).filter((line) => !existing.has(line));
+    if (added.length === 0)
+        return undefined;
+    // 逐行比较其余内容：插入请求行只会多出这些行，以及原来没有这一节时的节标题与空行。
+    const removed = new Set(added.map((line) => line.trimEnd()));
+    const beforeLines = contentLines(before);
+    const hadSection = beforeLines.some((line) => line.trim() === REQUEST_HEADING);
+    const rest = contentLines(after).filter((line) => !removed.has(line) && (hadSection || line.trim() !== REQUEST_HEADING));
+    return JSON.stringify(rest) === JSON.stringify(beforeLines) ? added : undefined;
+}
+/** 非空行，去掉行尾空白；空行不承载内容，不参与比较。 */
+function contentLines(markdown) {
+    return markdown
+        .replace(/\r\n?/gu, '\n')
+        .split('\n')
+        .map((line) => line.trimEnd())
+        .filter((line) => line !== '');
+}
+/**
+ * 把请求行原样补进摘要的「## 记忆请求」节。同一 note 已有请求行时跳过；补进后超出摘要预算的行
+ * 不补（dropped），与保存 note 时超预算不写摘要一致，note 本身已保存，由下一轮整理归置。
+ */
+export function carrySummaryRequestLines(summaryMarkdown, requestLines, maxSummaryTokens) {
+    let markdown = summaryMarkdown;
+    let carried = 0;
+    let dropped = 0;
+    for (const line of requestLines) {
+        const notePath = REQUEST_LINE_NOTE_RE.exec(line.trim())?.[1];
+        const lines = markdown.replace(/\r\n?/gu, '\n').split('\n');
+        if (!notePath || lines.some((existing) => existing.includes(`（note: ${notePath}）`)))
+            continue;
+        const next = appendRequestLine(lines, line);
+        if (exceedsSummaryBudget(next, maxSummaryTokens)) {
+            dropped += 1;
+            continue;
+        }
+        markdown = next;
+        carried += 1;
+    }
+    return { markdown, carried, dropped };
 }
 /** 单行请求：项目范围标注 + 正文一行化、脱敏后截断，行尾附 note 路径供模型读全文。 */
 function renderSummaryRequestLine(note, notePath, projectLabel) {

@@ -93,6 +93,9 @@ function terminalStatus(event) {
     }
 }
 function isForceExpansionReconciliation(kind) {
-    return kind === 'output-recall' || kind === 'network-reconcile' || kind === 'safety-reconcile';
+    return (kind === 'output-recall' ||
+        kind === 'network-reconcile' ||
+        kind === 'safety-reconcile' ||
+        kind === 'reply-reconcile');
 }
 //# sourceMappingURL=query-collapse-projector.js.map

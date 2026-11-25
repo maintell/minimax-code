@@ -35,6 +35,9 @@ export function buildToolLoadingCatalog(input) {
         options: input.options,
         retainedDeferredTools: new Set(existing?.registry.values()),
         ...(input.ptc ? { ptc: true } : {}),
+        ...(input.inlineOnDemandToolNames
+            ? { inlineOnDemandToolNames: input.inlineOnDemandToolNames }
+            : {}),
         ...(input.window ? { window: input.window } : {}),
         gatewaysExposed: Boolean(input.alwaysExpose || existing),
     });
@@ -73,6 +76,7 @@ export function buildToolLoadingCatalog(input) {
             .map((tool) => tool.def.name)
             .filter((name) => plan.window?.deviation.get(name)?.status !== 'removed')),
         ...(input.onToolSearch ? { onResult: input.onToolSearch } : {}),
+        ...(input.onNamespaceSearch ? { onNamespaceSearch: input.onNamespaceSearch } : {}),
     }), {
         deferredEntries: plan.deferred ? plan.deferredEntries : [],
         ...(plan.window ? { catalogEntries: [...plan.window.window.deferred.values()] } : {}),

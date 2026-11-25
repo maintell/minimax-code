@@ -11,12 +11,15 @@ import { sessionAgentNamePredicate } from './agent-name-predicate.js';
 import { sessionListPredicate } from './drizzle/list-predicates.js';
 import { INTERNAL_TREE_SESSION_KINDS, projectTaskRootPredicate, sessionTreePredicate, } from './filters.js';
 import { applySessionUpdate, isTaskSession, normalizeSessionType, } from './drizzle/normalization.js';
+import { rebindSessionAgentDefinitionProject, rebindSessionRecordWorkspace, } from './drizzle/workspace-rebind.js';
 import { decodeCreationCursor, decodeRecencyCursor, normalizePageLimit, recencyCursorPredicate, recencyOrder, sessionCreationPageFromRows, sessionPageFromRows, sortByRecency, } from './pagination.js';
 import { deleteSessionSearchDocument, searchSessionContentIds, searchSessionIds, sessionProjectKeys, writeSessionSearchDocument, } from './search.js';
 import { recordFromCreate } from './drizzle/record-create.js';
 import { projects } from '../../../../infra/db/schema/projects.js';
 import { eligible } from '../../projects/sidebar/predicate.js';
+import { latestProjectId, relistReturningProject } from './drizzle/project-relist.js';
 import { recordProjectRemoval, sessionNotRemovedFromProject, } from '../../shared/project-removal.js';
+import { listedFirstValues } from '../../shared/project-list-position.js';
 export { compareAndSetSessionInteractionModeInTransaction, readSessionInteractionModeInTransaction, transitionSessionInteractionModeInTransaction, } from './drizzle/interaction-mode.js';
 const DEFAULT_TREE_FILTER = {
     archived: false,
@@ -91,6 +94,8 @@ class DrizzleSessionRepository {
             : undefined;
         try {
             this.options.db.transaction((tx) => {
+                // Rows this insert creates rank by creation time; older ones may come back to the list.
+                const lastProjectId = latestProjectId(tx);
                 tx.insert(sessions)
                     .values(encodeSessionRow(record, { projectId: input.projectId }))
                     .run();
@@ -129,11 +134,20 @@ class DrizzleSessionRepository {
                         .innerJoin(projects, eq(sessions.projectId, projects.projectId))
                         .where(and(eq(sessions.sessionId, record.sessionId), eligible(true)))
                         .get();
+                    // The removed project comes back with this task and is listed first.
                     if (visible)
                         tx.update(projects)
-                            .set({ hidden: 0, updatedAtMs: nowMs })
+                            .set({ ...listedFirstValues(tx, nowMs, { unhide: true }), updatedAtMs: nowMs })
                             .where(eq(projects.projectId, project.projectId))
                             .run();
+                }
+                else {
+                    relistReturningProject(tx, {
+                        sessionId: record.sessionId,
+                        lastProjectId,
+                        nowMs,
+                        agentInternalWorkspaceDir: this.options.agentInternalWorkspaceDir,
+                    });
                 }
             });
         }
@@ -245,6 +259,18 @@ class DrizzleSessionRepository {
             writeRow(tx, row, record);
             // Updates only an existing model receipt; ordinary Agent definitions are never created here.
             syncSessionAgentDefinitionModel(tx, sessionId, modelFields);
+            return record;
+        }, { behavior: 'immediate' });
+    }
+    async rebindWorkspace(sessionId, target) {
+        return this.options.db.transaction((tx) => {
+            const row = selectRow(tx, sessionId);
+            if (!row)
+                return undefined;
+            const record = rebindSessionRecordWorkspace(decodeSessionRow(row), target);
+            // The Project triggers re-derive project_id and both Projects' aggregates from this write.
+            writeRow(tx, row, record);
+            rebindSessionAgentDefinitionProject(tx, sessionId, target);
             return record;
         }, { behavior: 'immediate' });
     }

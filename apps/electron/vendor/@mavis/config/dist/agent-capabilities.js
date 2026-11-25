@@ -60,16 +60,26 @@ export const AGENT_BUILTIN_SKILL_IDS = [
     'plugin-creator',
     'skill-creator',
     'skill-refiner',
+    'space',
     'visual-page',
     'x-link-reader',
 ];
 export const AGENT_CAPABILITY_OWNED_SKILL_IDS = [
     'control-in-app-browser',
     'resume-codex',
-    'mavis',
+    'agent-manage',
+    'session-manage',
+    'session-dispatch',
+    'mcp-manage',
+    'cron-manage',
+    'memory-manage',
+    'im-routing',
+    'skill-management',
+    'windows-tool-bootstrap',
     'create-agent',
     'minimax-code-product',
     'miniapp-creator',
+    'extension-creator',
     'plugin-management',
 ];
 const ROOT_KEYS = new Set([

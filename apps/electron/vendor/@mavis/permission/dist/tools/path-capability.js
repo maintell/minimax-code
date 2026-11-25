@@ -9,6 +9,7 @@ import { splitCommand, findHeredocBodyRanges } from './bash-split.js';
 import { extractSourceTarget } from './bash-permission.js';
 import { isDiscardSinkTarget } from './bash-write-target.js';
 import { FS_UMBRELLA_TOOL_NAME, READ_ONLY_TOOLS, containsPathTraversal, isDangerousRemovalPath, isPathAllowed, isPublicKeyFile, isTempDirectory, matchPathRule, } from './fs-permission.js';
+import { resolveOperationIdentities, unfoldedAbsolutePath } from './path-identity.js';
 export function pathActionToToolName(action) {
     switch (action) {
         case 'read':
@@ -110,9 +111,12 @@ export function evaluatePathCapability(filePath, action, context, options = {}) 
             },
         };
     }
-    // A relative `..` operand can climb out of the workspace (`rm -rf ..`), so
-    // judge it at its session-resolved location rather than the daemon cwd.
-    const removalPath = containsPathTraversal(filePath) ? candidatePath : filePath;
+    // Judge every operand at its session-resolved location, never the daemon cwd:
+    // a Desktop runtime launched from the Dock runs with cwd `/`, so resolving a
+    // bare relative operand there turns `rm build` into `/build` (a direct child
+    // of root). `rm -rf ..` still resolves to the workspace parent. A bare `~`
+    // keeps its raw form so it stays dangerous even without a session home.
+    const removalPath = isBareHomeToken(filePath) ? filePath : candidatePath;
     if (action === 'delete' && isDangerousRemovalPath(removalPath, context.homeDir)) {
         return {
             behavior: 'deny',
@@ -137,7 +141,12 @@ export function evaluatePathCapability(filePath, action, context, options = {}) 
         action !== 'read' &&
         result.reason.type === 'workingDirectory') {
         const resolved = result.reason.path;
-        if (isTempDirectory(resolved)) {
+        // A shell walking `/tmp/link/..` lands outside the temp directory.
+        const unfolded = unfoldedAbsolutePath(filePath, pathCtx.workingDirectory, pathCtx.homeDir);
+        const identities = resolveOperationIdentities(filePath, resolved, unfolded, action) ?? [
+            resolved,
+        ];
+        if (identities.every((identity) => isTempDirectory(identity))) {
             return { behavior: 'allow', reason: { type: 'tempDirectory', path: resolved } };
         }
     }
@@ -336,6 +345,10 @@ function ruleAllowsPathAction(rule, action) {
         return false;
     return matcher.actions === undefined || matcher.actions.includes(action);
 }
+function isBareHomeToken(filePath) {
+    const trimmed = filePath.trim();
+    return trimmed === '~' || trimmed === '~/';
+}
 function resolveShellAwarePath(filePath, workingDirectory, homeDir) {
     const looksWindows = /^[A-Za-z]:[\\/]/.test(filePath) || filePath.includes('\\');
     // Windows-shaped paths keep their raw form so HARD patterns see the Windows
@@ -508,7 +521,24 @@ export function extractUnknownToolPathIntents(toolName, input) {
         }
     }
     intents.push(...extractMatrixToolPathIntents(toolName, input));
+    intents.push(...extractSpaceToolPathIntents(toolName, input));
     return dedupePathIntents(intents);
+}
+/**
+ * space_upload reads `local_path` (its content goes to the user's Space); space_download writes
+ * it. Other space_* tools only touch Space and carry no local path.
+ */
+const SPACE_TOOL_LOCAL_PATH_ACTIONS = {
+    space_upload: 'read',
+    space_download: 'write',
+};
+function extractSpaceToolPathIntents(toolName, input) {
+    const action = SPACE_TOOL_LOCAL_PATH_ACTIONS[toolName];
+    const value = input.local_path;
+    if (!action || typeof value !== 'string')
+        return [];
+    const localPath = stripFileUri(value).trim();
+    return localPath ? [{ path: localPath, action }] : [];
 }
 const MATRIX_READ_PATH_FIELDS = new Set([
     'file',
@@ -1025,7 +1055,10 @@ function normalizeCommandToken(token) {
         return undefined;
     if (token.startsWith('/'))
         return token.split('/').pop() ?? token;
-    return token;
+    // The fast allow reads a bare `cat.exe` as `cat` on Windows, so its
+    // operands must surface as read intents too. An extra intent only adds a
+    // check, so this needs no platform gate.
+    return token.replace(/\.exe$/i, '');
 }
 function operandValue(operand) {
     return typeof operand === 'string' ? operand : operand.value;

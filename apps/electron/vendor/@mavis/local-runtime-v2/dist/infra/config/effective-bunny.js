@@ -1,4 +1,4 @@
-import { resolveBunnyEnabledState, withEffectiveBunny, } from '@mavis/config';
+import { productionBetaResolutionContext, resolveBunnyEnabledState, withEffectiveBunny, } from '@mavis/config';
 import { incrementMetric } from '../logging/metrics.js';
 /**
  * Fills the effective Bunny beta switch into a host's config read boundary:
@@ -20,7 +20,7 @@ export function withEffectiveBunnyConfig(boundary) {
         const userId = boundary.getUserId?.();
         const remote = boundary.getBunnyPolicy?.();
         const context = {
-            ...boundary.buildVariant,
+            ...(config.productionParity === true ? productionBuild() : boundary.buildVariant),
             ...(userId ? { userId } : {}),
         };
         reportState(() => resolveBunnyEnabledState(config.bunny?.enabled, remote, context));
@@ -33,6 +33,11 @@ export function withEffectiveBunnyConfig(boundary) {
             return { ...result, config: effective(result.config) };
         },
     };
+}
+/** Under `productionParity` Bunny takes a public production package's default and missing policy. */
+function productionBuild() {
+    const { buildEnv, internalBuild, insideBuild } = productionBetaResolutionContext();
+    return { buildEnv, internalBuild, insideBuild };
 }
 function createBunnyEnabledStateReporter(metrics) {
     if (!metrics)

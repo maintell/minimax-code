@@ -36,6 +36,8 @@ async function configRequest(input) {
             return { scene: SAFETY_CHECK_V2_SCENE.AgentConfigName, content_text: input.content };
         case SAFETY_SCENE.CronTitle:
             return { scene: SAFETY_CHECK_V2_SCENE.CronTitle, content_text: input.content };
+        case SAFETY_SCENE.ProjectName:
+            return { scene: SAFETY_CHECK_V2_SCENE.ProjectName, content_text: input.content };
         case SAFETY_SCENE.AgentConfigAvatar:
             return { scene: SAFETY_CHECK_V2_SCENE.AgentConfigAvatar, ...(await avatarReference(input)) };
         default:

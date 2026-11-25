@@ -12,8 +12,9 @@ export const DEFAULT_DEFER_BUDGET_TOKENS = 27_500;
 /**
  * Disclosure options of one Turn, shared by the local and the cloud runtime:
  * `MAVIS_MCP_TOOL_SEARCH_*` env vars win over `raw`, which wins over the defaults.
+ * The Host passes its environment; without one there are no env overrides.
  */
-export function resolveMcpDisclosureOptions(raw, env = process.env) {
+export function resolveMcpDisclosureOptions(raw, env = {}) {
     const configuredRatio = parseNumber(env.MAVIS_MCP_TOOL_SEARCH_THRESHOLD_PCT) ?? raw?.thresholdPct;
     const deferBudgetTokens = parseNumber(env.MAVIS_MCP_TOOL_SEARCH_DEFER_BUDGET_TOKENS) ??
         raw?.deferBudgetTokens ??

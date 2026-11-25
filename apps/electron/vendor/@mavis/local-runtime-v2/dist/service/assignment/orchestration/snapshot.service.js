@@ -176,7 +176,6 @@ function spaceLines(spaces, tasks) {
             ? spaces.map((item) => spaceOverviewLine({
                 name: safe(item.name),
                 id: safe(item.id),
-                system: item.system,
                 goal: item.goal ? safe(item.goal) : '',
                 projects: (item.projects ?? []).map((project) => safe(path.basename(project))),
                 ...(tasks

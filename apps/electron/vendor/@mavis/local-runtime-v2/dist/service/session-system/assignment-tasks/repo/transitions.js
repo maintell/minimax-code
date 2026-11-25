@@ -56,7 +56,7 @@ export const assignmentTransitions = {
             current.reviewTask?.reportKey === reviewTask.reportKey)
             return SKIP;
         return {
-            ...withoutKeys(current, ['verdict', 'verdictClaim']),
+            ...withoutKeys(current, ['verdict', 'verdictClaim', 'verdictGateReleased']),
             reviewTask: { ...reviewTask },
         };
     },
@@ -94,6 +94,38 @@ export const assignmentTransitions = {
         return {
             ...current,
             verdictClaim: { by: claim.by, at: claim.at, revision: verdict.revision },
+        };
+    },
+    /**
+     * A dispatched review will not report: its task failed, stopped, closed or ran past the
+     * deadline. The gate is released so the task can be concluded or sent back, and the reason
+     * is kept where the panel shows a task waiting for the user (reviewError).
+     *
+     * A verdict the review did manage to store is kept: it is the evidence of what the review
+     * found, and dropping it would throw away the only trace of work the user paid for. Only
+     * the link goes, so verdictGateBlock stops holding the task shut.
+     *
+     * A claim is kept with it. Releasing a gate is not a fact about who read what: the claim
+     * records that a coordinator turn read a revision at a time, and that stays true once the
+     * gate is gone. Dropping it destroyed the one fact that tells a released gate apart from a
+     * verdict nobody ever read, which is what made a real "Bunny read this 65 seconds in" case
+     * unprovable from the task itself. Keeping it cannot make a later round read as already
+     * read: every reader of a claim is revision-bound, a new review drops it outright
+     * ({@link assignmentTransitions.startVerdictReview}) and so does a newer verdict
+     * ({@link assignmentTransitions.recordVerdict}).
+     *
+     * Which review's gate this was stays behind (verdictGateReleased). A gated task never
+     * carries `assignment.review`, so once the link is gone nothing else would say a
+     * conclusion for it belongs to the verdict path rather than to a report nobody is
+     * reviewing — and a conclusion that writes nothing has to be able to say so.
+     */
+    abandonVerdictReview: (input) => (current) => {
+        if (!current || current.completion || !current.reviewTask)
+            return SKIP;
+        return {
+            ...withoutKeys(current, ['reviewTask']),
+            verdictGateReleased: { reviewTaskId: current.reviewTask.sessionId, at: input.at },
+            reviewError: { reportKey: input.reportKey, reason: input.reason, at: input.at },
         };
     },
     finishReview: (input) => (current) => {

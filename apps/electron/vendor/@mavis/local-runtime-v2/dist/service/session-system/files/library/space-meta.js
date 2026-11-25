@@ -3,14 +3,13 @@ import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { replaceFileAtomically } from '../../../../infra/file/jsonl.js';
 import { SPACE_META_FILE, resolveSpaceDirectory, scanSpaceDirectories } from './space-directory.js';
-import { spaceDisplayName } from './space-name.js';
 export function spaceMetaOf(space, options) {
     return {
         schemaVersion: 1,
         mirrorOf: 'bunny/data/bunny.sqlite#local_runtime_task_spaces',
         readOnly: true,
         space_id: space.id,
-        space_name: spaceDisplayName(space),
+        space_name: space.name,
         goal: space.objective,
         linked_projects: [...space.projects],
         'context-path': 'context.md',

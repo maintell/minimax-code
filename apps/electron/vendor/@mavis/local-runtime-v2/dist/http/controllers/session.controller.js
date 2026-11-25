@@ -185,6 +185,21 @@ export class SessionController extends SessionControllerBase {
     async listSessionFiles(ctx, req) {
         return this.requireApplications().session.content.listSessionFiles(ctx, req);
     }
+    async getSessionFileSyncs(ctx, req) {
+        return this.requireApplications().session.content.getSessionFileSyncs(ctx, req);
+    }
+    async recordSessionFileSync(ctx, req) {
+        return this.requireApplications().session.content.recordSessionFileSync(ctx, req);
+    }
+    async querySessionFileSyncSources(ctx, req) {
+        return this.requireApplications().session.content.querySessionFileSyncSources(ctx, req);
+    }
+    async invalidateSessionFileSyncSources(ctx, req) {
+        return this.requireApplications().session.content.invalidateSessionFileSyncSources(ctx, req);
+    }
+    async bindSessionFileSyncOwner(ctx, req) {
+        return this.requireApplications().session.content.bindSessionFileSyncOwner(ctx, req);
+    }
     /**
      * 把一个 Cron 提示轮次投递到已解析的会话。本方法只承担传输衔接：校验强类型请求，
      * 并委托给组合层绑定的 {@link CronTurnDeliveryPort}。宿主未持有 Cron 执行器且

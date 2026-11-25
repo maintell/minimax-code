@@ -20,8 +20,7 @@
  *   streams and re-request ports.
  */
 
-import { pathToFileURL } from "node:url";
-import { getConfig } from "@mavis/config";
+import { getBunnyMissingPolicy, getConfig } from "@mavis/config";
 import { DEFAULT_COLLECTION_POLICY } from "@mavis/shared/collection-policy";
 import logger from "../../../utils/logger";
 import { recordAuthRefreshExecutionGap } from "../../auth/refresh-environment";
@@ -43,6 +42,7 @@ export { releaseComputerUseLease };
 import { createExecutionContinuity } from "./execution-continuity";
 import { RUNTIME_TRANSPORT_LOST_CHANNEL } from "./control";
 import { serveUtilityPlaneBRequest } from "./plane-b";
+import { importRuntimeTransportModule } from "./runtime-transport-module.js";
 import { resolveUtilityProxyEnv } from "./proxy-env";
 import { SupervisorMetricsObserver } from "./supervisor-metrics";
 import { UtilityRuntimeObserver } from "./utility-runtime-observer";
@@ -111,15 +111,6 @@ function rememberRuntimeHeapProfile(profile) {
     lastRuntimeHeapProfile = summary;
     return summary;
 }
-function importEsm(specifier) {
-    if (process.env.VITEST === 'true') {
-        return import(specifier);
-    }
-    // eslint-disable-next-line no-new-func -- Preserve native dynamic import in Electron's CJS main process.
-    const dynamicImport = new Function('specifier', 'return import(specifier)');
-    // Resolve from Electron main even if V8 reuses an import callback from another package.
-    return dynamicImport(pathToFileURL(require.resolve(specifier)).href);
-}
 /**
  * Lazy dynamic import for `@mavis/shared/runtime-transport`: `@mavis/shared`
  * is ESM-only while Electron main is compiled to CommonJS, so a static value
@@ -127,7 +118,12 @@ function importEsm(specifier) {
  */
 function loadRuntimeTransportModule() {
     if (!runtimeTransportModulePromise) {
-        runtimeTransportModulePromise = importEsm('@mavis/shared/runtime-transport');
+        const pending = importRuntimeTransportModule().catch((error) => {
+            if (runtimeTransportModulePromise === pending)
+                runtimeTransportModulePromise = null;
+            throw error;
+        });
+        runtimeTransportModulePromise = pending;
     }
     return runtimeTransportModulePromise;
 }
@@ -211,6 +207,28 @@ function installNetworkServiceGoneListener() {
         logger.warn('[UtilityRuntime] network service listener install failed');
     });
 }
+const NETWORK_PROBE_TIMEOUT_MS = 5000;
+/**
+ * Whether Main's own Electron `net` (the restarted Network Service, current
+ * system proxy) gets any HTTP response from `origin`. Lets the manager tell a
+ * stale utility fallback apart from a machine that is actually offline.
+ */
+async function probeNetworkReachableViaMainNet(origin) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), NETWORK_PROBE_TIMEOUT_MS);
+    try {
+        const { net } = await import('electron');
+        const response = await net.fetch(origin, { method: 'HEAD', signal: controller.signal });
+        void response.body?.cancel().catch(() => undefined);
+        return true;
+    }
+    catch {
+        return false;
+    }
+    finally {
+        clearTimeout(timer);
+    }
+}
 function getManager() {
     if (manager)
         return manager;
@@ -274,7 +292,7 @@ function getManager() {
         }),
         getRunawayGuardConfig: () => hooks?.getRunawayGuardConfig?.() ?? {},
         getPromptSuggestionPolicy: () => hooks?.getPromptSuggestionPolicy?.() ?? {},
-        getBunnyPolicy: () => hooks?.getBunnyPolicy?.() ?? {},
+        getBunnyPolicy: () => hooks?.getBunnyPolicy?.() ?? getBunnyMissingPolicy(),
         getToolResultCompactionConfig: () => hooks?.getToolResultCompactionConfig?.() ?? {},
         getBunnyContextConfig: () => hooks?.getBunnyContextConfig?.() ?? {},
         getCollectionPolicy: () => hooks?.getCollectionPolicy?.() ?? DEFAULT_COLLECTION_POLICY,
@@ -311,6 +329,7 @@ function getManager() {
             });
         },
         onRuntimePowerDemand: setLocalWorkActive,
+        probeNetworkReachable: probeNetworkReachableViaMainNet,
         onRuntimeReady: () => {
             runtimeFailReason = null;
             notifyDataDirRuntimeReady();
@@ -687,7 +706,12 @@ export async function fetchViaUtilityRuntime(request, consumer = DEFAULT_TRANSPO
     // head-of-line block another owner's command traffic.
     let activePromise = mainFetchPromises.get(consumer);
     if (!activePromise) {
-        activePromise = createMainTransportFetch(consumer);
+        const pending = createMainTransportFetch(consumer).catch((error) => {
+            if (mainFetchPromises.get(consumer) === pending)
+                mainFetchPromises.delete(consumer);
+            throw error;
+        });
+        activePromise = pending;
         mainFetchPromises.set(consumer, activePromise);
     }
     const mainFetch = await activePromise;

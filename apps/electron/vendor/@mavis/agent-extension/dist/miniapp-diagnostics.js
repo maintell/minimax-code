@@ -132,6 +132,13 @@ const MINIAPP_FAILURE_CATALOG = {
         message: 'The Mini App device access declaration is invalid.',
         hint: 'Declare deviceAccess as a string array that contains only microphone, camera or notifications.',
     },
+    MINIAPP_FILE_HANDLERS_INVALID: {
+        lifecycleCode: 'PREPARATION_FAILED',
+        stage: 'workspace',
+        recovery: 'edit_workspace',
+        message: 'The Mini App file handlers declaration is invalid.',
+        hint: 'Declare fileHandlers as a non-empty array of { id, path, extensions }: id matches [a-z0-9-]{1,32} and is unique, path follows the surface.path rules, and each extension looks like ".stl" and appears in only one handler.',
+    },
     MINIAPP_MANIFEST_FIELD_UNSUPPORTED: {
         lifecycleCode: 'PREPARATION_FAILED',
         stage: 'workspace',

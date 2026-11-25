@@ -72,25 +72,44 @@ export class TelegramSender {
      * `undefined` keeps the legacy text-only behaviour unchanged.
      */
     async sendText(chatId, text, replyMarkup, messageThreadId) {
+        return this.sendTextWithReply(chatId, text, {
+            ...(replyMarkup ? { replyMarkup } : {}),
+            ...(messageThreadId !== undefined ? { messageThreadId } : {}),
+        });
+    }
+    /**
+     * {@link sendText} plus an optional quote of the inbound message
+     * (`reply_parameters`). Kept as a separate entry point so the four-argument
+     * `sendText` signature — and every existing caller of it — stays unchanged.
+     */
+    async sendTextWithReply(chatId, text, options = {}) {
         if (!text.trim())
             return undefined;
         return withRetry(async () => {
             const body = { chat_id: chatId, text };
-            if (replyMarkup)
-                body.reply_markup = replyMarkup;
+            if (options.replyMarkup)
+                body.reply_markup = options.replyMarkup;
             // Forum topic reply: Telegram routes the message into the topic when
             // `message_thread_id` is set. Absent → message lands in the General
             // (top-level) chat, preserving the legacy behaviour.
-            const threadId = toMessageThreadId(messageThreadId);
+            const threadId = toMessageThreadId(options.messageThreadId);
             if (threadId !== undefined)
                 body.message_thread_id = threadId;
+            const replyParameters = toReplyParameters(options.replyToMessageId);
+            if (replyParameters)
+                body.reply_parameters = replyParameters;
             const response = await this.fetcher(this.endpoint('sendMessage'), {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify(body),
             });
-            await this.assertOk(response, 'sendMessage');
-            return readTelegramMessageId(response);
+            return await this.finishSend(response, {
+                chatId,
+                method: 'sendMessage',
+                ...(options.replyToMessageId !== undefined
+                    ? { replyToMessageId: options.replyToMessageId }
+                    : {}),
+            });
         }, this.retry);
     }
     /**
@@ -114,7 +133,7 @@ export class TelegramSender {
      * Returns the `message_id` of the **last** message sent, or `undefined` when
      * nothing was sent.
      */
-    async sendRichText(chatId, text, messageThreadId) {
+    async sendRichText(chatId, text, messageThreadId, replyToMessageId) {
         if (!text.trim())
             return undefined;
         const chunks = splitTelegramText(text, TELEGRAM_RICH_TEXT_LIMIT);
@@ -122,12 +141,15 @@ export class TelegramSender {
             logger.info({ mode: 'rich', textLength: text.length, chunks: chunks.length }, 'Telegram outbound text split');
         }
         let last;
+        // Only the first delivered chunk quotes the inbound message; the rest
+        // continue the same reply and would otherwise all point back at it.
+        const quote = new SingleReplyQuote(replyToMessageId);
         for (const chunk of chunks) {
             // A whitespace-only chunk carries nothing; Telegram rejects an empty
             // body, so drop it instead of burning a request on it.
             if (!chunk.trim())
                 continue;
-            last = (await this.sendRichChunk(chatId, chunk, messageThreadId)) ?? last;
+            last = (await this.sendRichChunk(chatId, chunk, messageThreadId, quote.take())) ?? last;
         }
         return last;
     }
@@ -141,30 +163,62 @@ export class TelegramSender {
      * fail the same way, so those propagate untouched, as does a 5xx / network
      * error.
      */
-    async sendRichChunk(chatId, chunk, messageThreadId) {
+    async sendRichChunk(chatId, chunk, messageThreadId, replyToMessageId) {
         try {
-            return await this.sendRichMessage(chatId, chunk, messageThreadId);
+            return await this.sendRichMessage(chatId, chunk, messageThreadId, replyToMessageId);
         }
         catch (err) {
             if (readErrorStatus(err) !== 400)
                 throw err;
-            return await this.sendPlainFallback(chatId, chunk, messageThreadId, err);
+            if (replyToMessageId === undefined) {
+                return await this.sendPlainFallback(chatId, chunk, { messageThreadId, cause: err });
+            }
+            // `sendRichMessage` is not a documented Bot API method, so it may refuse
+            // `reply_parameters`. A 400 creates no message, so retrying the same rich
+            // payload without the quote is safe and keeps the formatting; only if that
+            // also fails do we degrade to plain text (which does support the quote).
+            try {
+                const sent = await this.sendRichMessage(chatId, chunk, messageThreadId);
+                logger.warn({
+                    chatId,
+                    textLength: chunk.length,
+                    replyToMessageId,
+                    quoteDropped: true,
+                    errorStatus: readErrorStatus(err),
+                }, 'Telegram rich send dropped its reply quote');
+                return sent;
+            }
+            catch (retryErr) {
+                if (readErrorStatus(retryErr) !== 400)
+                    throw retryErr;
+                return await this.sendPlainFallback(chatId, chunk, {
+                    messageThreadId,
+                    cause: retryErr,
+                    replyToMessageId,
+                });
+            }
         }
     }
     /** One `sendRichMessage` round-trip, retried like every other send. */
-    async sendRichMessage(chatId, markdown, messageThreadId) {
+    async sendRichMessage(chatId, markdown, messageThreadId, replyToMessageId) {
         return withRetry(async () => {
             const body = { chat_id: chatId, rich_message: { markdown } };
             const threadId = toMessageThreadId(messageThreadId);
             if (threadId !== undefined)
                 body.message_thread_id = threadId;
+            const replyParameters = toReplyParameters(replyToMessageId);
+            if (replyParameters)
+                body.reply_parameters = replyParameters;
             const response = await this.fetcher(this.endpoint('sendRichMessage'), {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify(body),
             });
-            await this.assertOk(response, 'sendRichMessage');
-            return readTelegramMessageId(response);
+            return await this.finishSend(response, {
+                chatId,
+                method: 'sendRichMessage',
+                ...(replyToMessageId !== undefined ? { replyToMessageId } : {}),
+            });
         }, this.retry);
     }
     /**
@@ -172,24 +226,32 @@ export class TelegramSender {
      * `parse_mode`, so the Markdown is delivered verbatim). Logs the degradation
      * without the message body — only sizes and Telegram's own error text.
      */
-    async sendPlainFallback(chatId, chunk, messageThreadId, cause) {
+    async sendPlainFallback(chatId, chunk, options) {
         const plainChunks = splitTelegramText(chunk, TELEGRAM_PLAIN_TEXT_LIMIT);
         logger.warn({
             chatId,
             textLength: chunk.length,
-            errorStatus: readErrorStatus(cause),
-            description: readErrorDescription(cause),
+            errorStatus: readErrorStatus(options.cause),
+            description: readErrorDescription(options.cause),
             plainChunks: plainChunks.length,
         }, 'Telegram rich send fell back to plain');
         if (plainChunks.length > 1) {
             logger.info({ mode: 'plain', textLength: chunk.length, chunks: plainChunks.length }, 'Telegram outbound text split');
         }
         let last;
+        const quote = new SingleReplyQuote(options.replyToMessageId);
         for (const piece of plainChunks) {
             // Same guard as the rich loop: a whitespace-only piece is not a message.
             if (!piece.trim())
                 continue;
-            last = (await this.sendText(chatId, piece, undefined, messageThreadId)) ?? last;
+            const anchor = quote.take();
+            last =
+                (await this.sendTextWithReply(chatId, piece, {
+                    ...(options.messageThreadId !== undefined
+                        ? { messageThreadId: options.messageThreadId }
+                        : {}),
+                    ...(anchor !== undefined ? { replyToMessageId: anchor } : {}),
+                })) ?? last;
         }
         return last;
     }
@@ -248,7 +310,7 @@ export class TelegramSender {
      * or `http(s)://`), then uploaded as `multipart/form-data` to the per-kind
      * `send*` method.
      */
-    async sendMedia(chatId, ref, messageThreadId) {
+    async sendMedia(chatId, ref, messageThreadId, replyToMessageId) {
         const { method, field } = KIND_TO_METHOD[ref.kind];
         const buffer = await this.resolveBytes(ref.path);
         const fileName = ref.name || basename(ref.path) || 'attachment';
@@ -258,6 +320,10 @@ export class TelegramSender {
             const threadId = toMessageThreadId(messageThreadId);
             if (threadId !== undefined)
                 form.set('message_thread_id', String(threadId));
+            const replyParameters = toReplyParameters(replyToMessageId);
+            // Multipart fields carry JSON-encoded values as strings.
+            if (replyParameters)
+                form.set('reply_parameters', JSON.stringify(replyParameters));
             // Normalize Buffer<ArrayBufferLike> for Node 22's DOM BlobPart type.
             form.set(field, new Blob([new Uint8Array(buffer)]), fileName);
             if (ref.caption)
@@ -266,7 +332,11 @@ export class TelegramSender {
                 method: 'POST',
                 body: form,
             });
-            await this.assertOk(response, method);
+            await this.finishSend(response, {
+                chatId,
+                method,
+                ...(replyToMessageId !== undefined ? { replyToMessageId } : {}),
+            });
         }, this.retry);
     }
     /**
@@ -288,6 +358,31 @@ export class TelegramSender {
     /** Compose a Bot API endpoint URL. Contains the token — never log this. */
     endpoint(method) {
         return `${TELEGRAM_API_BASE}/bot${this.botToken}/${method}`;
+    }
+    /**
+     * Settle one send response: reject a non-2xx through {@link assertOk}, read
+     * the sent `message_id`, and — when a quote was requested — record whether
+     * Telegram actually applied it.
+     *
+     * `quoteApplied` is the observable verdict, not our intent: the Bot API only
+     * echoes `result.reply_to_message` on a message it really anchored to the
+     * quoted one, so a `false` here means the quote silently did not land (an
+     * `allow_sending_without_reply` delivery of a deleted message, or the
+     * non-standard rich endpoint ignoring `reply_parameters`). Only the chat id,
+     * the method and the anchor id are logged — never the body or the token.
+     */
+    async finishSend(response, params) {
+        await this.assertOk(response, params.method);
+        const outcome = readTelegramSendOutcome((await settleOrUndefined(response.json())));
+        if (params.replyToMessageId !== undefined) {
+            logger.info({
+                chatId: params.chatId,
+                method: params.method,
+                replyToMessageId: params.replyToMessageId,
+                quoteApplied: outcome.quoteApplied,
+            }, 'Telegram outbound reply quote');
+        }
+        return outcome.messageId !== undefined ? { messageId: outcome.messageId } : undefined;
     }
     /**
      * Throw on a non-2xx Telegram response. The thrown error carries `status` so
@@ -348,28 +443,75 @@ async function readTelegramErrorDetail(response) {
     };
 }
 /**
+ * One quote per reply: the first thing a reply actually sends carries the
+ * `reply_parameters`, and everything after it continues the same reply instead
+ * of pointing back at the original message again.
+ */
+export class SingleReplyQuote {
+    replyToMessageId;
+    used = false;
+    constructor(replyToMessageId) {
+        this.replyToMessageId = replyToMessageId;
+    }
+    /** The anchor for the next send, or `undefined` once it has been used. */
+    take() {
+        if (this.used)
+            return undefined;
+        this.used = true;
+        return this.replyToMessageId;
+    }
+}
+/**
+ * Coerce an inbound `ctx.sourceMessageId` into the numeric `message_id` a Bot
+ * API `reply_parameters` needs. `undefined` for empty / non-numeric input so
+ * callers simply omit the quote.
+ */
+export function toTelegramReplyAnchor(sourceMessageId) {
+    return toPositiveIntId(sourceMessageId);
+}
+/**
+ * Bot API `reply_parameters` quoting one inbound message.
+ * `allow_sending_without_reply` keeps the reply deliverable when the quoted
+ * message was deleted in the meantime — a quote is never worth losing a reply.
+ */
+function toReplyParameters(replyToMessageId) {
+    if (replyToMessageId === undefined || !Number.isInteger(replyToMessageId))
+        return undefined;
+    return { message_id: replyToMessageId, allow_sending_without_reply: true };
+}
+/**
  * Coerce an inbound thread id into the numeric `message_thread_id` Telegram's
  * Bot API expects. `ChannelContext.threadId` is a string (unified across
  * platforms); Telegram forum topic ids are integers. Returns `undefined` for
  * empty / non-numeric input so callers simply omit the field.
  */
 function toMessageThreadId(value) {
+    return toPositiveIntId(value);
+}
+/**
+ * The Bot API takes message and thread ids as positive integers, while the
+ * unified channel context carries both as strings. Empty, non-numeric and
+ * non-positive input all read as "no id", so callers simply omit the field.
+ */
+function toPositiveIntId(value) {
     if (value === undefined)
         return undefined;
-    const trimmed = value.trim();
-    if (!trimmed)
-        return undefined;
-    const parsed = Number(trimmed);
+    const parsed = Number(value.trim());
     return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
 }
-async function readTelegramMessageId(response) {
-    const json = (await settleOrUndefined(response.json()));
+/**
+ * Read one successful send response: the sent `message_id` plus whether
+ * Telegram echoed `result.reply_to_message`, which it only does for a message
+ * it actually anchored to the quoted one.
+ */
+function readTelegramSendOutcome(json) {
     if (!isRecord(json) || !isRecord(json.result))
-        return undefined;
+        return { quoteApplied: false };
     const messageId = json.result.message_id;
-    if (typeof messageId !== 'number' || !Number.isFinite(messageId))
-        return undefined;
-    return { messageId };
+    return {
+        ...(typeof messageId === 'number' && Number.isFinite(messageId) ? { messageId } : {}),
+        quoteApplied: isRecord(json.result.reply_to_message),
+    };
 }
 function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);

@@ -56,7 +56,6 @@ export function createLocalSkillService(deps) {
             });
         },
         listRuntimeSkills: (scope) => runtime.listRuntimeSkills(scope),
-        renderCatalog: (scope) => runtime.renderCatalog(scope),
         readSkillByName: (name, scope) => runtime.readSkillByName(name, scope),
         async getSkill(input, options = {}) {
             return runtime.withRegistry(async (lease) => {

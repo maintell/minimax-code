@@ -1,12 +1,14 @@
 import { BUNNY_AGENT_NAME, isBunnyAgentName } from '@mavis/shared/agent-avatar';
+import { isBunnyVerdictGateEnabledInConfig } from '@mavis/config';
 import { assignmentTaskId, createMainSessionIndex, sweepSessionOrphans, } from '../../service/session-system/index.js';
 import { assistantReplyProgress, isUserSourcedWakeReason, } from '../../service/turn-system/index.js';
 import { initializeBunny, createBunnyResetData, createBunnyFeedbackReport, createBunnyRoundBudgetObserver, recordingBunnyTraceSink, BunnyTelemetry, BunnyTraceStore, BunnyWorklineService, markBunnyFirstUse, } from '../../service/bunny/index.js';
 import { createRuntimeGlobalEventWriter } from '../events.js';
-import { initializeAssignments, clearDeliveryBaselines, createAssignmentFacts, exportDeliveryBaselines, ownContextState, ownGoalState, readAssignmentAssets, spaceContextKey, } from '../../service/assignment/index.js';
-import { SPACE_CONTEXT_NOTICE_HINT, SPACE_CREATE_NEEDS_USER, } from '../../service/coordinator-text/index.js';
+import { initializeAssignments, clearDeliveryBaselines, createAssignmentFacts, exportDeliveryBaselines, ownContextState, ownGoalState, readAssignmentAssets, resolveApprovalProject, sessionCreateProject, spaceContextKey, } from '../../service/assignment/index.js';
+import { SPACE_CONTEXT_NOTICE_HINT } from '../../service/coordinator-text/index.js';
 import { toAssignmentStateView } from './wire.js';
 import { BunnyTurnSilenceObserver } from './bunny-turn-silence.js';
+import { createBunnyBackgroundReplyChannel } from './bunny-background-reply-channel.js';
 import { scopeCoordinatorTurnObservers, scopeCoordinatorTurnTiming, } from './coordinator-turn-scope.js';
 import { bindLateBunnyState, composeBunnyStateDelivery, } from './assignment-snapshot-product.js';
 import { clearWorkingStateLedger, exportWorkingStateLedger, } from '../../service/working-state/index.js';
@@ -36,16 +38,6 @@ function spaceTools(system, worklines, assignments, requireCaller) {
             const { artifacts } = await system.artifactCatalog.list({ spaceId, limit: 10 });
             return { ...detail, tasks: tasks.map(toAssignmentStateView), assets: artifacts };
         },
-        listProjects: async ({ callerSessionId }) => {
-            await requireCaller(callerSessionId);
-            return {
-                projects: (await assignments.projects()).map((project) => ({
-                    name: project.workspaceDir.split(/[\\/]/).at(-1),
-                    path: project.workspaceDir,
-                    lastActiveAtMs: project.latestActivityAtMs,
-                })),
-            };
-        },
     };
 }
 /**
@@ -56,6 +48,7 @@ function spaceTools(system, worklines, assignments, requireCaller) {
 export function assignmentTools(service, dispatched, called = () => undefined, triggerOf = () => 'unknown') {
     return {
         summarizeAssignments: (input) => service.summarize(input),
+        claimAssignmentVerdict: (input) => service.claimVerdict(input),
         cancelAssignment: async ({ reason, ...input }) => ({
             assignment: toAssignmentStateView(await service.setCompletion({
                 ...input,
@@ -69,7 +62,9 @@ export function assignmentTools(service, dispatched, called = () => undefined, t
             called('stop');
             return { assignment: toAssignmentStateView(stopped) };
         },
-        resolveAssignmentProject: (caller, input) => service.resolveAssignmentProject(caller, input),
+        resolveAssignmentProject: (caller, toolName, args) => resolveApprovalProject(service, caller, toolName, args),
+        // Not a Bunny tool: session_create of any Agent names its project through it.
+        resolveSessionProject: (project) => sessionCreateProject(service, project),
         createAssignment: async (input, signal) => {
             signal?.throwIfAborted();
             const accepted = await service.createFromTool({
@@ -89,22 +84,14 @@ export function assignmentTools(service, dispatched, called = () => undefined, t
         },
     };
 }
-/** Spaces belong to the user (B7): Bunny never creates one; a goal it changes is absorbed. */
 /**
- * R3.5: Bunny creates a space only after the user agreed. The backend check is
- * that the calling Turn took the user's own input (a message, a steered
- * message or a questionnaire answer); a Turn woken only by a task report,
- * schedule or other system event cannot create one.
+ * Bunny creates a space whenever a task it dispatches belongs to none, in any Turn: a Turn woken
+ * by a task report or a schedule creates one too. A goal it changes is absorbed.
  */
-function worklineTools(worklines, requireCaller, goalChanged, userInputTurns) {
+function worklineTools(worklines, requireCaller, goalChanged) {
     return {
-        createWorkline: async ({ callerSessionId, callerTurnId, ...input }) => {
+        createWorkline: async ({ callerSessionId, ...input }) => {
             await requireCaller(callerSessionId);
-            if (!callerTurnId || !userInputTurns?.has(callerTurnId))
-                throw Object.assign(new Error(SPACE_CREATE_NEEDS_USER), {
-                    status: 409,
-                    code: 'BUNNY_SPACE_CREATE_NEEDS_USER',
-                });
             return { space: await worklines.create(input) };
         },
         updateWorkline: async ({ callerSessionId, workline_id, ...input }) => {
@@ -247,7 +234,7 @@ async function sweepAssignmentOrphans(options, sessionSystem, logger, signal) {
         logger.warn({ error: error instanceof Error ? error.message : String(error) }, 'Assignment orphan sweep failed; it runs again at the next startup');
     }
 }
-/** How many recent user-input Turns are remembered; space create runs in the Turn itself. */
+/** How many recent Turns are remembered; a dispatch runs in the Turn itself. */
 const USER_INPUT_TURN_LIMIT = 64;
 /**
  * The recent Bunny Turns that took the user's own input, newest last, and what woke each
@@ -264,9 +251,6 @@ export class UserInputTurns {
             if (oldest !== undefined)
                 this.turns.delete(oldest);
         }
-    }
-    has(turnId) {
-        return this.turns.has(turnId);
     }
     /** A Turn was prepared with these wake reasons. */
     woke(turnId, reasons) {
@@ -361,7 +345,7 @@ export function bindLateBunnyOwners(ownership, timing = {}) {
         mayCoordinate: observers.mayCoordinate,
         ports: {
             bunnyPermissionMode: () => get().bunny.permissionMode(),
-            resolveAssignmentProject: (caller, input) => get().assignments.resolveAssignmentProject(caller, input),
+            resolveAssignmentProject: (caller, toolName, args) => resolveApprovalProject(get().assignments, caller, toolName, args),
             // A Turn can settle before the owners are bound; nothing is published then.
             assignmentTurnSettled: (sessionId) => owners?.assignments.turnSettled(sessionId),
             bunnyStateObserver: observers.state,
@@ -430,6 +414,17 @@ function composeBunnyFeedback(options, sessionSystem, owners, nowMs) {
  * so a retired MiniMax model never silently turns into another provider's
  * Runtime default.
  */
+/**
+ * Whether config.yaml turns the async review gate on, read from the model-system view of the
+ * runtime config.
+ *
+ * The `bunny` section is not part of that view, so the value is widened in here; the rule itself
+ * lives in `@mavis/config` with the two other readers, so the three cannot drift. A host that
+ * injects no runtime config leaves the gate off, which is today's behaviour.
+ */
+function readBunnyVerdictGate(config) {
+    return isBunnyVerdictGateEnabledInConfig(config);
+}
 function bunnyTaskSelection(model, config, logger) {
     const replacement = config ? resolveSavedAgentModelReplacement(config, model) : undefined;
     if (replacement) {
@@ -581,7 +576,6 @@ export function composeBunnyOwners(options, sessionSystem, owners, nowMs) {
         },
         roots: bunnyRoots(sessionSystem, owners),
         withMemoryLock: options.withMemoryLock,
-        ensureDefaultSpace: () => sessionSystem.artifactCatalog.library.ensureDefault(),
         resetData: composeBunnyResetData(options, sessionSystem, owners),
         logger,
         ...withTaskModelCheck(owners, logger),
@@ -622,11 +616,22 @@ export function composeBunnyOwners(options, sessionSystem, owners, nowMs) {
         events: options.eventBus,
         logger,
         nowMs,
+        // Off unless config.yaml sets bunny.verdictGate: a task Bunny dispatched a review for
+        // may only be concluded once that review reported a verdict and Bunny read it.
+        verdictGate: () => readBunnyVerdictGate(owners.modelConfig?.()),
     }, (status) => publish({
         type: 'assignment.updated',
         payload: { assignment: toAssignmentStateView(status) },
     }));
-    options.bindClosedTaskBackgroundRoute?.(assignments.closedTaskBackground);
+    options.bindClosedTaskBackgroundRoute?.({
+        deliver: (ownerSessionId, tasks) => assignments.closedTaskBackground.deliver(ownerSessionId, tasks),
+        // A wake for background tasks Bunny started from an IM chat also replies there.
+        replyChannel: createBunnyBackgroundReplyChannel({
+            sessions: sessionSystem.repositories.sessions,
+            root: sessionSystem.sessions.root,
+            messages: sessionSystem.repositories.messages,
+        }),
+    });
     const bunnyState = composeBunnyState(options, sessionSystem, owners, {
         stateView: assignments.stateView,
         viewState: () => bunny.viewState(),
@@ -640,7 +645,7 @@ export function composeBunnyOwners(options, sessionSystem, owners, nowMs) {
             throw new Error('Only bunny sessions can manage worklines');
     };
     options.compatibility.bindAssignmentTools?.({
-        ...worklineTools(worklines, requireBunnyCaller, absorbed.goal, options.userInputTurns),
+        ...worklineTools(worklines, requireBunnyCaller, absorbed.goal),
         ...spaceTools(sessionSystem, worklines, assignments.service, requireBunnyCaller),
         ...taskModelTools({
             bunny,

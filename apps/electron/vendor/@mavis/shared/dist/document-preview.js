@@ -1,7 +1,7 @@
 /** Versioned contracts shared by document preview hosts and renderers. */
 import { PPTX_PREVIEW_LIMITS_V1 } from './pptx-preview-limits.generated.js';
 import { normalizePptxErrorTraceV1 } from './pptx-telemetry.js';
-export { PPTX_PREVIEW_LIMITS_SCHEMA_V1, PPTX_PREVIEW_LIMITS_VERSION_V1, PPTX_PREVIEW_LIMITS_V1, } from './pptx-preview-limits.generated.js';
+export { isPptxStoredMediaEntryV1, PPTX_PREVIEW_LIMITS_SCHEMA_V1, PPTX_PREVIEW_LIMITS_VERSION_V1, PPTX_PREVIEW_LIMITS_V1, } from './pptx-preview-limits.generated.js';
 /** Product-owned identity for the renderer that exposes PPTX as selectable DOM. */
 export const PPTX_DOM_BACKEND_ID_V1 = 'pptx-dom';
 export const PPTX_CORE_BACKEND_ID_V1 = 'pptx-core';

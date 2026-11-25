@@ -36,6 +36,9 @@ export class ProjectController extends ProjectControllerBase {
     async setProjectHidden(ctx, req) {
         return this.requireApplication().setProjectHidden(ctx, req);
     }
+    async moveSidebarProject(ctx, req) {
+        return this.requireApplication().moveSidebarProject(ctx, req);
+    }
     async putProjectsOrder(ctx, req) {
         return this.requireApplication().putProjectsOrder(ctx, req);
     }

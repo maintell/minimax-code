@@ -85,6 +85,7 @@ export class LocalModelResolver {
             : this.defaultApi;
         const resolved = this.finishResolve({
             sessionId: input.sessionId,
+            turnId: input.turnId,
             agentConfig: input.agentConfig,
             ...identity,
             api,
@@ -118,6 +119,7 @@ export class LocalModelResolver {
         this.logRoute(selected.identity.provider, selected.identity.modelId, selected.route);
         const resolved = this.finishResolve({
             sessionId: input.sessionId,
+            turnId: input.turnId,
             agentConfig: input.agentConfig,
             ...selected.identity,
             managedProvider: false,
@@ -164,6 +166,7 @@ export class LocalModelResolver {
         this.logRoute(provider, modelId, providerRouteForAuthMode(credentials.authMode));
         return this.finishResolve({
             sessionId: input.sessionId,
+            turnId: input.turnId,
             agentConfig: input.agentConfig,
             ...identity,
             api: limits.api ?? this.defaultApi,
@@ -219,6 +222,7 @@ export class LocalModelResolver {
                 managedProvider: input.managedProvider,
                 routingContext: input.routingContext,
                 sessionId: input.sessionId,
+                turnId: input.turnId,
                 agentId: readAgentHeaderId(input.agentConfig),
             }),
             ...(fileApiGatewayAuth ? { fileApiGatewayAuth } : {}),
@@ -442,7 +446,8 @@ function exposedThinkingLevel(context) {
     return context.shouldExposeLevel && context.piLevel ? { exposedLevel: context.piLevel } : {};
 }
 function thinkingLevelMapFields(context) {
-    return context.enabled && context.protocolThinking
+    return (context.enabled || context.protocolThinking?.enabled === false) &&
+        context.protocolThinking
         ? { thinkingLevelMap: context.protocolThinking.thinkingLevelMap }
         : {};
 }

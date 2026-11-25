@@ -1,7 +1,9 @@
 import { buildRunningSessionStatusEvent } from '../event-bridge/index.js';
+import { decideContentReview, parseContentReviewError, } from './content-review.js';
 import { isLLMRequestStoppedMessage } from './llm-retry.js';
 import { llmCallPreemptedNotice } from './llm-preemption.js';
 import { immediateSendBatchId } from './outbound-message-normalizer.js';
+import { replaceAssistantText } from './replace-text.js';
 import { failureReason } from './terminal.js';
 /** Bounds a turn-failure hook that keeps asking to recover. */
 const MAX_TURN_FAILURE_RECOVERIES = 4;
@@ -174,10 +176,7 @@ export function subscribeEvents(agent, turn, history, nowMs) {
             if (!decision || decision.type === 'continue')
                 continue;
             if (decision.type === 'replaceText') {
-                event.message.content = [
-                    ...event.message.content.filter((block) => block.type !== 'text'),
-                    { type: 'text', text: decision.text },
-                ];
+                event.message.content = replaceAssistantText(event.message.content, decision.text);
                 continue;
             }
             if (decision.type === 'retry') {
@@ -237,6 +236,74 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         const normalized = turn.metrics.getLLMFailureObservation()?.normalized;
         const recovered = await recoverTurnFailure(event.message, { kind: 'provider_error', errorMessage, ...(normalized ? { normalized } : {}) }, failureReason(errorMessage, normalized), errorMessage);
         return recovered ? 'discard' : 'emit';
+    };
+    /**
+     * 网关 content_error：先于 afterLlmCall hook 处理，不交给 recover。被打回的这条回复一律丢弃
+     * （不发完成事件、不进历史）；action=4 且预算内时登记重发，由 runAgent 从同一份 transcript 重发，
+     * 其他结果记为本轮结果。每次都先通知调用方，带上这条消息的 id 供撤回。
+     */
+    const applyContentReview = async (event) => {
+        const message = event.message;
+        if (message.role !== 'assistant')
+            return false;
+        const state = turn.contentReview;
+        const error = parseContentReviewError(message);
+        if (!error) {
+            if (message.stopReason !== 'error' && message.stopReason !== 'aborted') {
+                state.regenerations = 0;
+            }
+            return false;
+        }
+        const regenerations = state.regenerations;
+        const kind = decideContentReview(error, {
+            regenerations,
+            maxRegenerations: state.options?.maxRegenerations ?? 0,
+            aborted: turn.input.signal?.aborted === true,
+        });
+        const assistantMessageId = turn.bridge.getActiveAssistantMessageId();
+        const rejection = {
+            kind,
+            ...(assistantMessageId ? { assistantMessageId } : {}),
+            ...(error.requestId ? { requestId: error.requestId } : {}),
+            ...(error.code === undefined ? {} : { code: error.code }),
+            ...(error.action === undefined ? {} : { action: error.action }),
+            ...(kind === 'replace' && error.suggestion ? { suggestion: error.suggestion } : {}),
+            regenerations,
+        };
+        if (kind === 'regenerate') {
+            state.regenerations = regenerations + 1;
+            state.pending = {
+                attempt: regenerations + 1,
+                ...(error.requestId ? { requestId: error.requestId } : {}),
+                guidePrompt: error.guidePrompt ?? state.options.defaultGuidePrompt,
+            };
+        }
+        else {
+            state.regenerations = 0;
+            state.outcome = rejection;
+            if (error.message !== undefined)
+                state.message = error.message;
+        }
+        turn.logger.info({
+            session_id: turn.input.sessionId,
+            turn_id: turn.input.turnId,
+            kind,
+            code: error.code,
+            action: error.action,
+            request_id: error.requestId,
+            regenerations,
+        }, '[pi-turn-runner] gateway rejected the model response');
+        try {
+            await state.options?.onRejected?.(rejection);
+        }
+        catch (err) {
+            turn.logger.error({
+                session_id: turn.input.sessionId,
+                turn_id: turn.input.turnId,
+                error: err instanceof Error ? err.message : String(err),
+            }, '[pi-turn-runner] content review rejection callback threw; continuing');
+        }
+        return true;
     };
     /**
      * A request the host refused to send (its request budget closed while a
@@ -458,6 +525,13 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         if (requiresPtcLifecycleDelivery(event, turn) && !turn.bridge.getActiveAssistantMessageId()) {
             throw new Error('PTC lifecycle delivery requires an active assistant message id.');
         }
+        // Read before the bridge closes the message: a message without tool calls
+        // drops its id as soon as its completed frame is built.
+        const endedAssistantId = event.type === 'message_end' &&
+            event.message.role === 'assistant' &&
+            event.message.stopReason !== 'aborted'
+            ? turn.bridge.getActiveAssistantMessageId()
+            : undefined;
         let out;
         try {
             out = await turn.bridge.processEvent(event, observedAtMs);
@@ -465,6 +539,9 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         catch (err) {
             turn.metrics.recordDegradation('event_bridge', 'translation', err);
             throw err;
+        }
+        if (endedAssistantId && event.type === 'message_end') {
+            turn.assistantMessageIds.set(event.message, endedAssistantId);
         }
         if (out.requestAssistantMessageId) {
             // The bridge may ask for the assistant message id before it can emit
@@ -500,6 +577,14 @@ export function subscribeEvents(agent, turn, history, nowMs) {
         }
     };
     const onAgentEvent = async (event, observedAtMs) => {
+        // A yielded run writes nothing more: the resuming run re-emits what it
+        // owns. History still flows so the host fence keeps settled tool results.
+        if (turn.input.isYieldStopped?.() === true) {
+            if (event.type === 'message_end' || event.type === 'tool_execution_end') {
+                await history.flushTail();
+            }
+            return;
+        }
         let discardMessage = false;
         if (event.type === 'tool_execution_start' &&
             !event.parentToolCallId &&
@@ -513,7 +598,8 @@ export function subscribeEvents(agent, turn, history, nowMs) {
             }
             else if (event.type === 'message_end') {
                 discardMessage =
-                    isRefusedRequestFailure(event.message) ||
+                    (await applyContentReview(event)) ||
+                        isRefusedRequestFailure(event.message) ||
                         (await applyAfterLlmControl(event)) === 'discard';
                 if (discardMessage)
                     discardAssistantMessage(event);

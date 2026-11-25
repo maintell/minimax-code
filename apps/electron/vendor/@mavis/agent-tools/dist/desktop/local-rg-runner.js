@@ -8,8 +8,10 @@
 import { spawn } from 'node:child_process';
 import { existsSync, statSync } from '../shared/physical-fs.js';
 import { createRequire } from 'node:module';
-import { basename, dirname, isAbsolute, resolve } from 'node:path';
+import { basename, dirname } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { resolveSearchRoot } from '../core-tools/paths.js';
+export { resolveSearchRoot, textResult } from '../core-tools/paths.js';
 const PATH_RG_FALLBACK = 'rg';
 const ASAR_PATH_PATTERN = /\.asar([/\\])/;
 const DEFAULT_RG_TIMEOUT_MS = 30_000;
@@ -59,11 +61,6 @@ function getRgBinary() {
         cachedRgBinary = resolveRgBinaryPath(readBundledRgPath, existsSync);
     }
     return cachedRgBinary;
-}
-export function resolveSearchRoot(workspaceRoot, inputPath) {
-    if (!inputPath?.trim())
-        return resolve(workspaceRoot);
-    return isAbsolute(inputPath) ? resolve(inputPath) : resolve(workspaceRoot, inputPath);
 }
 /**
  * Resolve a grep target to an rg cwd + search path. A directory searches `.`
@@ -258,12 +255,5 @@ export function runRg(args, cwd, opts = {}) {
             });
         });
     });
-}
-export function textResult(toolName, text) {
-    return {
-        tool_name: toolName,
-        text,
-        content: [{ type: 'text', text }],
-    };
 }
 //# sourceMappingURL=local-rg-runner.js.map

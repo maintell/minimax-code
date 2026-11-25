@@ -1,4 +1,4 @@
-import { projectAgentMessagesForModel } from '@mavis/agent-core/pi-turn-runner';
+import { omitUnsampleableVideosForModel, projectAgentMessagesForModel, } from '@mavis/agent-core/pi-turn-runner';
 import { SEGMENT_PROTOCOL, buildSegmentControlText, buildSegmentSharedPrefixControlText, } from '../../../coordinator-text/index.js';
 import { buildIsolatedTranscript } from './algorithm/transcript.js';
 import { fingerprintRequest, firstRequestDifference, } from './request-fingerprint.js';
@@ -74,8 +74,9 @@ function controlMessage(text, projected) {
 async function send(input, context, signal, options) {
     let final;
     let sent;
+    const request = await withSampleableVideos(context, input.model);
     try {
-        const stream = await input.streamFn(input.model, context, streamOptions(input, signal, options.sessionId, (payload) => {
+        const stream = await input.streamFn(input.model, request, streamOptions(input, signal, options.sessionId, (payload) => {
             sent = fingerprintRequest(payload);
         }));
         final = await stream.result();
@@ -90,6 +91,17 @@ async function send(input, context, signal, options) {
         throw new SegmentCheckpointRequestError('provider_error', final.errorMessage ?? 'provider error');
     }
     return { final, sent };
+}
+/**
+ * The main request replaces a video the provider would reject (a broken
+ * container, a frame sampling or length rule) in its own copy only; the
+ * records keep it, so the compaction request repeats that replacement.
+ */
+async function withSampleableVideos(context, model) {
+    const sampled = await omitUnsampleableVideosForModel(context.messages, model);
+    if (sampled.omittedCount + sampled.brokenCount + sampled.limitedCount === 0)
+        return context;
+    return { ...context, messages: sampled.messages };
 }
 function streamOptions(input, signal, sessionId, sent) {
     return {

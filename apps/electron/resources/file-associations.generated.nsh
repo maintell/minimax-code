@@ -157,4 +157,9 @@
   !insertmacro ${ACTION} "msg"
   !insertmacro ${ACTION} "mbox"
   !insertmacro ${ACTION} "skill"
+  !insertmacro ${ACTION} "stl"
+  !insertmacro ${ACTION} "step"
+  !insertmacro ${ACTION} "stp"
+  !insertmacro ${ACTION} "pcraft"
+  !insertmacro ${ACTION} "ccproj"
 !macroend

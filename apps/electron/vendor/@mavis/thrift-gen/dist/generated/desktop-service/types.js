@@ -123,6 +123,17 @@ export const PluginShowcaseMediaType = {
     EXCEL: 5,
     PDF: 6,
 };
+export const PluginPostInstallActionType = {
+    OPEN_URL: 1,
+    OPEN_SETTINGS: 2,
+};
+export const PluginPostInstallBrowser = {
+    CHROME: 1,
+    EDGE: 2,
+};
+export const PluginPostInstallSettingsPage = {
+    BROWSER: 1,
+};
 export const InstalledPluginSource = {
     OFFICIAL: 1,
     LOCAL: 2,
@@ -265,6 +276,113 @@ export const LocalHookSource = {
     USER: 1,
     PROJECT: 2,
     PLUGIN: 3,
+};
+export const CodeHostPlatform = {
+    CODE_HOST_PLATFORM_UNSPECIFIED: 0,
+    GITLAB: 1,
+    GITHUB: 2,
+};
+export const CodeHostCliState = {
+    CODE_HOST_CLI_STATE_UNSPECIFIED: 0,
+    READY: 1,
+    NOT_INSTALLED: 2,
+    NOT_AUTHENTICATED: 3,
+    UNAVAILABLE: 4,
+};
+export const MergeRequestLinkSource = {
+    MERGE_REQUEST_LINK_SOURCE_UNSPECIFIED: 0,
+    CURRENT_BRANCH: 1,
+    BRANCH: 2,
+    CREATED: 3,
+    MANUAL: 4,
+};
+export const MergeRequestState = {
+    MERGE_REQUEST_STATE_UNSPECIFIED: 0,
+    OPEN: 1,
+    MERGED: 2,
+    CLOSED: 3,
+};
+export const MergeRequestStatus = {
+    MERGE_REQUEST_STATUS_UNSPECIFIED: 0,
+    READY_TO_MERGE: 1,
+    PIPELINE_FAILED: 2,
+    CONFLICT: 3,
+    CHANGES_REQUESTED: 4,
+    UNRESOLVED_DISCUSSIONS: 5,
+    PIPELINE_RUNNING: 6,
+    WAITING_FOR_APPROVAL: 7,
+    DRAFT: 8,
+    BLOCKED: 9,
+    MERGED: 10,
+    CLOSED: 11,
+};
+export const MergeRequestBlocker = {
+    MERGE_REQUEST_BLOCKER_UNSPECIFIED: 0,
+    DRAFT: 1,
+    PIPELINE_FAILED: 2,
+    PIPELINE_RUNNING: 3,
+    DISCUSSIONS_UNRESOLVED: 4,
+    APPROVAL_REQUIRED: 5,
+    CHANGES_REQUESTED: 6,
+    CONFLICT: 7,
+    NEED_REBASE: 8,
+    CHECKING: 9,
+    OTHER: 10,
+};
+export const MergeRequestCheckStatus = {
+    MERGE_REQUEST_CHECK_STATUS_UNSPECIFIED: 0,
+    PENDING: 1,
+    RUNNING: 2,
+    SUCCESS: 3,
+    FAILED: 4,
+    CANCELED: 5,
+    SKIPPED: 6,
+    MANUAL: 7,
+};
+export const MergeRequestReviewState = {
+    MERGE_REQUEST_REVIEW_STATE_UNSPECIFIED: 0,
+    REQUESTED: 1,
+    APPROVED: 2,
+    CHANGES_REQUESTED: 3,
+    COMMENTED: 4,
+};
+export const MergeRequestMergeMethod = {
+    MERGE_REQUEST_MERGE_METHOD_UNSPECIFIED: 0,
+    MERGE: 1,
+    SQUASH: 2,
+    REBASE: 3,
+    FAST_FORWARD: 4,
+};
+export const MergeRequestStateEvent = {
+    MERGE_REQUEST_STATE_EVENT_UNSPECIFIED: 0,
+    CLOSE: 1,
+    REOPEN: 2,
+};
+export const MergeRequestFileChangeKind = {
+    MERGE_REQUEST_FILE_CHANGE_KIND_UNSPECIFIED: 0,
+    ADDED: 1,
+    MODIFIED: 2,
+    DELETED: 3,
+    RENAMED: 4,
+};
+export const MergeRequestCleanupBlocker = {
+    MERGE_REQUEST_CLEANUP_BLOCKER_UNSPECIFIED: 0,
+    UNCOMMITTED_CHANGES: 1,
+    UNPUSHED_COMMITS: 2,
+    OTHER_SESSIONS: 3,
+    SESSION_RUNNING: 4,
+    MAIN_CHECKOUT: 5,
+    BRANCH_NOT_CHECKED_OUT: 6,
+    OTHER: 7,
+};
+export const MergeRequestCandidateReason = {
+    MERGE_REQUEST_CANDIDATE_REASON_UNSPECIFIED: 0,
+    EXACT: 1,
+    MINE_IN_REPOSITORY: 2,
+    MINE: 3,
+    REVIEW_REQUESTED: 4,
+    IN_REPOSITORY: 5,
+    SEARCH: 6,
 };
 export const FeedbackStatus = {
     FEEDBACK_STATUS_UNSPECIFIED: 0,

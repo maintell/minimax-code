@@ -1,5 +1,4 @@
-import { isUserSteeringProducer } from '../../agent-host/contracts.js';
-import { captureAgentHostSteeringInput } from '../../agent-host/canonical-user-input.js';
+import { isUserSteeringProducer, captureAgentHostSteeringInput, } from '@mavis/harness';
 import { resolveGenuineUserQueryText } from '../message-query-authorship.js';
 import { steeringMessageKey, steeringReceiptId } from '../../steering-identity.js';
 import { createUserMessageId } from '../../../session-system/index.js';

@@ -1,18 +1,21 @@
 import { homedir } from 'node:os';
 import { createToolPermissionContext, PermissionEngine, } from '@mavis/permission';
+import { emitPermissionCheckMetric, engineDecisionSource, } from '../permission/index.js';
 import { MiniAppToolError, } from './contracts.js';
 const ARGUMENTS_PREVIEW_MAX_CHARS = 2_000;
 /**
  * The Agent permission rules as they apply to `context.tool`: the same rule file and engine, but
  * only global rules and the global mode. `auto` has no classifier here, so its asks reach the
- * Host prompt; `off` and "always allow" never ask, and only a deny survives them.
+ * Host prompt; `off` and "always allow" never ask, and only a deny survives them. Only per-call
+ * checks reach `permission_check_total`: `snapshot()` previews tools for `list()` / `request()`.
  */
 export function createMiniAppToolPermissions(rules) {
     const engine = new PermissionEngine();
-    const snapshot = async () => {
-        const mode = readPermissionMode(rules.readPermissionMode());
-        if (mode === 'off')
-            return { check: () => 'allow' };
+    const readJudge = async (mode) => {
+        if (mode === 'off') {
+            const judge = () => ({ verdict: 'allow', source: 'mode_off' });
+            return judge;
+        }
         const dataDir = rules.readDataDir();
         const context = createToolPermissionContext({
             mode: mode === 'acceptEdits' ? 'default' : mode,
@@ -23,18 +26,42 @@ export function createMiniAppToolPermissions(rules) {
             homeDir: homedir(),
         });
         const policyOwner = rules.readPolicyOwner();
-        return {
-            check(name, input) {
-                const decision = engine.checkPermission(name, { ...input }, context, { policyOwner });
-                if (decision.behavior === 'ask' && mode === 'bypassPermissions')
-                    return 'allow';
-                return decision.behavior;
-            },
+        const judge = (name, input) => {
+            const decision = engine.checkPermission(name, { ...input }, context, { policyOwner });
+            if (decision.behavior === 'ask' && mode === 'bypassPermissions') {
+                return { verdict: 'allow', source: 'ask_gate_bypass' };
+            }
+            return { verdict: decision.behavior, source: engineDecisionSource(decision) };
         };
+        return judge;
     };
+    const currentMode = () => readPermissionMode(rules.readPermissionMode());
+    const report = (mode, toolName, judged) => emitPermissionCheckMetric(rules.readMetricsClient?.(), {
+        mode,
+        result: judged.verdict,
+        source: judged.source,
+        toolName,
+        platform: process.platform,
+    });
     return {
-        check: async (name, input) => (await snapshot()).check(name, input),
-        snapshot,
+        check: async (name, input) => {
+            const mode = currentMode();
+            let judged;
+            try {
+                judged = (await readJudge(mode))(name, input);
+            }
+            catch (error) {
+                // The caller turns an unreadable rule store into an ask.
+                report(mode, name, { verdict: 'ask', source: 'store_unhealthy' });
+                throw error;
+            }
+            report(mode, name, judged);
+            return judged.verdict;
+        },
+        snapshot: async () => {
+            const judge = await readJudge(currentMode());
+            return { check: (name, input) => judge(name, input).verdict };
+        },
         allowAlways: (name) => rules.addGlobalAllowRule(name),
     };
 }

@@ -5,7 +5,9 @@ import { ConnectorCloudClient } from './app/cloud-client.js';
 import { PluginSystemCloudTransport } from './cloud-transport.js';
 import { createMiniAppPluginMcpTools } from './mcp/miniapp-plugin-mcp-tools.js';
 import { createPluginMcpAuthPort, PluginMcpCredentials } from './mcp/oauth.js';
+import { createPluginMcpCallSource } from './mcp/plugin-mcp-call-source.js';
 import { PluginMcpRuntime } from './mcp/runtime.js';
+import { PluginSessionOverlays } from './mcp/session-overlays.js';
 import { GithubPluginImporter } from './plugin/import/github-plugin-importer.js';
 import { createPluginMarketplaceService } from './plugin/marketplace/marketplace-service.js';
 import { PluginDesktopFacade } from './plugin/runtime/desktop-facade.js';
@@ -13,7 +15,9 @@ import { OfficialPluginAuthBarrier, resolveOfficialPluginAuthState, } from './pl
 import { OfficialPluginReconciler } from './plugin/runtime/official-reconciler.js';
 import { PluginRegistryClient } from './plugin/runtime/registry-client.js';
 import { SqlitePluginRepository } from './plugin/runtime/repository.js';
+import { PluginSnapshotBuilder } from './plugin/runtime/snapshot-builder.js';
 import { PluginSystem } from './plugin-system.js';
+import { normalizedPluginName } from './plugin-system-helpers.js';
 /** Assembles Plugin/App state over public host ports and existing v2 MCP/Skill owners. */
 export function initializePluginService(dependencies, turnCapabilities, onPluginDeactivated) {
     const metricTags = {
@@ -75,12 +79,18 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         onAuditFailure: (error) => dependencies.logger.warn({ errorType: error instanceof Error ? error.name : typeof error }, 'Host-process Connector audit failed'),
     });
     const officialCacheRoot = path.join(dependencies.dataDir, 'v2', 'plugin-cache', 'official');
+    const sessionOverlays = new PluginSessionOverlays({
+        builder: new PluginSnapshotBuilder(dependencies.mcp.getRuntimeNameRegistry()),
+        createRuntime: createPluginMcpRuntime,
+        currentBase: () => system.currentSnapshot,
+    });
     const system = new PluginSystem({
         onPluginDeactivated,
         onOfficialPluginRevoked: dependencies.onOfficialPluginRevoked,
         onCapabilitiesChanged: dependencies.onCapabilitiesChanged,
         mcpNames: dependencies.mcp.getRuntimeNameRegistry(),
         forbiddenPluginNames: dependencies.configGetter().plugins?.forbidden,
+        ...(dependencies.configGetter().plugins?.onlyOfficial ? { onlyOfficialPlugins: true } : {}),
         ...(dependencies.miniAppHostVersion
             ? { miniAppHostVersion: dependencies.miniAppHostVersion }
             : {}),
@@ -93,6 +103,7 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         listReservations: dependencies.listReservations,
         mcpRuntime: pluginMcpRuntime,
         mcpRuntimeFactory: createPluginMcpRuntime,
+        sessionOverlays,
         officialReconciler: new OfficialPluginReconciler({
             cacheRoot: officialCacheRoot,
             repository,
@@ -105,6 +116,7 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
     const unsubscribeSkillChanges = dependencies.skill.onDidChangeRuntimeSkills?.(() => system.markReservationsDirty()) ??
         (() => undefined);
     system.attachPublicationPort(turnCapabilities.attach(system));
+    const pluginMcpCalls = createPluginMcpCallSource(system);
     const marketplaces = createPluginMarketplaceService({
         dataDir: dependencies.dataDir,
         installer: system.localInstaller,
@@ -141,36 +153,22 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
         }),
         skill: dependencies.skill,
         hostConnectorGateway: hostConnectorSystem.gateway,
-        miniAppPermissionSwitches: system.miniAppPublication.permissionSwitches,
-        miniAppPluginMcp: createMiniAppPluginMcpTools(system),
-        attachMiniAppPublication: (input) => system.miniAppPublication.attach(input),
-        bindMiniAppMemory: (coordinator) => system.miniAppPublication.bindMemory(coordinator),
+        miniAppPluginMcp: createMiniAppPluginMcpTools(system, pluginMcpCalls),
         observeManagedMiniAppToolCalls: (listener) => {
             managedMiniAppToolCall = listener;
         },
-        listAcceptedMiniApps: () => system.miniAppPublication.listAcceptedMiniApps(),
-        isAcceptedMiniAppRunning: (pluginId) => system.miniAppPublication.isAcceptedMiniAppRunning(pluginId),
-        listAvailableMiniApps: () => system.miniAppPublication.listAvailableMiniApps(),
-        listAvailableMiniAppDefinitions: () => system.miniAppPublication.listAvailableDefinitions(),
-        withheldMiniAppReason: (pluginId) => system.miniAppPublication.withheldMiniAppReason(pluginId),
-        activateMiniApp: (input) => system.miniAppPublication.activate(input),
-        ensureMiniAppStarted: (input) => system.miniAppPublication.ensureStarted(input),
-        prepareMiniAppTurn: (input) => system.prepareMiniAppTurn(input),
-        initializeWorkspaceMiniApp: (input) => system.miniAppPublication.initializeWorkspace(input),
-        publishWorkspaceMiniApp: (input) => system.miniAppPublication.publishWorkspace(input),
-        restartMiniApp: (input) => system.miniAppPublication.restart(input),
-        applyUpdate: (input) => system.miniAppPublication.applyUpdate(input),
-        stopMiniApp: (input) => system.miniAppPublication.stop(input),
-        listMiniAppPermissions: (pluginId) => system.miniAppPublication.listPermissions(pluginId),
-        setMiniAppPermission: (input) => system.miniAppPublication.setPermission(input),
-        verifyMiniAppCandidate: (candidate) => system.miniAppPublication.verifyCandidate(candidate),
-        materializeMiniAppRuntimePackage: (input) => system.miniAppPublication.materializeRuntimePackage(input),
+        ...miniAppPublicationMembers(system),
         authContextChanged: () => {
             officialAuthBarrier.authContextChanged();
             hostConnectorSystem.authContextChanged();
             system.authContextChanged();
         },
-        enabledHookPluginNames: () => new Set(system.currentSnapshot.turnCapabilities.hooks?.map((handler) => handler.pluginName)),
+        enabledHookPluginNames: () => new Set((system.currentSnapshot.turnCapabilities.hooks ?? []).map((handler) => handler.pluginName)),
+        pluginMcpCalls,
+        sessionPreviews: sessionOverlays,
+        installedExtensions: system.installedExtensions,
+        assertPreviewNameAvailable: (pluginName) => system.miniAppPublication.assertPreviewNameAvailable(pluginName),
+        ...effectivePluginLookups(system),
         ready: () => {
             readyPromise ??= (async () => {
                 await system.initialize();
@@ -189,6 +187,7 @@ export function initializePluginService(dependencies, turnCapabilities, onPlugin
                         await marketplaces.dispose();
                     }
                     finally {
+                        await sessionOverlays.close();
                         await system.dispose();
                     }
                 }
@@ -229,6 +228,47 @@ export function createPluginNameReservations(skill, mcp) {
             mcpServerNames: servers.flatMap((server) => server['enabled'] !== false && typeof server['name'] === 'string' ? [server['name']] : []),
             toolNames: [],
         };
+    };
+}
+/** Mini App publication members delegated straight to the Plugin system's publication owner. */
+function miniAppPublicationMembers(system) {
+    return {
+        miniAppPermissionSwitches: system.miniAppPublication.permissionSwitches,
+        attachMiniAppPublication: (input) => system.miniAppPublication.attach(input),
+        bindMiniAppMemory: (coordinator) => system.miniAppPublication.bindMemory(coordinator),
+        listAcceptedMiniApps: () => system.miniAppPublication.listAcceptedMiniApps(),
+        isAcceptedMiniAppRunning: (pluginId) => system.miniAppPublication.isAcceptedMiniAppRunning(pluginId),
+        listAvailableMiniApps: () => system.miniAppPublication.listAvailableMiniApps(),
+        listAvailableMiniAppDefinitions: () => system.miniAppPublication.listAvailableDefinitions(),
+        withheldMiniAppReason: (pluginId) => system.miniAppPublication.withheldMiniAppReason(pluginId),
+        activateMiniApp: (input) => system.miniAppPublication.activate(input),
+        ensureMiniAppStarted: (input) => system.miniAppPublication.ensureStarted(input),
+        prepareMiniAppTurn: (input) => system.prepareMiniAppTurn(input),
+        initializeWorkspaceMiniApp: (input) => system.miniAppPublication.initializeWorkspace(input),
+        publishWorkspaceMiniApp: (input) => system.miniAppPublication.publishWorkspace(input),
+        restartMiniApp: (input) => system.miniAppPublication.restart(input),
+        applyUpdate: (input) => system.miniAppPublication.applyUpdate(input),
+        stopMiniApp: (input) => system.miniAppPublication.stop(input),
+        listMiniAppPermissions: (pluginId) => system.miniAppPublication.listPermissions(pluginId),
+        setMiniAppPermission: (input) => system.miniAppPublication.setPermission(input),
+        verifyMiniAppCandidate: (candidate) => system.miniAppPublication.verifyCandidate(candidate),
+        materializeMiniAppRuntimePackage: (input) => system.miniAppPublication.materializeRuntimePackage(input),
+    };
+}
+function effectivePluginLookups(system) {
+    const effective = (pluginName) => {
+        const key = normalizedPluginName(pluginName);
+        return system.currentSnapshot.enabledPlugins.find((candidate) => normalizedPluginName(candidate.name) === key);
+    };
+    return {
+        effectivePluginTier: (pluginName) => {
+            const plugin = effective(pluginName);
+            if (!plugin)
+                return undefined;
+            return plugin.source === 'OFFICIAL' ? 'official' : 'installed';
+        },
+        effectivePluginDisplayName: (pluginName) => effective(pluginName)?.displayName,
+        sessionPluginAgents: (sessionId) => system.sessionSnapshot(sessionId).turnCapabilities.agents ?? [],
     };
 }
 //# sourceMappingURL=initialize.js.map

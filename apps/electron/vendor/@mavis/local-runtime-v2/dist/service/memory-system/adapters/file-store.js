@@ -4,6 +4,10 @@ import { lstat, mkdir, open, readdir, readFile, rename, rm, unlink } from 'node:
 import { basename, dirname, join, relative, sep } from 'node:path';
 const SAFE_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const SAFE_FILE_NAME_RE = /^[A-Za-z0-9_-]+\.md$/;
+/** 整理草稿目录里的三项：身份记录、冻结的本轮输入与工作目录。 */
+const CHECKPOINT_META = 'meta.json';
+const CHECKPOINT_PAYLOAD = 'payload.json';
+const CHECKPOINT_WORKDIR = 'workdir';
 export class MemoryFileStoreImpl {
     dataDir;
     memoriesRoot;
@@ -195,6 +199,84 @@ export class MemoryFileStoreImpl {
         this.assertWorkdirPath(workDir);
         await rm(workDir, { recursive: true, force: true });
     }
+    async saveConsolidationCheckpoint(scopeKey, workDir, records) {
+        assertSafeScopeKey(scopeKey);
+        this.assertWorkdirPath(workDir);
+        const target = this.checkpointDir(scopeKey);
+        // 先在同级的点号目录里写全，再整体改名：读取方要么看到完整草稿，要么看不到。
+        const staging = join(this.checkpointRoot(), `.${scopeKey}-${randomUUID()}`);
+        await assertSafePath(this.dataDir, target);
+        await assertSafePath(this.dataDir, staging);
+        await mkdir(staging, { recursive: true });
+        try {
+            await atomicWrite(join(staging, CHECKPOINT_PAYLOAD), records.payload);
+            await atomicWrite(join(staging, CHECKPOINT_META), records.meta);
+            await rename(workDir, join(staging, CHECKPOINT_WORKDIR));
+            await rm(target, { recursive: true, force: true });
+            await rename(staging, target);
+        }
+        catch (error) {
+            await rm(staging, { recursive: true, force: true });
+            throw error;
+        }
+    }
+    async readConsolidationCheckpoint(scopeKey, record) {
+        assertSafeScopeKey(scopeKey);
+        const file = join(this.checkpointDir(scopeKey), record === 'meta' ? CHECKPOINT_META : CHECKPOINT_PAYLOAD);
+        await assertSafePath(this.dataDir, file);
+        return safeReadFile(file);
+    }
+    async takeConsolidationCheckpoint(scopeKey) {
+        assertSafeScopeKey(scopeKey);
+        const target = this.checkpointDir(scopeKey);
+        const source = join(target, CHECKPOINT_WORKDIR);
+        const workDir = join(this.memoriesRoot, 'tmp', `${scopeKey}-${randomUUID()}`);
+        await assertSafePath(this.dataDir, source);
+        await assertSafePath(this.dataDir, workDir);
+        await mkdir(dirname(workDir), { recursive: true });
+        try {
+            await rename(source, workDir);
+        }
+        finally {
+            // 取不出工作目录的草稿也不再保留，下次从头整理。
+            await rm(target, { recursive: true, force: true });
+        }
+        return workDir;
+    }
+    async deleteConsolidationCheckpoint(scopeKey) {
+        assertSafeScopeKey(scopeKey);
+        const target = this.checkpointDir(scopeKey);
+        await assertSafePath(this.dataDir, target);
+        await rm(target, { recursive: true, force: true });
+    }
+    async listConsolidationCheckpoints() {
+        const root = this.checkpointRoot();
+        await assertSafePath(this.dataDir, root);
+        let entries;
+        try {
+            entries = await readdir(root);
+        }
+        catch (error) {
+            if (isENOENT(error))
+                return [];
+            throw error;
+        }
+        const scopes = [];
+        for (const entry of entries.sort()) {
+            if (SAFE_NAME_RE.test(entry))
+                scopes.push(entry);
+            // 保存中途退出留下的暂存目录与不合法的名字都不是草稿；协调循环串行执行，此时没有保存在进行。
+            else
+                await rm(join(root, entry), { recursive: true, force: true });
+        }
+        return scopes;
+    }
+    checkpointRoot() {
+        return join(this.memoriesRoot, 'pending');
+    }
+    checkpointDir(scopeKey) {
+        return join(this.checkpointRoot(), scopeKey);
+    }
     assertWorkdirPath(workDir) {
         const tmpRoot = join(this.memoriesRoot, 'tmp');
         const rel = relative(tmpRoot, workDir);
@@ -208,40 +290,34 @@ export class MemoryFileStoreImpl {
         await this.collectLegacyFiles(join(this.dataDir, 'agents', agentName, 'memory'), '', results);
         return results;
     }
-    async snapshotLegacyUserMemory() {
-        const snapshotPath = this.legacyUserSnapshotPath();
-        await assertSafePath(this.dataDir, snapshotPath);
-        const existing = await safeReadFile(snapshotPath);
-        if (existing !== undefined)
-            return existing.trim() ? existing : undefined;
-        const userPath = this.userMemoryPath();
-        await assertSafePath(this.dataDir, userPath);
-        const content = (await safeReadFile(userPath)) ?? '';
-        await atomicWrite(snapshotPath, content);
-        return content.trim() ? content : undefined;
-    }
     /**
-     * 比较与清空在同一段同步代码里完成，期间同进程的资料写入无法插入：资料编辑器先写临时文件
-     * 再改名，它的改名落在这段之后则新资料生效，落在之前则这里读到新内容、不再清空。
-     * 同一数据目录只有一个持有所有者租约的 runtime，跨进程写入不在此考虑。
+     * 设置页保存“关于你”时总会写入个性化标记，不会留下空文件；空文件只可能是旧版迁移清空的结果。
+     * 比较与写回在同一段同步代码里完成，期间同进程的资料保存无法插入：保存先写临时文件再改名，
+     * 改名落在这段之前时这里读到新内容、不再写回。同一数据目录只有一个持有所有者租约的 runtime。
      */
-    async clearLegacyUserMemory(snapshot) {
+    async restoreClearedUserProfile() {
+        const snapshotPath = this.legacyUserSnapshotPath();
         const userPath = this.userMemoryPath();
+        await assertSafePath(this.dataDir, snapshotPath);
         await assertSafePath(this.dataDir, userPath);
+        const snapshot = await safeReadFile(snapshotPath);
+        if (!snapshot?.trim())
+            return false;
         let current;
         try {
             current = readFileSync(userPath, 'utf8');
         }
         catch (error) {
             if (isENOENT(error))
-                return;
+                return false;
             throw error;
         }
-        if (current !== snapshot)
-            return;
+        if (current !== '')
+            return false;
         const tmp = join(dirname(userPath), `.${basename(userPath)}.${process.pid}.${randomUUID()}.tmp`);
-        writeFileSync(tmp, '', { mode: 0o600, flag: 'wx' });
+        writeFileSync(tmp, snapshot, { mode: 0o600, flag: 'wx' });
         renameSync(tmp, userPath);
+        return true;
     }
     async deleteLegacyUserSnapshot() {
         const snapshotPath = this.legacyUserSnapshotPath();
@@ -281,7 +357,7 @@ export class MemoryFileStoreImpl {
     userMemoryPath() {
         return join(this.dataDir, 'memory', 'user.md');
     }
-    /** 用户资料的迁移副本：在 memories/ 下、任何记忆作用域之外，记忆工具读不到，也不注入对话。 */
+    /** 旧版迁移留下的用户资料副本：在 memories/ 下、任何记忆作用域之外，记忆工具读不到，也不注入对话。 */
     legacyUserSnapshotPath() {
         return join(this.memoriesRoot, 'legacy', 'user.md');
     }

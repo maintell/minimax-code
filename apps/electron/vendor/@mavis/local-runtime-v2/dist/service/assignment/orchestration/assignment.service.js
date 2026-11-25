@@ -3,33 +3,27 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { createBunnyAssignmentPurpose } from '@mavis/shared/bunny-assignment-purpose';
 import { AssignmentQueue } from './assignment-queue.js';
+import { taskAttachmentPaths } from '../../../infra/conversation/dispatch-attachments.js';
+import { assertAcceptableConclusion, assertBunnyAssigner, coded, refuseSend, requireReadableAttachments, } from '../state/assignment-refusals.js';
 import { claimDirectory, claimFile, containingProject, defaultProjectOf, executionLocationLabel, isDirectory, mergeClaims, normalizeProjectDir, projectByName, projectDirectoryOf, projectStart, releaseExecutionLocation, } from './execution-location.js';
-import { assignerSessionOf, listDispatchedTasks } from '../dispatched-tasks.js';
+import { assertTaskLimit, assignerSessionOf, listAssignmentPage, listDispatchedTasks, sortTasksByDispatchOrder, } from '../dispatched-tasks.js';
 import { readReviewTarget } from '../review-target-reader.js';
 import { BUNNY_AGENT_NAME } from '../../bunny/index.js';
-import { ASSIGNMENT_ERROR, assignmentModelUnavailable, assignmentSpaceNotFound, assignmentTakenOver, NESTED_TASK_REFUSAL, worktreeSubPathMissing, } from '../../coordinator-text/index.js';
-import { ASSIGNMENT_SEND_REASONS, DEFAULT_SPACE_NAME, isAssignedByBunny, SPACE_ARTIFACTS_DIR, } from '../../session-system/index.js';
+import { ASSIGNMENT_ERROR, assignmentModelUnavailable, assignmentSpaceNotFound, assignmentSpaceRequired, worktreeSubPathMissing, } from '../../coordinator-text/index.js';
+import { ASSIGNMENT_SEND_REASONS, isAssignedByBunny, originChannelColumn, SPACE_ARTIFACTS_DIR, } from '../../session-system/index.js';
 import { deliveredArtifacts, spaceLinkOf, } from '../contracts.js';
-import { endedOpenRound, reviewFailed, stalled, underReviewBy, } from '../state/assignment-status-facts.js';
-import { claimStoredVerdict, recordVerdict, startVerdictReview, verdictGateBlock, verdictStatus, } from '../verdict/verdict-gate.js';
-/** A queued task waits for its start; a cancelled or taken-over one is over. */
-function refuseSend(current) {
-    if (current?.pendingStart)
-        throw new Error(ASSIGNMENT_ERROR.sendQueued);
-    const completion = current?.completion;
-    // A cancelled task is over: carrying the work on is a new task.
-    if (completion?.state === 'cancelled')
-        throw coded(ASSIGNMENT_ERROR.sendCancelled, 'ASSIGNMENT_CANCELLED');
-    if (completion?.state === 'taken_over')
-        throw coded(assignmentTakenOver(completion.successorSessionId), 'ASSIGNMENT_TAKEN_OVER');
-}
-function coded(message, code) {
-    return Object.assign(new Error(message), { code });
-}
-/** Rejects a conclusion the batch cannot record: a blank id or summary, or a repeated id. */
-function assertAcceptableConclusion(item, ids) {
-    if (!item.sessionId.trim() || !item.summary.trim() || ids.has(item.sessionId))
-        throw new Error('Task IDs must be unique and conclusions must not be empty');
+import { endedOpenRound, reviewFailed, stalled } from '../state/assignment-status-facts.js';
+import { followUpOrigin } from '../state/origin-routing.js';
+import { verdictStatus } from '../verdict/verdict-gate.js';
+import { prepareConclusion, } from '../state/conclusion-facts.js';
+import { AssignmentVerdictWiring } from '../verdict/verdict-wiring.js';
+/** A fresh dispatch's answer: where it could not run as asked, and which files the task got. */
+function acceptedWith(accepted, locationHint, attachments) {
+    return {
+        ...accepted,
+        ...(locationHint ? { locationHint } : {}),
+        ...(attachments.length ? { attachments } : {}),
+    };
 }
 export class AssignmentService {
     options;
@@ -51,6 +45,14 @@ export class AssignmentService {
             mark: (id) => this.mark(id),
             reportFailed: (signal) => this.reports?.failed(signal),
         });
+        this.verdictWiring = new AssignmentVerdictWiring({
+            options: this.options,
+            serialize: (run) => this.serialize(run),
+            require: (id) => this.require(id),
+            requireSummaryAssignment: (task, caller) => this.requireSummaryAssignment(task, caller),
+            mark: (id) => this.mark(id),
+            verdictRecorded: (id, verdict) => this.reports?.verdictRecorded(id, verdict),
+        });
     }
     async serialize(run) {
         const previous = this.operation;
@@ -66,47 +68,27 @@ export class AssignmentService {
             release();
         }
     }
-    /** What the verdict writes need from this service; every write stays serialized here. */
-    verdictStore() {
-        return {
-            tasks: this.options.tasks,
-            nowMs: () => this.options.nowMs(),
-            mark: (id) => this.mark(id),
-            onRecorded: (id, verdict) => this.reports?.verdictRecorded(id, verdict),
-        };
+    /** Every verdict write and every conclusion write; see verdict/verdict-wiring.ts. */
+    verdictWiring;
+    /** @see AssignmentVerdictWiring.startVerdictReview */
+    startVerdictReview(input) {
+        return this.verdictWiring.startVerdictReview(input);
     }
-    /**
-     * Links a review task to the task it checks, so that task's conclusion becomes gated on
-     * the review's verdict. Any verdict an earlier review left is dropped.
-     */
-    async startVerdictReview(input) {
-        return this.serialize(() => startVerdictReview(this.verdictStore(), input));
+    /** @see AssignmentVerdictWiring.recordVerdict */
+    recordVerdict(input) {
+        return this.verdictWiring.recordVerdict(input);
     }
-    /**
-     * Stores a review verdict and wakes the assigner once per verdict.
-     *
-     * Idempotency is enforced by the store, not by the caller: the same verdict (same review
-     * task and revision) delivered twice applies once, and the wake is claimed through a
-     * dedupe key so a redelivery never produces a second turn. Nothing here has to be told
-     * not to resend.
-     */
-    async recordVerdict(input) {
-        return this.serialize(() => recordVerdict(this.verdictStore(), input));
+    /** @see AssignmentVerdictWiring.recordReviewerVerdict */
+    recordReviewerVerdict(input) {
+        return this.verdictWiring.recordReviewerVerdict(input);
     }
-    /**
-     * A coordinator turn takes the stored verdict. Only the assigner or its current root may,
-     * and only a stored verdict can be claimed.
-     */
-    async claimVerdict(input) {
-        return this.serialize(async () => {
-            const caller = await this.require(input.callerSessionId);
-            const task = await this.require(input.sessionId);
-            await this.requireSummaryAssignment(task, caller);
-            return claimStoredVerdict(this.verdictStore(), {
-                sessionId: input.sessionId,
-                by: caller.sessionId,
-            });
-        });
+    /** @see AssignmentVerdictWiring.abandonVerdictReview */
+    abandonVerdictReview(input) {
+        return this.verdictWiring.abandonVerdictReview(input);
+    }
+    /** @see AssignmentVerdictWiring.claimVerdict */
+    claimVerdict(input) {
+        return this.verdictWiring.claimVerdict(input);
     }
     /** Explicit user-facing conclusions; reading a report or sending rework never calls this. */
     async summarize(input) {
@@ -115,64 +97,30 @@ export class AssignmentService {
             throw new Error('Only Bunny can summarize tasks');
         if (!input.items.length)
             throw new Error('At least one task conclusion is required');
+        const ports = {
+            requireTask: (sessionId) => this.require(sessionId),
+            requireAssignment: (task) => this.requireSummaryAssignment(task, caller),
+            conclusionBlock: (assignment) => this.verdictWiring.conclusionBlock(assignment),
+            facts: this.options.facts,
+        };
         const ids = new Set();
-        const items = [];
-        const results = [];
+        const prepared = [];
+        const gateOn = this.verdictWiring.verdictGateOn();
         for (const item of input.items) {
             assertAcceptableConclusion(item, ids);
             ids.add(item.sessionId);
-            const task = await this.require(item.sessionId);
-            const assignment = await this.requireSummaryAssignment(task, caller);
-            // A reviewed task may only be concluded once its verdict landed and Bunny read it.
-            const blocked = verdictGateBlock(assignment);
-            if (blocked)
-                throw coded(blocked, 'ASSIGNMENT_VERDICT_REQUIRED');
-            const turn = await this.options.facts.lastTurn(task.sessionId);
-            if (!turn)
-                throw new Error('Task has no result to summarize');
-            results.push({
-                sessionId: task.sessionId,
-                reportKey: `${task.sessionId}:${turn.turnId}:${turn.state}`,
-                summary: item.summary.trim(),
-            });
-            items.push({
-                sessionId: task.sessionId,
-                title: task.title ?? '',
-                summary: item.summary.trim(),
-                // Stable across coordinator turns, different for a real new task result.
-                revision: `${assignment.assignedAt}:${turn.turnId}:${turn.state}`,
-                // No files: Bunny's conversation shows none. They stay with the task, in its panel
-                // and in the completion closeReviewed records below.
-            });
+            prepared.push(await prepareConclusion(ports, item, gateOn));
         }
         // Every item is validated first, so a rejected batch changes nothing.
-        for (const result of results)
-            await this.closeReviewed(result, caller.sessionId);
+        const running = prepared
+            .filter((entry) => entry.backgroundRunning)
+            .map((entry) => entry.result.sessionId);
+        if (running.length > 0)
+            throw coded(`These tasks still have background work running: ${running.join(', ')}. ` +
+                'Wait for it to finish, then conclude them.', 'ASSIGNMENT_BACKGROUND_RUNNING');
+        await this.verdictWiring.recordConclusions(prepared.map((entry) => entry.result), new Set(prepared.filter((entry) => entry.gated).map((entry) => entry.result.sessionId)), caller.sessionId);
         // No session messages or delivery receipts are mutated here.
-        return { items };
-    }
-    /** Closes the exact report Bunny is reviewing now, keeping its conclusion and delivered files. */
-    closeReviewed(result, callerSessionId) {
-        return this.serialize(async () => {
-            const { sessionId, reportKey } = result;
-            const assignment = await this.options.tasks.get(sessionId);
-            if (!assignment?.review || !underReviewBy(assignment, callerSessionId, reportKey))
-                return;
-            const closed = await this.options.tasks.finishReview(sessionId, {
-                completion: {
-                    state: 'completed',
-                    by: 'assigner',
-                    at: this.options.nowMs(),
-                    reason: 'review_passed',
-                    summary: result.summary,
-                    ...(await deliveredArtifacts(this.options.assets, sessionId)),
-                },
-                clearReportedKey: false,
-                result: 'passed',
-            });
-            if (closed)
-                this.mark(sessionId);
-        });
+        return { items: prepared.map((entry) => entry.summaryItem) };
     }
     async requireSummaryAssignment(task, caller) {
         const assignment = await this.options.tasks.get(task.sessionId);
@@ -414,17 +362,15 @@ export class AssignmentService {
         delete rest.model;
         return this.create(rest);
     }
-    async resolveAssignmentProject(callerSessionId, input) {
-        const args = input.args;
-        if (typeof args !== 'object' || args === null)
-            return undefined;
-        if (input.command === 'session create') {
+    /** The project an assignment tool dispatches into, by its own name and arguments. */
+    async resolveAssignmentProject(callerSessionId, toolName, args) {
+        if (toolName === 'assignment_create') {
             const project = Reflect.get(args, 'project');
             if (project !== undefined && typeof project !== 'string')
                 throw new Error('Invalid project');
             return (await this.executionProject(project))?.projectDir ?? 'default';
         }
-        return input.command === 'session send' ? this.sendProject(callerSessionId, args) : undefined;
+        return toolName === 'assignment_send' ? this.sendProject(callerSessionId, args) : undefined;
     }
     async sendProject(callerSessionId, args) {
         const id = Reflect.get(args, 'session_id');
@@ -452,6 +398,7 @@ export class AssignmentService {
             reportBack: true,
             reason: input.reason,
             ...(input.callerTurnId ? { callerTurnId: input.callerTurnId } : {}),
+            ...(input.originChannel ? { originChannel: input.originChannel } : {}),
         });
         return {
             origin,
@@ -555,6 +502,7 @@ export class AssignmentService {
                 ...(current?.goal ? { goal: current.goal } : {}),
                 ...(current?.doneWhen ? { doneWhen: current.doneWhen } : {}),
                 ...(current?.userWords ? { userWords: current.userWords } : {}),
+                ...followUpOrigin(send.originChannel, current),
                 // What a task reviews is part of what it is: a follow-up round keeps it.
                 ...(current?.reviewOf ? { reviewOf: { ...current.reviewOf } } : {}),
                 ...(current?.completion ? { completion: current.completion } : {}),
@@ -579,17 +527,16 @@ export class AssignmentService {
      * bounded list never drops an open task for a newer closed one.
      */
     async list(agentName, limit = 50) {
-        if (!Number.isSafeInteger(limit) || limit < 0)
-            throw new Error('limit must be a non-negative integer');
-        const assigned = (await this.options.tasks.list({ archived: false, assignerAgentName: agentName }))
-            .sort((a, b) => Number(Boolean(a.assignment.completion)) - Number(Boolean(b.assignment.completion)) ||
-            b.assignment.assignedAt - a.assignment.assignedAt)
-            .slice(0, limit);
+        assertTaskLimit(limit);
+        const assigned = sortTasksByDispatchOrder(await this.options.tasks.list({ archived: false, assignerAgentName: agentName })).slice(0, limit);
         const statuses = await Promise.all(assigned.map(async ({ sessionId, assignment }) => {
             const session = await this.options.sessions.get(sessionId);
             return session && !session.archived ? this.status(session, assignment) : undefined;
         }));
         return statuses.filter((status) => status !== undefined);
+    }
+    page(agentName, input) {
+        return listAssignmentPage(this.options, agentName, input, (session, assignment) => this.status(session, assignment));
     }
     /**
      * Review counts for `turnId`: total tasks reviewed (live `assignment.review` plus
@@ -707,9 +654,25 @@ export class AssignmentService {
         }
         return model;
     }
+    /**
+     * The gate link this dispatch would install, with every check that can refuse it already
+     * run, or nothing when the gate is off or this is not a review dispatch.
+     *
+     * Called before the create touches the disk: a refusal after `stopTakenOver` would leave the
+     * task a `takes_over` dispatch named stopped and closed, with nothing to show for it.
+     */
+    async verdictLinkOf(input, caller, gateOn) {
+        if (!input.reviewOf || !gateOn)
+            return undefined;
+        return {
+            reviewOf: input.reviewOf,
+            reportKey: await this.verdictWiring.checkVerdictReview(caller, input.reviewOf),
+        };
+    }
     async createSession(input) {
         // Checked before any session or workspace side effect.
         const caller = await this.requireAssigner(input.callerSessionId);
+        await requireReadableAttachments(input.attachments, input.callerTurnId, (turnId) => this.options.facts.messages(input.callerSessionId, turnId));
         const existing = await this.replay(input);
         if (existing)
             return this.accepted(existing.session, existing.assignment, true);
@@ -717,6 +680,14 @@ export class AssignmentService {
         const sessionId = `mvs_${randomUUID().replaceAll('-', '')}`;
         const spaceId = await this.routeSpace(this.successorSpace(input.space, original));
         const model = await this.checkedModel(input, caller);
+        // A dispatched review that the gate would refuse is refused here, with the other checks:
+        // by this point a `takes_over` dispatch has not stopped anything yet, so a checked task
+        // with no finished round fails the create instead of leaving the user with a failed
+        // dispatch and a task that is no longer running.
+        // Read once: the gate link and the first message's contract must agree across the awaits.
+        const verdictGate = this.verdictWiring.verdictGateOn();
+        const verdictLink = await this.verdictLinkOf(input, caller, verdictGate);
+        const attachments = await taskAttachmentPaths(input.attachments, input.callerTurnId, (turnId) => this.options.facts.messages(input.callerSessionId, turnId));
         // Every check that can refuse the create has run: only now touch the disk.
         const location = await this.executionLocation(input, spaceId, sessionId);
         await this.stopTakenOver(original, location.claim);
@@ -730,7 +701,8 @@ export class AssignmentService {
                 ...(input.callerTurnId ? { callerTurnId: input.callerTurnId } : {}),
             })
             : undefined;
-        const assignment = this.createdAssignment(caller, input, queued, reviewTarget);
+        const instruction = taskInstruction(input, reviewTarget, verdictGate);
+        const assignment = this.createdAssignment(caller, input, queued, { attachments, instruction });
         const created = await this.recordSession(input, sessionId, location, model);
         let session = created;
         let locationHint;
@@ -740,10 +712,15 @@ export class AssignmentService {
             const link = spaceLinkOf(input, spaceId, Boolean(location.project), queuePosition);
             // Task and space link commit together: no task is ever left without its space.
             await this.options.tasks.openInSpace(session.sessionId, assignment, spaceId, link);
+            // A dispatched review gates the task it checks, before anything can conclude it. Every
+            // check that could refuse it ran above, before the disk was touched.
+            if (verdictLink)
+                await this.verdictWiring.linkVerdictReview(verdictLink.reviewOf, session.sessionId, verdictLink.reportKey);
             // The original closes before its successor starts, so the two never run at once.
             await this.closeTakenOver(original, session.sessionId);
+            // A queued task starts from `pendingStart`, which keeps these files for it.
             if (!queued)
-                await this.queue.submit(session, taskInstruction(input, reviewTarget), caller);
+                await this.queue.submit(session, instruction, caller, attachments);
         }
         catch (error) {
             // An unadmitted fresh conversation must not become a successful request-id replay.
@@ -756,10 +733,10 @@ export class AssignmentService {
             throw error;
         }
         this.mark(session.sessionId);
-        const accepted = await this.accepted(session, assignment, false);
-        return locationHint ? { ...accepted, locationHint } : accepted;
+        return acceptedWith(await this.accepted(session, assignment, false), locationHint, attachments);
     }
-    createdAssignment(caller, input, queued, reviewTarget) {
+    createdAssignment(caller, input, queued, start) {
+        const { attachments, instruction } = start;
         return {
             ...this.makeAssignment(caller, {
                 via: 'create',
@@ -769,12 +746,14 @@ export class AssignmentService {
             goal: input.content,
             doneWhen: input.doneWhen,
             userWords: input.userWords,
+            ...(input.originChannel ? { originChannel: originChannelColumn(input.originChannel) } : {}),
             ...(input.reviewOf ? { reviewOf: { ...input.reviewOf } } : {}),
             ...(queued
                 ? {
                     pendingStart: {
-                        content: taskInstruction(input, reviewTarget),
+                        content: instruction,
                         queuedAt: this.options.nowMs(),
+                        ...(attachments.length ? { attachments: [...attachments] } : {}),
                     },
                 }
                 : {}),
@@ -812,18 +791,19 @@ export class AssignmentService {
         }
     }
     /**
-     * A named space (id or exact name) must exist; a task Bunny names no space for
-     * goes to Bunny's space. The space the user has open never decides it (R3.6).
-     * Follow-ups keep their task's space.
+     * Every task names its space (id or exact name), which must exist; a successor that names none
+     * keeps its original's. The space the user has open never decides it (R3.6).
      */
     async routeSpace(named) {
-        if (named === undefined)
-            return 'default';
         const spaces = await this.options.worklines.list();
-        const wanted = named.trim();
+        const wanted = named?.trim();
+        if (!wanted)
+            throw Object.assign(new Error(assignmentSpaceRequired(spaces)), {
+                code: 'ASSIGNMENT_SPACE_REQUIRED',
+            });
         const match = spaces.find((item) => item.id === wanted) ?? spaces.find((item) => item.name === wanted);
         if (!match)
-            throw Object.assign(new Error(assignmentSpaceNotFound(wanted, spaces, DEFAULT_SPACE_NAME)), {
+            throw Object.assign(new Error(assignmentSpaceNotFound(wanted, spaces)), {
                 code: 'ASSIGNMENT_INVALID_SPACE',
             });
         return match.id;
@@ -900,11 +880,12 @@ export class AssignmentService {
         return session ? { session, assignment: task.assignment } : undefined;
     }
     async accepted(session, assignment, reused) {
-        const id = this.options.worklines.sessionSpace(session.sessionId) ?? 'default';
-        const space = (await this.options.worklines.list()).find((item) => item.id === id);
+        const id = this.options.worklines.sessionSpace(session.sessionId);
+        const space = id && (await this.options.worklines.list()).find((item) => item.id === id);
         const label = executionLocationLabel(session);
         return {
-            space: { id, name: space?.name ?? DEFAULT_SPACE_NAME },
+            // A task whose space was deleted since it was dispatched belongs to none.
+            ...(id ? { space: { id, name: space ? space.name : id } } : {}),
             executionLocation: { directory: session.workspaceDir, label },
             sessionId: session.sessionId,
             title: session.title ?? '',
@@ -927,12 +908,8 @@ export class AssignmentService {
      */
     async requireAssigner(callerSessionId) {
         const caller = await this.require(callerSessionId);
-        if (caller.agentName !== BUNNY_AGENT_NAME)
-            throw Object.assign(new Error('Only Bunny can assign tasks'), {
-                code: 'ASSIGNMENT_NOT_BUNNY',
-            });
-        if (await this.options.tasks.get(caller.sessionId))
-            throw Object.assign(new Error(NESTED_TASK_REFUSAL), { code: 'ASSIGNMENT_NESTED_TASK' });
+        const isTask = (await this.options.tasks.get(caller.sessionId)) !== undefined;
+        assertBunnyAssigner(caller, isTask, BUNNY_AGENT_NAME);
         return caller;
     }
     /** The assigner facts of a new round; the caller is a checked Bunny conversation. */

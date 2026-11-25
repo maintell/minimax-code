@@ -49,10 +49,14 @@ function secretFailureReason(error) {
 }
 function secretFailureDetails(error) {
     const abeReason = error instanceof AbeKeyError ? error.reason : undefined;
+    const abeEnvelope = error instanceof AbeKeyError ? error.envelope : undefined;
+    const cngKeyName = error instanceof AbeKeyError ? error.cngKeyName : undefined;
     const underlying = error instanceof AbeKeyError && error.cause ? error.cause : error;
     const dpapi = underlying instanceof WindowsDpapiError ? underlying : undefined;
     return {
         ...(abeReason ? { abeReason } : {}),
+        ...(abeEnvelope ? { abeEnvelope } : {}),
+        ...(cngKeyName ? { cngKeyName } : {}),
         ...(dpapi?.exitCode !== undefined ? { exitCode: dpapi.exitCode } : {}),
         ...(dpapi?.win32Code !== undefined ? { win32Code: dpapi.win32Code } : {}),
     };

@@ -11,15 +11,16 @@ export function retryWindowsFileSystemOperation(operation, options = {}) {
             return operation();
         }
         catch (error) {
-            if (platform !== 'win32' || attempt >= retries || !isRetryableWindowsFileError(error)) {
+            if (attempt >= retries || !isRetryableWindowsFileError(error, platform)) {
                 throw error;
             }
             wait(retryDelayMs * (attempt + 1));
         }
     }
 }
-function isRetryableWindowsFileError(error) {
-    return (typeof error === 'object' &&
+export function isRetryableWindowsFileError(error, platform = process.platform) {
+    return (platform === 'win32' &&
+        typeof error === 'object' &&
         error !== null &&
         'code' in error &&
         typeof error.code === 'string' &&

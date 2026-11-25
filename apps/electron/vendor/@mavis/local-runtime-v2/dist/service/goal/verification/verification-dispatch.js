@@ -177,7 +177,8 @@ export class ThreadGoalVerificationDispatcher {
             signal.throwIfAborted();
             return undefined;
         }
-        const resources = (attempt.objectiveResources ?? []).filter((resource) => resource.type === 'image');
+        // An asset library image is a reference only; there is no local copy to load.
+        const resources = (attempt.objectiveResources ?? []).filter((resource) => resource.type === 'image' && !resource.driveNodeId);
         const images = resources.length ? await this.deps.loadObjectiveImages(resources) : undefined;
         signal.throwIfAborted();
         const objectiveImages = images?.flatMap((image) => image.data ? [{ data: image.data, mimeType: image.mime }] : []);

@@ -12,7 +12,6 @@ import { AttachmentRegistrationError, attachmentRegistrationResponse, } from '..
 import { projectedMessageContent, shouldProjectMessage, } from '../conversation/user-message-turn-delivery.js';
 import { toUserModelSelection } from '../conversation/model-selection.js';
 import { toSessionInfoView } from './wire.js';
-import { copySideChatAssets } from './sidechat-asset-copy.js';
 import { selectSideChatDisplayPrefix } from './sidechat-history-copy.js';
 /** Process-scoped idempotency surrounds file preparation and one durable admission. */
 export class SideChatApplication {
@@ -253,7 +252,6 @@ export class SideChatApplication {
             }
         }, 10000);
         let committed = false;
-        let copied;
         try {
             const item = claim.item;
             const input = {
@@ -289,26 +287,11 @@ export class SideChatApplication {
                     }
                     : {}),
             };
-            const source = await this.options.sessions.get(req.id);
-            if (!source)
-                throw new AppError(404, 'local_session_not_found', `Session not found: ${req.id}`);
-            copied = await copySideChatAssets({
-                sessionId: pending.sessionId,
-                workspaceDir: source.workspaceDir,
-                display: [input],
-                history: {
-                    active: [],
-                    snapshots: [],
-                    historyRevision: '',
-                    forEachSnapshotRecord: async () => { },
-                },
-                registration: this.options.registration,
-            });
             const result = await this.commitPrepared({
                 mainSessionId: req.id,
                 pending,
                 signal: claimController.signal,
-                input: copied.display[0],
+                input,
                 sourceClaim: claim,
             });
             committed = true;
@@ -318,7 +301,6 @@ export class SideChatApplication {
             clearInterval(renew);
             signal.removeEventListener('abort', abort);
             if (!committed) {
-                await copied?.discard();
                 await this.options.queue.releaseClaim(req.id, claim.claimId);
             }
         }
@@ -333,12 +315,10 @@ export class SideChatApplication {
     }
     async commitPrepared(request) {
         const { mainSessionId, pending, signal, input, sourceClaim } = request;
-        const source = await this.options.sessions.get(mainSessionId);
-        if (!source)
+        if (!(await this.options.sessions.get(mainSessionId)))
             throw new AppError(404, 'local_session_not_found', `Session not found: ${mainSessionId}`);
         let staged;
         let committed = false;
-        let discardAssets;
         try {
             const model = await this.options.sideChats.prepareModel(mainSessionId, request.model ?? input?.model);
             const createdAtMs = Date.now();
@@ -346,17 +326,9 @@ export class SideChatApplication {
                 sourceSessionId: mainSessionId,
                 target: { sessionId: pending.sessionId, createdAtMs },
                 signal,
-                captureDisplay: async (frozen) => {
-                    const copied = await copySideChatAssets({
-                        sessionId: pending.sessionId,
-                        workspaceDir: source.workspaceDir,
-                        display: await selectSideChatDisplayPrefix((await this.options.messages.listAfter(mainSessionId)).messages, frozen),
-                        history: frozen,
-                        registration: this.options.registration,
-                    });
-                    discardAssets = copied.discard;
-                    return copied;
-                },
+                captureDisplay: async (frozen) => ({
+                    display: await selectSideChatDisplayPrefix((await this.options.messages.listAfter(mainSessionId)).messages, frozen),
+                }),
             });
             signal.throwIfAborted();
             const result = this.options.sideChats.commit({
@@ -389,7 +361,6 @@ export class SideChatApplication {
         finally {
             if (!committed) {
                 await staged?.rollback();
-                await discardAssets?.();
             }
         }
     }

@@ -1,33 +1,62 @@
 import { buildLocalBrowserRuntimeTools, CONTROL_IN_APP_BROWSER_SKILL_NAME, } from '@mavis/agent-tools/desktop';
-import { readBrowserUseBuiltinSkillAsset } from './assets/browser-skill-asset.js';
+import { logger } from '../../infra/logging/logger.js';
+import { readBrowserUseBuiltinSkillAsset, readBrowserUseProgramSkillAsset, readBrowserUseShortSkillAsset, withBrowserOnDemandNote, withBrowserProgramSection, } from './assets/browser-skill-asset.js';
 import { createBrowserUseExtension, createBrowserUseTurnToolSafetyGuard, isBrowserUseToolingAvailable, } from './policy.js';
 import { BROWSER_CONTROL_DISABLED_GUIDANCE, buildInAppBrowserContext, hasExplicitInAppBrowserOperationIntent, } from './reminders.js';
 import { createBrowserScreenshotPreprocessor } from './assets/screenshot-preprocessor.js';
 import { BrowserSkillSessionStore, BrowserTurnContextStore } from './session-state.js';
 import { createWorkspaceBrowserAssetAdapter } from './assets/workspace-assets.adapter.js';
+import { createBrowserUseMetrics } from './browser-use-metrics.js';
+import { createBrowserProgramExecutor } from './program/program-executor.js';
+import { BrowserProgramStateStore } from './program/state-store.js';
 const DESKTOP_PLUGIN_DISABLED_GUIDANCE = 'Browser control is unavailable in this turn. Report the unavailable Browser capability; do not call request_feature_enable.';
 export class LocalBrowserUseService {
     options;
     turnContext = new BrowserTurnContextStore();
     skillSessionStore = new BrowserSkillSessionStore();
     requiredSkillByTurn = new Map();
+    /** Sub-Agent sessions whose Browser is private and closed when the Agent ends. */
+    ephemeralBrowserSessions = new Set();
     screenshotPreprocessor;
-    explicitBuiltinSkill;
+    builtinSkillFailed = false;
+    /**
+     * Skill variants (program, short, Plugin program section) whose assets did
+     * not fit: their turns use the plain Skill instead, logged once per Runtime.
+     */
+    failedSkillVariants = new Set();
+    metrics;
+    programState = new BrowserProgramStateStore();
+    programExecutor = createBrowserProgramExecutor({
+        stateStore: this.programState,
+    });
     extension = createBrowserUseExtension({
         requiredSkillName: (sessionId, turnId) => this.requiredSkillByTurn.get(turnKey(sessionId, turnId)),
-        clearTurn: (sessionId, turnId) => this.requiredSkillByTurn.delete(turnKey(sessionId, turnId)),
+        clearTurn: (sessionId, turnId) => {
+            this.requiredSkillByTurn.delete(turnKey(sessionId, turnId));
+            this.metrics?.finishTurn(sessionId, turnId);
+        },
+        notifyLifecycle: (type, sessionId, turnId) => {
+            const ephemeral = this.ephemeralBrowserSessions.has(sessionId);
+            if (type === 'turn_end')
+                this.ephemeralBrowserSessions.delete(sessionId);
+            this.options.adapter?.notifyLifecycle?.({
+                type,
+                sessionId,
+                turnId,
+                ...(ephemeral ? { ephemeral: true } : {}),
+            });
+        },
     });
     reminders = {
         buildTurnReminder: (input) => this.buildTurnReminder(input),
     };
     constructor(options) {
         this.options = options;
-        this.explicitBuiltinSkill =
-            options.activationMode === 'explicit-config' ? readBrowserUseBuiltinSkillAsset() : undefined;
         this.screenshotPreprocessor = createBrowserScreenshotPreprocessor({
             getImageEncoding: options.getImageEncoding,
             registerGeneratedAsset: options.registerGeneratedAsset,
         });
+        this.metrics = options.metrics ? createBrowserUseMetrics(options.metrics) : undefined;
     }
     isAvailable(desktopCapabilities) {
         return this.isAvailableForCapabilities(desktopCapabilities);
@@ -38,7 +67,11 @@ export class LocalBrowserUseService {
         });
     }
     resolveTurnCapability(input) {
-        const requiredSkill = this.resolveRequiredSkill(input.desktopCapabilities, input.allowedExtensionSkillNames, input.surface);
+        // PTC on = Browser programs (the provider must declare programOps).
+        // ARCHON_BROWSER_PROGRAM=0 is an internal evaluation control only.
+        const wantPrograms = input.ptc === true && process.env.ARCHON_BROWSER_PROGRAM !== '0';
+        const short = this.usesShortTexts();
+        const { skill: requiredSkill, programs } = this.turnSkill(this.resolveRequiredSkill(input.desktopCapabilities, input.allowedExtensionSkillNames, input.surface), wantPrograms, short);
         const key = turnKey(input.sessionId, input.turnId);
         if (requiredSkill)
             this.requiredSkillByTurn.set(key, requiredSkill.name);
@@ -54,10 +87,15 @@ export class LocalBrowserUseService {
             }
             return tool;
         });
-        const delegate = this.options.adapter;
-        if (!delegate || !requiredSkill) {
+        const providerAdapter = this.options.adapter;
+        if (!providerAdapter || !requiredSkill) {
             return { tools: baseTools, controlAuthorized: false };
         }
+        // A sub-Agent gets its own private Browser, closed when its turn ends.
+        const ephemeral = input.surface === 'task-child';
+        if (ephemeral)
+            this.ephemeralBrowserSessions.add(input.sessionId);
+        const delegate = ephemeral ? createEphemeralBrowserAdapter(providerAdapter) : providerAdapter;
         const assertLiveAvailability = () => this.options.activationMode === 'explicit-config'
             ? this.isExplicitlyEnabled()
             : this.isProviderAvailable();
@@ -66,7 +104,7 @@ export class LocalBrowserUseService {
             workspaceRoot: input.workspaceRoot,
         });
         const receipt = bindTurnSkillReceipt(this.skillSessionStore, requiredSkill);
-        const exposure = this.options.activationMode === 'desktop-plugin' ? 'compact' : this.options.toolExposure;
+        const exposure = this.toolExposure();
         const browserTools = buildLocalBrowserRuntimeTools(
         // Keep the live kill switch outside every action-specific adapter so a
         // revoked Turn performs no workspace I/O before failing closed.
@@ -74,6 +112,11 @@ export class LocalBrowserUseService {
             ...(exposure ? { exposure } : {}),
             browserSkillSessionStore: receipt,
             preprocessScreenshot: this.screenshotPreprocessor,
+            ...(this.metrics ? { observer: this.metrics } : {}),
+            postActionVisualInPtc: () => this.options.readConfig().ptcPostActionScreenshot !== false,
+            compactInspect: () => this.options.readConfig().compactInspect === true,
+            shortDescription: short,
+            ...(programs ? { programRunner: this.programExecutor } : {}),
         }).map((tool) => bindRequiredSkillDescription(tool, requiredSkill.name));
         return {
             tools: insertBrowserTools(baseTools, browserTools),
@@ -82,9 +125,7 @@ export class LocalBrowserUseService {
         };
     }
     builtinSkillDescriptor() {
-        return this.options.activationMode === 'explicit-config' && this.isExplicitlyEnabled()
-            ? this.explicitBuiltinSkill
-            : undefined;
+        return this.readBuiltinSkill();
     }
     admitQuestionnaireRequest(input) {
         if (this.options.activationMode !== 'desktop-plugin' ||
@@ -105,6 +146,8 @@ export class LocalBrowserUseService {
         this.skillSessionStore.clearSession(sessionId);
         this.screenshotPreprocessor.clearSession(sessionId);
         this.turnContext.clearSession(sessionId);
+        this.metrics?.clearSession(sessionId);
+        this.programState.clearSession(sessionId);
         for (const key of this.requiredSkillByTurn.keys()) {
             if (key.startsWith(`${sessionId}\0`))
                 this.requiredSkillByTurn.delete(key);
@@ -114,7 +157,9 @@ export class LocalBrowserUseService {
         this.skillSessionStore.clear();
         this.screenshotPreprocessor.clear();
         this.turnContext.clear();
+        this.metrics?.clear();
         this.requiredSkillByTurn.clear();
+        this.programState.clear();
     }
     buildTurnReminder(input) {
         const inAppBrowser = this.turnContext.read(input.sessionId, input.turnId);
@@ -137,9 +182,13 @@ export class LocalBrowserUseService {
         const browserControlDisabled = !controlAuthorized;
         const browserDisabledGuidanceInjected = browserControlDisabled && browserOperationIntentDetected;
         const surfaceVisible = inAppBrowser?.visible === true;
+        // Tabs are worth reporting even while the panel is closed: the Agent may reuse one.
+        const hasTabs = (inAppBrowser?.tabs?.length ?? 0) > 0;
         const disabledGuidance = resolveDisabledGuidance(this.options.activationMode, browserDisabledGuidanceInjected);
         const content = [
-            surfaceVisible ? buildInAppBrowserContext({ ...inAppBrowser, controlAuthorized }) : '',
+            inAppBrowser && (surfaceVisible || hasTabs)
+                ? buildInAppBrowserContext({ ...inAppBrowser, controlAuthorized })
+                : '',
             disabledGuidance,
         ]
             .filter(Boolean)
@@ -160,14 +209,116 @@ export class LocalBrowserUseService {
         if (!this.isProviderAvailable())
             return undefined;
         if (this.options.activationMode === 'explicit-config') {
-            return this.isExplicitlyEnabled() ? this.explicitBuiltinSkill : undefined;
+            return this.readBuiltinSkill();
         }
         return resolveDesktopRequiredSkill(capabilities, allowedExtensionSkillNames, surface);
+    }
+    /**
+     * The Skill describes this turn's run_script, so it follows the provider
+     * check `buildLocalBrowserRuntimeTools` makes for the runner: the builtin
+     * Skill becomes its program variant, a Plugin-bound Skill (desktop) gets the
+     * program section, naming the Browser by its Plugin-bound name
+     * `mcp_browser`. `short` (`browser.compactInspect`) selects the short
+     * builtin Skill; a Plugin-bound Skill keeps the Plugin's text. Desktop
+     * exposure is compact, and the compact Browser loads on demand, so the
+     * Plugin-bound Skill always ends with the on-demand host note. When the
+     * program variant cannot be built, the turn runs without programs, so its
+     * run_script matches the Skill it got.
+     */
+    turnSkill(skill, wantPrograms, short) {
+        if (!skill)
+            return { skill, programs: wantPrograms };
+        const programVariant = wantPrograms &&
+            this.toolExposure() !== 'full' &&
+            this.options.adapter?.getCapabilities?.().programOps === true;
+        if (this.options.activationMode === 'explicit-config') {
+            const programSkill = programVariant ? this.readBuiltinSkill(true, short) : undefined;
+            if (programSkill)
+                return { skill: programSkill, programs: true };
+            return {
+                skill: this.readBuiltinSkill(false, short),
+                programs: wantPrograms && !programVariant,
+            };
+        }
+        if (skill.content === undefined)
+            return { skill, programs: wantPrograms };
+        return this.pluginTurnSkill({ ...skill, content: skill.content }, wantPrograms, programVariant);
+    }
+    /**
+     * The Plugin-bound Skill (desktop): the program section when this turn runs
+     * programs (without programs when the section cannot be built), and the
+     * on-demand host note at its end.
+     */
+    pluginTurnSkill(skill, wantPrograms, programVariant) {
+        const section = programVariant
+            ? this.skillVariant('plugin-program', () => withBrowserProgramSection(skill.content, 'mcp_browser'))
+            : undefined;
+        const programs = wantPrograms && (!programVariant || section !== undefined);
+        return {
+            skill: { ...skill, content: withBrowserOnDemandNote(section ?? skill.content) },
+            programs,
+        };
+    }
+    /**
+     * The builtin Skill. A variant (program, short) whose assets do not fit
+     * falls back to the next plainer one: a program variant to undefined (the
+     * caller then runs the turn without programs), the short Skill to SKILL.md.
+     * Only a missing or invalid SKILL.md withdraws Browser.
+     */
+    readBuiltinSkill(programs = false, short = false) {
+        if (this.options.activationMode !== 'explicit-config' ||
+            !this.isProviderAvailable() ||
+            !this.isExplicitlyEnabled()) {
+            return undefined;
+        }
+        if (programs) {
+            return this.skillVariant(`program${short ? '-short' : ''}`, () => readBrowserUseProgramSkillAsset(short));
+        }
+        if (short) {
+            return this.skillVariant('short', readBrowserUseShortSkillAsset) ?? this.readBuiltinSkill();
+        }
+        try {
+            return readBrowserUseBuiltinSkillAsset();
+        }
+        catch (error) {
+            // Assets belong to the installation. Keep this capability unavailable until
+            // Runtime restarts, without repeating a broken read on every ordinary turn.
+            this.builtinSkillFailed = true;
+            this.requiredSkillByTurn.clear();
+            logger.warn({ err: error, programs, short }, 'browser.skill_asset_unavailable');
+            return undefined;
+        }
+    }
+    /**
+     * One Skill variant, or undefined when its assets do not fit (a reference
+     * reworded so a section is no longer found). Logged once and not retried
+     * until Runtime restarts; Browser itself stays available.
+     */
+    skillVariant(variant, build) {
+        if (this.failedSkillVariants.has(variant))
+            return undefined;
+        try {
+            return build();
+        }
+        catch (error) {
+            this.failedSkillVariants.add(variant);
+            logger.warn({ err: error, variant }, 'browser.skill_variant_unavailable');
+            return undefined;
+        }
+    }
+    toolExposure() {
+        return this.options.activationMode === 'desktop-plugin' ? 'compact' : this.options.toolExposure;
+    }
+    /** `browser.compactInspect` this Turn: the short texts go with the compact tool only. */
+    usesShortTexts() {
+        return this.options.readConfig().compactInspect === true && this.toolExposure() !== 'full';
     }
     isAvailableForCapabilities(capabilities, allowedExtensionSkillNames, surface) {
         return (this.resolveRequiredSkill(capabilities, allowedExtensionSkillNames, surface) !== undefined);
     }
     isProviderAvailable() {
+        if (this.builtinSkillFailed)
+            return false;
         const adapter = this.options.adapter;
         if (!adapter)
             return false;
@@ -177,6 +328,8 @@ export class LocalBrowserUseService {
             : this.options.readConfig().filePanelBrowserEnabled === true;
     }
     isExplicitlyEnabled() {
+        if (this.builtinSkillFailed)
+            return false;
         const config = this.options.readConfig();
         return isBrowserUseToolingAvailable(config.filePanelBrowserEnabled, config.browserUseToolingEnabled, this.options.adapter?.getCapabilities?.().provider);
     }
@@ -235,9 +388,10 @@ function wrapBrowserSkillTool(tool, input) {
             async execute(ctx, rawInput, signal, onUpdate) {
                 const requested = readSkillName(rawInput);
                 const requiredSkill = input.requiredSkill;
-                if (input.mode === 'desktop-plugin' &&
-                    requested === CONTROL_IN_APP_BROWSER_SKILL_NAME &&
-                    requested !== requiredSkill?.name) {
+                const otherCopy = otherBrowserSkillCopy(requested, requiredSkill?.name);
+                if (otherCopy)
+                    return otherCopy;
+                if (input.mode === 'desktop-plugin' && requested === CONTROL_IN_APP_BROWSER_SKILL_NAME) {
                     return missingSkillResult(requested);
                 }
                 if (requiredSkill &&
@@ -255,6 +409,37 @@ function wrapBrowserSkillTool(tool, input) {
                 }
                 return tool.impl.execute(ctx, rawInput, signal, onUpdate);
             },
+        },
+    };
+}
+/**
+ * Another copy of the Browser Skill: the native asset where the Plugin binds
+ * Browser, or a Plugin copy (`<plugin>:control-in-app-browser`) where the
+ * native Browser runs (one evaluation run: 4 tasks per arm loaded the Plugin copy
+ * and then hit SKILL_REQUIRED). The bodies differ (the Plugin copy drives
+ * `mcp_browser`), so the result names the copy this turn's Browser needs
+ * instead of loading the other one.
+ */
+function otherBrowserSkillCopy(requested, requiredSkillName) {
+    if (!requested || !requiredSkillName || requested === requiredSkillName)
+        return undefined;
+    const isCopy = requested === CONTROL_IN_APP_BROWSER_SKILL_NAME ||
+        requested.endsWith(`:${CONTROL_IN_APP_BROWSER_SKILL_NAME}`);
+    return isCopy ? otherBrowserSkillCopyResult(requested, requiredSkillName) : undefined;
+}
+function otherBrowserSkillCopyResult(requested, requiredSkillName) {
+    const text = `Not loaded: \`${requested}\` is another copy of the Browser Skill, written for a different Browser tool, and does not unlock the Browser of this session. Load \`${requiredSkillName}\` with the skill tool instead, as the only tool call of that step.`;
+    return {
+        tool_name: 'skill',
+        text,
+        content: [{ type: 'text', text }],
+        details: {
+            kind: 'skill',
+            skill: requested,
+            found: false,
+            readable: false,
+            owner: 'browser-use-v2',
+            requiredSkill: requiredSkillName,
         },
     };
 }
@@ -334,10 +519,21 @@ function isExtensionSkillSelected(selected, pluginName, skillName) {
 function normalizedName(value) {
     return value.trim().normalize('NFKC').toLocaleLowerCase('en-US');
 }
+function createEphemeralBrowserAdapter(delegate) {
+    const getCapabilities = delegate.getCapabilities?.bind(delegate);
+    return {
+        ...(getCapabilities ? { getCapabilities } : {}),
+        // run_script's program_start/program_end reach the provider here, marked like its ops.
+        notifyLifecycle: (event) => delegate.notifyLifecycle?.({ ...event, ephemeral: true }),
+        execute: (ctx, action, input, signal) => delegate.execute({ ...ctx, browserEphemeral: true }, action, input, signal),
+    };
+}
 function createLiveBrowserUseAdapter(delegate, isAvailable) {
     const getCapabilities = delegate.getCapabilities?.bind(delegate);
     return {
         ...(getCapabilities ? { getCapabilities } : {}),
+        // Lifecycle is not gated: a program_end must reach the provider even after revocation.
+        notifyLifecycle: (event) => delegate.notifyLifecycle?.(event),
         async execute(ctx, action, input, signal) {
             if (!isAvailable()) {
                 throw new Error('BROWSER_CONTROL_DISABLED: Browser control permission was disabled during this turn.');

@@ -4,7 +4,7 @@ import { MANAGED_MINIMAX_PROVIDER_ID, MINIMAX_API_PROVIDER_ID } from '../identit
 import {} from './model-cache.js';
 import { byokModelTestStatus } from './config-fingerprint.js';
 import { MINIMAX_API_DEFAULT_BASE_URL, MINIMAX_API_FORMAT, MINIMAX_API_PROVIDER_NAME, minimaxApiBaseUrl, minimaxApiModels, } from './minimax-api.js';
-import { normalizeModelThinkingEffortOptions, resolveModelThinkingMiddleEffort, } from '../resolution/model-ref.js';
+import { normalizeModelThinkingEffortOptions, resolveDefaultThinkingEffort, } from '../resolution/model-ref.js';
 export { MINIMAX_API_DEFAULT_BASE_URL, MINIMAX_API_FORMAT, MINIMAX_API_PROVIDER_NAME, minimaxApiBaseUrl, minimaxApiModels, };
 const MODEL_THINKING_MODES = new Set([
     'switchable',
@@ -195,6 +195,7 @@ export function buildModelEntry(input) {
         providerName: input.providerName,
         ...(input.apiFormat ? { apiFormat: input.apiFormat } : {}),
         ...modelLimitFields(model),
+        ...modelHintField(model),
         ...modelContextWindowOptionHintFields(input),
         ...modelCapabilityFields(model, input.providerKind === 'minimax-managed'),
         ...modelThinkingFields(input),
@@ -221,6 +222,11 @@ function modelContextWindowOptionHintFields(input) {
 }
 function modelDisplayName(model, modelId) {
     return typeof model.name === 'string' ? model.name : modelId;
+}
+/** Usage hint delivered with the model, e.g. "用量翻倍"; absent models show none. */
+function modelHintField(model) {
+    const hint = typeof model.hint === 'string' ? model.hint.trim() : '';
+    return hint ? { hint } : {};
 }
 function modelLimitFields(model) {
     const fields = {};
@@ -288,7 +294,7 @@ function modelThinkingFields(input) {
     const configuredDefaultEffort = model.thinking?.defaultEffort?.trim();
     const defaultEffort = implicitThinking?.mode === 'forced_on' &&
         (!configuredDefaultEffort || !effortOptions?.includes(configuredDefaultEffort))
-        ? resolveModelThinkingMiddleEffort(effortOptions)
+        ? resolveDefaultThinkingEffort(effortOptions, configuredDefaultEffort)
         : undefined;
     const supportedVariants = normalizeSupportedVariants(model.variants);
     const variant = selectedModelVariant(input, thinkingConfig);

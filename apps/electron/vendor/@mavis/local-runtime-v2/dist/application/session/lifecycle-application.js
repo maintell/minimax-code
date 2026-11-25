@@ -139,14 +139,32 @@ export class SessionLifecycleApplication {
         }));
     }
     async updateSession(_context, req) {
-        const updated = await this.invoke(() => this.options.lifecycle.mutateSession(req.id, {
-            ...whenDefined('title', req.title),
-            ...whenDefined('memoryPolicy', req.memoryPolicy),
-        }));
+        const updated = await this.invoke(() => this.applySessionUpdate(req));
         const assignments = await readSessionAssignments(this.options.assignments, [updated]);
         return {
             session: toSessionInfoView(updated, undefined, assignments.get(updated.sessionId)),
         };
+    }
+    /**
+     * The move commits first and keeps the activity time; a title or memory policy in the same
+     * request is written afterwards with its own semantics.
+     */
+    async applySessionUpdate(req) {
+        const moved = req.projectId === undefined
+            ? undefined
+            : await this.moveSessionToProject(req.id, req.projectId);
+        if (moved && req.title === undefined && req.memoryPolicy === undefined)
+            return moved;
+        return this.options.lifecycle.mutateSession(req.id, {
+            ...whenDefined('title', req.title),
+            ...whenDefined('memoryPolicy', req.memoryPolicy),
+        });
+    }
+    async moveSessionToProject(sessionId, projectId) {
+        if (!this.options.projectMove) {
+            throw new AppError(400, 'SESSION_PROJECT_MOVE_UNSUPPORTED', 'Moving a Session to another project is unavailable in this Runtime');
+        }
+        return this.options.projectMove.move(sessionId, projectId);
     }
     async deleteSession(_context, req) {
         return this.withSessionLifecycle('delete', async () => {
@@ -183,6 +201,8 @@ export class SessionLifecycleApplication {
         await this.invoke(() => this.options.deletion.deleteSession(sessionId));
     }
     async setArchived(sessionId, archived, maintenanceLane) {
+        if (archived)
+            await this.pauseActiveGoalForArchive(sessionId);
         const operation = async () => {
             const pluginHookDeadlineAtMs = Date.now() + ARCHIVE_PLUGIN_HOOK_FOREGROUND_BUDGET_MS;
             if (archived && this.options.preparePluginHookSessionEnd) {
@@ -203,6 +223,14 @@ export class SessionLifecycleApplication {
             return await this.invoke(operation);
         }
         return await this.invoke(() => this.options.runPluginHookSessionEndFence?.(sessionId, operation) ?? operation());
+    }
+    async pauseActiveGoalForArchive(sessionId) {
+        try {
+            await this.options.pauseActiveGoalForArchive?.(sessionId);
+        }
+        catch {
+            // Archiving is authoritative; pausing its Goal is a best-effort side effect.
+        }
     }
     async invoke(operation) {
         try {

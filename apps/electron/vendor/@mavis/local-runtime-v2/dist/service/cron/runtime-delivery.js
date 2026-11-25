@@ -40,7 +40,11 @@ export async function deliverRuntimeCron(turns, request, reportFailure) {
             provenance: {
                 source: 'cron',
                 routingFingerprint: `cron:${request.cronId}:${request.runId}`,
-                sourceContext: { cronId: request.cronId, runId: request.runId },
+                sourceContext: {
+                    cronId: request.cronId,
+                    runId: request.runId,
+                    ...(request.replyChannel ? { replyChannel: request.replyChannel } : {}),
+                },
             },
         });
     }

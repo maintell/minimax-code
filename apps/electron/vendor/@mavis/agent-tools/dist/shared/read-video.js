@@ -15,8 +15,9 @@
  * lock-step: caps semantics, error strings, and `details.media` shape are
  * the single source of truth here.
  */
-import { readFile, stat } from './physical-fs.js';
+import { physicalToolFs } from './physical-fs.js';
 import { extname } from 'node:path';
+import { describeVideoContainerProblem, findVideoContainerProblem, } from '@mavis/agent-core/pi-turn-runner';
 import { isSupportedNativeVideoMime } from './multimodal-attachments.js';
 // Extension -> MIME map for read-path inference. The supported-MIME allowlist
 // lives in `multimodal-attachments.ts` and is shared with user attachments;
@@ -38,11 +39,23 @@ export function inferReadVideoMimeType(filePath) {
  * `inferReadVideoMimeType` and resolved `absolutePath` to a host-validated
  * path. Throws on filesystem errors (matches the pre-extraction cloud
  * behaviour).
+ *
+ * A file with a container problem (see `findVideoContainerProblem`: an MP4 an
+ * interrupted write left without its `moov` box, an index pointing outside
+ * the frames, bytes that are not a video at all, an empty file, no video
+ * track, an empty video track, no keyframe) is returned as text only, with
+ * what is wrong and what to do about it, for every model alike: the provider
+ * rejects such a video and the whole request with it, and once inlined it is
+ * replayed from history on every later request (MCT-202611-IX0UFNBE,
+ * MCT-202611-E3ZW0XFK). The video rules that depend on the request (length,
+ * aspect ratio, frame sampling, pixel budget, videos per request) are left to
+ * the outbound guard, which checks them on every request.
  */
 export async function readVideoAsToolResult(opts) {
     if (opts.signal?.aborted)
         throw new Error('Operation aborted');
-    const info = await stat(opts.absolutePath);
+    const fs = opts.fs ?? physicalToolFs;
+    const info = await fs.stat(opts.absolutePath);
     if (opts.signal?.aborted)
         throw new Error('Operation aborted');
     const baseText = `Read video file [${opts.mimeType}]`;
@@ -58,9 +71,13 @@ export async function readVideoAsToolResult(opts) {
     if (maxBody > 0 && base64Size > maxBody) {
         return readVideoTextOnly(opts.toolName, `${baseText}\n[Video omitted: base64 payload ${formatBytes(base64Size)} exceeds max_request_body_bytes=${formatBytes(maxBody)}.]`, opts.mimeType, info.size, 'max_request_body_bytes');
     }
-    const bytes = await readFile(opts.absolutePath);
+    const bytes = await fs.readFile(opts.absolutePath);
     if (opts.signal?.aborted)
         throw new Error('Operation aborted');
+    const problem = findVideoContainerProblem(bytes);
+    if (problem) {
+        return readVideoTextOnly(opts.toolName, `${baseText}\n[Video not loaded: ${describeVideoContainerProblem(problem)}.]`, opts.mimeType, info.size, 'invalid_container', problem);
+    }
     return {
         tool_name: opts.toolName,
         text: baseText,
@@ -78,7 +95,7 @@ export async function readVideoAsToolResult(opts) {
         },
     };
 }
-function readVideoTextOnly(toolName, text, mimeType, sizeBytes, reason) {
+function readVideoTextOnly(toolName, text, mimeType, sizeBytes, reason, containerProblem) {
     return {
         tool_name: toolName,
         text,
@@ -90,6 +107,7 @@ function readVideoTextOnly(toolName, text, mimeType, sizeBytes, reason) {
                 size_bytes: sizeBytes,
                 inline: false,
                 reason,
+                ...(containerProblem ? { container_problem: containerProblem } : {}),
             },
         },
     };

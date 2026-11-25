@@ -1,7 +1,10 @@
 import { MINIAPP_CREATION_INDEX_NAMES } from './schema/miniapp-launchpad.js';
 import { EXPECTED_TABLES, SESSION_QUERY_INDEX_NAMES, AGENT_COLUMN_DEFINITIONS, MEMORY_TABLE_NAMES, MEMORY_COLUMN_DEFINITIONS, MEMORY_CHECKS, } from './schema-consistency.contracts.js';
 import { migration as messageSearchMigration } from './migrations/session/migration-0055-create-message-search-index.js';
+import { migration as extensionPreviewConsentsMigration } from './migrations/plugin/migration-0068-create-extension-preview-consents.js';
 import { migration as sessionAutoResumeMigration } from './migrations/session/migration-0064-create-session-auto-resume.js';
+import { migration as skillUsageMigration } from './migrations/skill/migration-0069-create-skill-usage.js';
+import { migration as sessionMergeRequestsMigration } from './migrations/session/migration-0071-create-session-merge-requests.js';
 import { readName, readNullableString, readNumber, readSql, readString, } from './schema-consistency.metadata-rows.js';
 import { readIndexColumns, readIndexDefinition } from './schema-consistency.index-metadata.js';
 import { canonicalizeSqlContract as compactSql, canonicalizeSqlDefault, canonicalizeSqlDefinition as normalizeDefinition, canonicalizeSqlExpression, extractSqlCheckContracts, } from './sql-contract.js';
@@ -82,6 +85,8 @@ const SESSION_QUERY_QUEUE_COLUMNS = new Set([
 const SESSION_HISTORY_LOCATION_COLUMNS = new Set(['history_relative_dir']);
 /** Added by m0053; required only after that migration ran or the column exists. */
 const PROJECT_DISPLAY_NAME_COLUMNS = new Set(['display_name']);
+/** Added by m0070; required only after that migration ran or the column exists. */
+const PROJECT_LISTED_AT_COLUMNS = new Set(['listed_at_ms']);
 const REQUIRED_INDEXES = [
     ...MINIAPP_CREATION_INDEX_NAMES,
     'idx_v2_cron_definitions_scheduler',
@@ -186,7 +191,11 @@ const TABLE_MIGRATIONS = new Map([
     ['local_runtime_ppt_preview_artifacts', 54],
     ['local_runtime_ppt_preview_requests', 54],
     ['local_runtime_ppt_preview_events', 54],
+    ['extension_preview_consents', extensionPreviewConsentsMigration.version],
     ['local_runtime_v2_session_auto_resume', sessionAutoResumeMigration.version],
+    ['local_runtime_skill_usage', skillUsageMigration.version],
+    ['local_runtime_session_file_syncs', 66],
+    ['local_runtime_v2_session_merge_requests', sessionMergeRequestsMigration.version],
 ]);
 function shouldSkipRequiredTableCheck(db, table) {
     const tableMigration = TABLE_MIGRATIONS.get(table);
@@ -730,8 +739,9 @@ function currentTableColumns(db, table) {
     if (table.name === 'local_runtime_sessions' && !sessionHistoryLocationApplied(db)) {
         return table.columns.filter((column) => !SESSION_HISTORY_LOCATION_COLUMNS.has(column));
     }
-    if (table.name === 'local_runtime_projects' && !projectDisplayNameApplied(db)) {
-        return table.columns.filter((column) => !PROJECT_DISPLAY_NAME_COLUMNS.has(column));
+    if (table.name === 'local_runtime_projects') {
+        const pending = pendingProjectColumns(db);
+        return table.columns.filter((column) => !pending.has(column));
     }
     return table.columns;
 }
@@ -740,8 +750,9 @@ function currentColumnDefinitions(db, table) {
     if (table.name === 'local_runtime_sessions') {
         compatibleDefinitions = compatibleDefinitions.filter((column) => !SESSION_HISTORY_LOCATION_COLUMNS.has(column.name));
     }
-    else if (table.name === 'local_runtime_projects' && !projectDisplayNameApplied(db)) {
-        compatibleDefinitions = compatibleDefinitions.filter((column) => !PROJECT_DISPLAY_NAME_COLUMNS.has(column.name));
+    else if (table.name === 'local_runtime_projects') {
+        const pending = pendingProjectColumns(db);
+        compatibleDefinitions = compatibleDefinitions.filter((column) => !pending.has(column.name));
     }
     if (table.name === 'local_runtime_queue_items' && !queryIndexesApplied(db)) {
         return compatibleDefinitions.filter((column) => !SESSION_QUERY_QUEUE_COLUMNS.has(column.name));
@@ -805,6 +816,16 @@ function taskSessionBindingsApplied(db) {
 }
 function projectDisplayNameApplied(db) {
     return migrationApplied(db, 53) || tableHasColumn(db, 'local_runtime_projects', 'display_name');
+}
+function projectListedAtApplied(db) {
+    return migrationApplied(db, 70) || tableHasColumn(db, 'local_runtime_projects', 'listed_at_ms');
+}
+/** Project columns of later migrations that this database has not received yet. */
+function pendingProjectColumns(db) {
+    return new Set([
+        ...(projectDisplayNameApplied(db) ? [] : PROJECT_DISPLAY_NAME_COLUMNS),
+        ...(projectListedAtApplied(db) ? [] : PROJECT_LISTED_AT_COLUMNS),
+    ]);
 }
 function sessionHistoryLocationApplied(db) {
     return (migration35ConvergenceApplied(db) ||

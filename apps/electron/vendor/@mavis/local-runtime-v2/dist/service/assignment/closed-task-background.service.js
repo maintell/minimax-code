@@ -5,11 +5,15 @@ import { isAssignedByBunny } from '../session-system/index.js';
 const TASK_BACKGROUND_FINISHED = 'task.background_finished';
 /**
  * Background commands and subagents a Bunny task started that finish after the task
- * closed (review passed, cancelled, ...). Their results never reopen the task: they are
- * recorded in its history, nothing runs in the task Session, and Bunny's main
- * conversation is woken with a `background_task` reason saying which closed task's
+ * closed (review passed, cancelled, ...). Their results do not reopen a task someone
+ * closed: they are recorded in its history, nothing runs in the task Session, and Bunny's
+ * main conversation is woken with a `background_task` reason saying which closed task's
  * background task finished and where its result is (6.1, 6.2). Open tasks and every
  * other Session keep the ordinary delivery (6.3).
+ *
+ * A task closed only because Bunny's review Turn ended without a conclusion
+ * (`completion.automatic`) was not done: its result takes the ordinary delivery too,
+ * which starts a round in the task, and that round reopens it.
  */
 export class ClosedTaskBackgroundService {
     options;
@@ -28,6 +32,8 @@ export class ClosedTaskBackgroundService {
         const assignment = await this.options.tasks.get(ownerSessionId);
         if (!assignment?.completion || !isAssignedByBunny(assignment))
             return false;
+        if (reopensOnBackgroundResult(assignment.completion))
+            return false;
         for (const task of finished) {
             await this.options.tasks.appendEvent(ownerSessionId, {
                 type: TASK_BACKGROUND_FINISHED,
@@ -43,6 +49,7 @@ export class ClosedTaskBackgroundService {
         const session = await this.options.sessions.get(ownerSessionId);
         const title = session?.title?.trim() || ownerSessionId;
         const taskIds = finished.map((task) => task.taskId);
+        const names = finished.map((task) => task.description?.trim() || task.taskId);
         const steered = await this.options.conversation.ingress.steer({
             sessionId: target,
             source: 'background-task',
@@ -52,7 +59,7 @@ export class ClosedTaskBackgroundService {
             idempotencyKey: `closed-task-background:${ownerSessionId}:${[...taskIds].sort().join(',')}`,
             requestedTurnId: `turn_closed_task_background_${randomUUID()}`,
             activationDisplayContent: finished
-                .map((task) => `Background task “${task.description?.trim() || task.taskId}” of closed task “${title}”: ${task.status}.`)
+                .map((task, index) => `Background task “${names[index]}” of closed task “${title}”: ${task.status}.`)
                 .join('\n'),
             message: {
                 content: renderClosedTaskBackground({
@@ -63,7 +70,19 @@ export class ClosedTaskBackgroundService {
                 }),
                 attachments: [],
                 hideUserMessage: true,
-                origin: { kind: 'background-task-terminal', taskIds },
+                origin: {
+                    kind: 'background-task-terminal',
+                    taskIds,
+                    // `tasks` is the display snapshot the conversation shows as a background-task
+                    // notice row; without it the wake reads as a message the user typed.
+                    tasks: finished.map((task, index) => ({
+                        taskId: task.taskId,
+                        name: names[index],
+                        status: task.status,
+                    })),
+                    // A task dispatched from an IM chat: this wake's final reply is also sent there.
+                    ...(assignment.originChannel ? { replyChannel: assignment.originChannel } : {}),
+                },
             },
         });
         if (steered.mode !== 'activated')
@@ -77,6 +96,13 @@ export class ClosedTaskBackgroundService {
             }
         })());
     }
+}
+/** Only a closure nobody decided on gives way to the task's own late results. */
+function reopensOnBackgroundResult(completion) {
+    return (completion.automatic === true &&
+        completion.state === 'completed' &&
+        completion.by === 'assigner' &&
+        completion.reason === 'review_passed');
 }
 /** Identifiers, enums and times only, like every task history payload. */
 function backgroundPayload(task) {
@@ -99,7 +125,7 @@ export function renderClosedTaskBackground(input) {
         `Task "${escapeXml(input.title)}" (session_id="${escapeXml(input.taskSessionId)}") was already closed (${escapeXml(closure)}) when these background tasks it started finished:`,
         ...input.finished.map((task) => `  ${renderTask(task)}`),
         'The task stays closed: the result is recorded in its task history and nothing ran in the task session.',
-        "Read a background command's result from its output_file, and a background subagent's reply with the mavis session messages command on its session_id.",
+        "Read a background command's result from its output_file, and a background subagent's reply with the session_messages tool on its session_id.",
         'Decide yourself whether to tell the user, send the task more work, or say nothing.',
         '</closed-task-background-finished>',
     ].join('\n');

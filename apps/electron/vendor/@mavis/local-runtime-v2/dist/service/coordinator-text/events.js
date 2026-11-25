@@ -20,7 +20,7 @@ const ROUND_INITIATOR = {
 export function renderTaskReport(report) {
     const field = TASK_REPORT_FIELDS;
     return taskReportBlock([
-        `${field.task}${report.title}（${report.spaceName} · ${report.projectName}，${field.sessionId}${report.sessionId}）`,
+        `${field.task}${report.title}（${report.spaceName ? `${report.spaceName} · ` : ''}${report.projectName}，${field.sessionId}${report.sessionId}）`,
         ROUND_INITIATOR[report.initiator],
         report.error === undefined
             ? `${field.status}${report.stopped ? TASK_REPORT_STOPPED_STATUS : TASK_REPORT_DONE_STATUS}`
@@ -39,10 +39,10 @@ export function replyOmissionLine(omittedTokens) {
 }
 /**
  * The note after a preview: where the full reply is and how to read it, on a Turn with
- * run_code (its mavis_session_messages tool) and on one without (mavis session messages).
+ * run_code (its `tools.session_messages` child) and on one without (`mcp_invoke`).
  */
 export function replyPreviewNote(totalTokens, sessionId) {
-    return `（最终回复约 ${String(totalTokens)} token，这里只有首尾预览。读全文用 session_id：${sessionId}：有 run_code 的回合在 run_code 里调用 mavis_session_messages；其他回合用 mavis 的 session messages 命令，回复太长时按返回的 offset 分段读到结尾。读完全文再核对。）`;
+    return `（最终回复约 ${String(totalTokens)} token，这里只有首尾预览。读全文用 session_id：${sessionId}：有 run_code 的回合在 run_code 里 await tools.session_messages(...)，其他回合用 mcp_invoke 调 session_messages（tool_name 写 session_messages）；回复太长时按返回的 offset 分段读到结尾。读完全文再核对。）`;
 }
 /**
  * Why a task's round failed when the app's restart cut it off: its status shows it, and Bunny
@@ -76,12 +76,49 @@ export const REVIEW_FAILURE_CAUSE = {
     timeout: '核对超时',
     failed: '核对时模型或服务出错',
 };
+/**
+ * Why a dispatched review stopped holding a task's conclusion. Each is one line written for
+ * the user, and each is followed by VERDICT_REVIEW_RELEASED so the way out is always said.
+ */
+export const VERDICT_REVIEW_GAVE_UP = {
+    missing: '核对任务已经不在了',
+    closed: '核对任务已被关闭',
+    failed: '核对任务出错，没能给出结论',
+    stopped: '核对任务被停止，没能给出结论',
+    switchedOff: '等待核对已被关闭，这个任务不再等核对结论',
+};
+/** The same, for a review that ran past its deadline without reporting. */
+export function verdictReviewTimedOut(minutes) {
+    return `核对任务超过 ${String(minutes)} 分钟没有给出结论`;
+}
+/**
+ * The same, for a review that did report and whose verdict no coordinator turn ever read.
+ *
+ * The verdict is not thrown away and the task is not concluded by it: closing a task takes
+ * Bunny's confirmation, and that stays true on this path too. The gate opens so the user is
+ * not left waiting behind it, with the verdict kept as the evidence of what the review found.
+ */
+export function verdictUnreadTimedOut(minutes) {
+    return `核对结论已经存下，但超过 ${String(minutes)} 分钟没有人读取`;
+}
+/**
+ * What can still happen to a task once the gate is released; appended to every give-up reason.
+ *
+ * Written for both of its readers, because both act on it. The user can close the task from
+ * the panel; a coordinator turn cannot — `assignment_summary` and `assignment_claim_verdict`
+ * both refuse a task whose review link is gone, and only `setCompletion({ by: 'user' })`,
+ * which no Agent tool reaches, closes it. This used to promise "you can conclude it directly",
+ * which is true for the user and false for Bunny: every coordinator that believed it walked
+ * into two refusals and could only hand the task back to the user anyway. So the way out is
+ * named for whoever can actually take it.
+ */
+export const VERDICT_REVIEW_RELEASED = '这个任务已解除等待核对：Bunny 已不能直接结案，只能由用户在界面上标记完成，或者重新给它派活返工。';
 export function reviewGaveUp(cause, retries) {
     return `${cause}，自动重试 ${String(retries)} 次仍没完成`;
 }
 // The round budget and review delivery follow-up (bunny/round-budget.ts).
 const TURN_ONLY_REMINDER = 'This reminder applies only to the current Turn. Do not save or generalize it.';
-const FREE_CALLS = '派任务（assignment_create，含 run_code 里调用）、续派返工（assignment_send）、结案（assignment_summary）、send_to_user、新建任务空间，以及记忆、账本、定时、设置、context.md 的写入命令本身不计轮次';
+const FREE_CALLS = '派任务（assignment_create，含 run_code 里调用）、续派返工（assignment_send）、结案（assignment_summary）、send_to_user、新建事项，以及记忆、账本、定时、设置、context.md 的写入命令本身不计轮次';
 export function roundBudgetReminder(rounds, blockAt) {
     const limit = blockAt === undefined ? '' : `从第 ${blockAt} 轮起，计数的工具调用会被拒绝。`;
     return wrapSystemReminder([
@@ -111,7 +148,7 @@ export const REVIEW_CONCLUDED_WITHOUT_DELIVERY_FOLLOW_UP = wrapSystemReminder([
 // A Bunny schedule (bunny/orchestration/schedule-space-label.ts).
 /** The line naming the space a schedule belongs to, before the schedule's own text. */
 export function scheduleSpacePrefix(spaceName) {
-    return `任务空间：${spaceName}\n\n`;
+    return `事项：${spaceName}\n\n`;
 }
 /** A schedule whose space was deleted names it so instead of by its raw ID. */
 export function deletedScheduleSpace(spaceId) {

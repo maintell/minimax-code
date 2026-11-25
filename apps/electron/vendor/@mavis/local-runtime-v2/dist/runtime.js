@@ -412,6 +412,12 @@ function reportStorageInitialization(initialization) {
         recoveredProjectPreferenceCount: initialization.recoveredProjectPreferenceCount,
         skippedSessionProjectRepairCount: initialization.skippedSessionProjectRepairCount,
     });
+    if (initialization.repairedTurnIngressAllocator) {
+        logger.warn({ ...initialization.repairedTurnIngressAllocator }, 'local-runtime-v2 raised a lagging Turn sequence allocator high-water');
+    }
+    if (initialization.turnIngressAllocatorRepairError !== undefined) {
+        logger.warn({ error: initialization.turnIngressAllocatorRepairError }, 'local-runtime-v2 could not repair the Turn sequence allocator; retrying on next startup');
+    }
     reportDatabaseInitializationWarnings(initialization);
 }
 function reportDatabaseInitializationWarnings(initialization) {
@@ -611,6 +617,7 @@ async function initializeOwnerRuntime(input) {
             metrics: v1.metricsClient,
             eventBus: background.clients.eventBus,
             forkWorktree: background.clients.forkWorktree,
+            subscribeConfigChanges: background.clients.subscribeConfigChanges,
             compatibility: {
                 create: (hosted) => compatibility.createServiceCompatibility(v1, options, hosted),
             },

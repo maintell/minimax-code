@@ -2,18 +2,19 @@ import { settleInBackground } from '../../service/plugin-system/index.js';
 import { isLocalSourceProvenanceEnabled } from '@mavis/config';
 import { incrementMetric } from '@mavis/shared/local-runtime-logging/metrics';
 import { BUNNY_LIBRARY_ROOT_AGENTS, projectBunnyGreetingOrigin, bunnyTaskHistoryObserver, } from '../../service/bunny/index.js';
-import { inputReviewDisposition, productOutputReviewPolicy, SAFETY_SCENE, } from '../../service/content-safety/index.js';
 import { CUSTOM_PROVIDER_ID_PREFIX, ModelAccessRelist, initializeModelSystem, freezeManagedQueueModel, resolveRequestedSessionModel, LocalModelProviderError, resolveBuiltinAgentModelGroup, previewAgentModelSelection, resolveEffectiveAgentModelSelection, AgentModelSelectionError, } from '../../service/model-system/index.js';
 import { createSessionSystemPinBridge, initializePinService, } from '../../service/pin/index.js';
-import { ArtifactLibraryService, createAssignmentTaskRepository, createCanonicalRecoveryLoggerAdapter, initializeSessionSystem, QueueServiceError, readSessionAdditionalWorkspaceRoots, } from '../../service/session-system/index.js';
-import { createFileApiRuntime, createProductionAgentPreparation, createPtcStoreDecision, createProductionRootArchiveTitleModel, createProductionSessionTitleModel, createSessionModelRepair, agentHostModelFromQueue, } from '../../service/turn-system/index.js';
+import { ArtifactLibraryService, createAssignmentTaskRepository, createCanonicalRecoveryLoggerAdapter, initializeSessionSystem, QueueServiceError, } from '../../service/session-system/index.js';
+import { createFileApiRuntime, createProductionAgentPreparation, createPtcStoreDecision, createProductionRootArchiveTitleModel, createProductionSessionTitleModel, createSessionModelRepair, queuedTurnPinsSessionModel, agentHostModelFromQueue, resolveRuntimeLocale, } from '../../service/turn-system/index.js';
 import { createBuiltinAgentSurfacePolicy } from '../agent/agent-surface-policy.js';
 import { createRuntimeAgentProduct } from '../agent/runtime-agent-product.js';
 import { bunnyMessageWriteObservers } from './bunny-message-writes.js';
 import { withAdvisorAgentProduct } from './advisor-agent-product.js';
+import { bindProjectAdditionalWorkspaceRoots } from './project-workspace-roots-binding.js';
 import { withGoalAgentProduct } from './goal-agent-product.js';
 import { withQuotaAutoResumeProduct } from './quota-auto-resume-product.js';
 import { createRuntimeGoalPort } from './runtime-goal-port.js';
+import { createSkillUsageExtension, SkillUsageStore } from '../../service/skill/index.js';
 import { initializeGoalService, isGoalVerifierChildSession, } from '../../service/goal/index.js';
 import { createApplicationFactPorts, createCommittedModelProviderSessionPort, } from './fact-ports.js';
 import { createSessionToolCallModePolicy } from './session-tool-call-mode-policy.js';
@@ -62,10 +63,15 @@ export function createProductionSessionComposition(input) {
         modelAccessExtensionTool: input.modelAccess?.extensionTool,
     });
     const { goal, goalPort, bindGoalCronOwnerReader } = composeGoalOwner(input, baseProduct, () => executionSessionSystem?.queue.committed);
-    const product = composeAdvisorProduct(composeSessionProduct(baseProduct, goal, input.quotaAutoResume), input, {
+    const skillUsage = new SkillUsageStore(input.db, input.logger);
+    const product = withSkillUsageProduct(composeAdvisorProduct(composeSessionProduct(baseProduct, goal, input.quotaAutoResume), input, {
         preparation: () => preparation,
         sessionSystem: () => executionSessionSystem,
-    });
+    }), createSkillUsageExtension({
+        store: skillUsage,
+        ...(input.metrics ? { metricsClient: input.metrics } : {}),
+        nowMs: input.nowMs,
+    }));
     const modelSystem = createSessionModelSystem(input, product);
     visible.bind(() => modelSystem.providers.modelCatalogConfig?.());
     input.agentService.bindBuiltinModelGroupResolver(async ({ previous, bundled }) => resolveBuiltinAgentModelGroup({ config: visible.read(), previous, bundled }));
@@ -80,6 +86,9 @@ export function createProductionSessionComposition(input) {
             // One decision for this whole assembly: the Agent Host's store and the PTC
             // prompt line that names it read this same getter, so they cannot disagree.
             ptcStoreRequested: createPtcStoreDecision(product.preparation.configBuilder.config()),
+            skillUsage,
+            ...(input.metrics ? { metricsClient: input.metrics } : {}),
+            ...windowLogger(product.preparation.configBuilder.logger, input.logger),
         },
         modelResolver: modelSystem.resolver,
         ...(input.logger ? { logger: input.logger } : {}),
@@ -88,6 +97,7 @@ export function createProductionSessionComposition(input) {
     const archiveTitleModel = createProductionRootArchiveTitleModel({ agents: product.agents, preparation, safety: input.safety }, input.nowMs);
     const sessionPin = createSessionSystemPinBridge();
     const sessionSystem = initializeSessionSystem({
+        onSubagentExecutionCommitted: (payload) => input.publishGlobalEvent({ type: 'subagent.execution', payload }),
         db: input.db,
         ...bunnyStoreRepositories(input),
         ...(input.coordinatorRoster ? { coordinatorRoster: input.coordinatorRoster } : {}),
@@ -126,7 +136,6 @@ export function createProductionSessionComposition(input) {
         queueFacts: facts.queue,
         resolveQueueModel: createQueueModelResolver(visibleInput, () => executionSessionSystem),
         ...createRuntimeEventSinks(input.inspector, input.publishGlobalEvent),
-        ...(input.metrics ? { compactionMetrics: input.metrics } : {}),
         title: createSessionTitleOptions(input, { agents: product.agents, preparation }),
         nowMs: input.nowMs,
         runtimeOwnerIdentity: input.runtimeOwnerIdentity,
@@ -138,9 +147,15 @@ export function createProductionSessionComposition(input) {
     input.compatibility.bindSessionPinReader((sessionId) => pinService.isSessionPinned(sessionId));
     preparation.bindSessionModelRepair(createSessionModelRepair(sessionSystem.sessions.records, input.logger, modelUpdatedFactSink(facts)));
     preparation.bindTaskSessionBindings(sessionSystem.sessions.records);
-    preparation.bindAdditionalWorkspaceRoots((sessionId) => readSessionAdditionalWorkspaceRoots(sessionSystem.repositories.projects, sessionId));
+    bindProjectAdditionalWorkspaceRoots({
+        runtimeOwnerKind: input.runtimeOwnerKind,
+        preparation,
+        projects: sessionSystem.repositories.projects,
+        sessions: sessionSystem.repositories.sessions,
+    });
     const modelProviderApplication = new ModelProviderApplication({
         publish: input.publishGlobalEvent,
+        logger: input.logger,
         tuiProductPolicy,
         config: visible.read,
         providers: modelSystem.providers,
@@ -189,11 +204,13 @@ export function createProductionSessionComposition(input) {
 function createSessionTitleOptions(input, owners) {
     return {
         model: createProductionSessionTitleModel(owners, input.nowMs),
+        // Same source as the main conversation's appLocale, so titles and replies agree.
+        locale: resolveRuntimeLocale,
         reviewPromptSnapshots: input.promptSnapshots,
         ...(input.metrics
             ? {
                 onOutcome: (outcome) => input.metrics?.counter('session_title_generation_total', 1, { outcome }),
-                onReviewOutcome: (outcome) => incrementMetric(input.metrics, 'session_title_review_total', 1, { outcome }),
+                onReviewOutcome: (outcome, mode) => incrementMetric(input.metrics, 'session_title_review_total', 1, { outcome, mode }),
             }
             : {}),
         // Title failures stay Session-scoped diagnostics, never runtime turn failures.
@@ -228,6 +245,14 @@ function bunnyStoreRepositories(input) {
         artifactLibrary: new ArtifactLibraryService(input.db, input.bunnyDb, input.dataDir, BUNNY_LIBRARY_ROOT_AGENTS),
     };
 }
+/** The skill catalog window logs its starts and resyncs through the builder's logger. */
+function windowLogger(builderLogger, logger) {
+    return !builderLogger && logger ? { logger } : {};
+}
+/** Counts the model's `skill` tool loads; the catalog window ranks descriptions by them. */
+function withSkillUsageProduct(product, extension) {
+    return { ...product, normalExtensions: [...(product.normalExtensions ?? []), extension] };
+}
 /** Adds the advisor tool; its owners are late-bound and both exist before any Turn runs. */
 function composeAdvisorProduct(product, input, owners) {
     return withAdvisorAgentProduct(product, {
@@ -244,24 +269,26 @@ function composeAdvisorProduct(product, input, owners) {
         // The same Files API wiring as the Turn executor's requests.
         fileApi: createFileApiRuntime({ db: input.db, nowMs: input.nowMs, product: product.fileApi }),
         logger: input.logger,
-        // A managed advisor is reviewed like a managed main model: the Turn's input and the output,
-        // with the same scenes, verdict rules and region policy.
-        contentReview: {
-            reviewInput: async (text) => inputReviewDisposition(await input.safety.review(text, SAFETY_SCENE.UserInput)),
-            blocksAdvice: (text) => input.safety.blocks(text, SAFETY_SCENE.MessageOutput),
-            policy: productOutputReviewPolicy(input.runtimeOwnerKind),
-        },
+        // 托管顾问模型和主模型一样由网关审核，这里不接本地送审。
         nowMs: input.nowMs,
     });
 }
 /** 已提交事实的端口；撤回时经各自的服务重开问卷、删除目标。 */
 function createSessionFactPorts(input, goal) {
-    return createApplicationFactPorts({
+    let observer;
+    const ports = createApplicationFactPorts({
         publish: input.publishGlobalEvent,
         questionnaires: input.compatibility.questionnaires,
         goals: goal.service,
         logger: input.logger,
+        observeSession: (fact) => observer?.(fact),
     });
+    return {
+        ...ports,
+        bindSessionObserver: (next) => {
+            observer = next;
+        },
+    };
 }
 /**
  * The Turn product every Session runs on: the Goal wiring, plus the quota
@@ -407,19 +434,26 @@ function createQueueModelResolver(input, getSessionSystem) {
                 targetAgentId: await channelTargetAgentId(sessionSystem, session.sessionId, queueInput?.message.channelContext?.targetAgentId),
             });
         }
-        const binding = model
-            ? undefined
-            : await sessionSystem.repositories.sessions.getSessionAgentDefinition(session.sessionId);
-        const frozenModel = binding?.definition.definitionVersion === 2 ? binding.definition.model : undefined;
-        try {
-            return freezeManagedQueueModel(input.modelConfig.read(), session, model, frozenModel);
-        }
-        catch (error) {
-            if (error instanceof LocalModelProviderError)
-                throw new QueueServiceError('model-invalid', error.message);
-            throw error;
-        }
+        return await freezeSessionQueueModel(input, sessionSystem, session, model);
     };
+}
+async function freezeSessionQueueModel(input, sessionSystem, session, model) {
+    const binding = model
+        ? undefined
+        : await sessionSystem.repositories.sessions.getSessionAgentDefinition(session.sessionId);
+    const frozenModel = binding?.definition.definitionVersion === 2 ? binding.definition.model : undefined;
+    // A Session without a model of its own takes one when its Turn starts; the global
+    // default is not frozen into an automatic message here.
+    if (queuedTurnPinsSessionModel(session, model, frozenModel))
+        return undefined;
+    try {
+        return freezeManagedQueueModel(input.modelConfig.read(), session, model, frozenModel);
+    }
+    catch (error) {
+        if (error instanceof LocalModelProviderError)
+            throw new QueueServiceError('model-invalid', error.message);
+        throw error;
+    }
 }
 function createChannelInputModelResolver(input, sessionSystem) {
     return async ({ sessionId, input: userInput }) => {

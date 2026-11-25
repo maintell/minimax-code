@@ -1,9 +1,11 @@
 import { captureMiniAppPageSnapshot } from "./miniapp-content-preview";
 import { BaseWindow, app, dialog, webContents as electronWebContents } from "electron";
-import { sanitizeConsoleDiagnosticUrl, BROWSER_TIMEOUTS, withTimeout } from "@mavis/browser-core";
-import { getConfig } from "@mavis/config";
+import { sanitizeConsoleDiagnosticUrl, AgentBrowserControl, BROWSER_TIMEOUTS, withTimeout, AGENT_READ_ACTIONS, browserUserTakeoverError, miniAppNavigateBlockedError, PROGRAM_POPUP_WAIT_MS, PROGRAM_TAB_OPS, programTabResult, programUserTakeoverResult, programThrownResult, readProgramKeepOp, programTabFailure, PROGRAM_CARRYOVER_NOTICE, programCloseNotOwnedFailure, PROGRAM_READ_OPS, programOpTabId, programTabNotControlledError, PROGRAM_POPUP_POLL_MS, tabNotControlledError, CARRYOVER_NOTICE } from "@mavis/browser-core";
+import { getConfig, resolveBrowserReadV2 } from "@mavis/config";
 import { MINIAPP_ATTENTION_MAX_TABS } from "./miniapp-attention";
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { setTimeout as sleep } from "node:timers/promises";
 import { BrowserController } from "./controller";
 import { browserBackendPolicy } from "./browser-backend-policy.js";
 import { createMiniAppWebviewWindow } from "./miniapp-webview-window.js";
@@ -19,7 +21,7 @@ import { getBrowserJsDialogGate } from "./browser-js-dialog-registry";
 import { EMBEDDED_COMMENT_WORLD_ID, EMBEDDED_COMMENT_BRIDGE_SCRIPT, EMBEDDED_COMMENT_CONTROL_NAME, normalizeCommentBridgeMessage } from "./embedded-comment-bridge";
 import { loadEmbeddedPropsPanelScript } from "./embedded-props-panel";
 import { IPC_CHANNELS } from "../../config/constants";
-import { captureTabScreenshotWithoutAgentCursor, withDevicePreviewLease, bestEffortHideAgentCursor, captureFrameWithoutAgentCursor, isAgentCursorVisible, handleAgentCursorBridgeEvent, withAgentCursorHiddenForCapture, executeWithAgentExecutionGlow, executeWithAgentCursorLease } from "./embedded-browser-agent-cursor";
+import { captureTabScreenshotWithoutAgentCursor, withDevicePreviewLease, bestEffortHideAgentCursor, captureFrameWithoutAgentCursor, isAgentCursorVisible, handleAgentCursorBridgeEvent, withAgentCursorHiddenForCapture, executeWithAgentExecutionGlow, executeWithAgentCursorLease, holdAgentProgramGlow, releaseAgentProgramGlow } from "./embedded-browser-agent-cursor";
 import { windowManager } from "../../windows/manager";
 import { getMainWindow } from "../../windows/mainWindow";
 import { getCategoryLogger } from "../../utils/logger";
@@ -27,17 +29,26 @@ import { openExternalTarget } from "../../utils/open-external-target";
 import { PersistentBrowserRegistry, normalizePersistedBrowserUrl, MAX_PERSISTED_BROWSER_HISTORY_ENTRIES, createPersistentBrowserRegistry } from "./persistent-browser-registry";
 import { ENABLE_BROWSER_INPUT_DIAGNOSTICS, safeError, nowMs, normalizeBrowserTarget, urlHost, OFFSCREEN_BOUNDS, presentationLoadError, normalizeCommentSelectionMode, normalizeCommentKeys, normalizeCommentRevisions, normalizeUrl, isWithinAgentKeepalive, HIDDEN_SWEEP_INTERVAL_MS, MAX_HIDDEN_TABS, AGENT_OPERATION_KEEPALIVE_MS, SELECTED_TAB_PROTECTION_MS, HIDDEN_LOADING_GRACE_MS, finiteNumber, DEFAULT_BOUNDS, isMainDocumentNavigation, asRecord, asString, asCommentRenumberMap, asNumber, normalizeCommentPayload, PENDING_COMMENT_EVENT_LIMIT, assertBrowserTabBelongsToSession, AGENT_BROWSER_ACTIONS } from "./embedded-browser-manager-helpers";
 import { setTabDevicePreviewMode, updateTabDevicePreview } from "./embedded-browser-device-preview";
+import { resolveElectronBrowserActionRoute } from "./electron-browser-route-policy";
 import { EmbeddedBrowserResourceDiagnostics } from "./embedded-browser-resource-diagnostics";
-import { EmbeddedBrowserAdaptiveBudget, memoryWeightedLruValue } from "./embedded-browser-adaptive-budget";
+import { EmbeddedBrowserAdaptiveBudget } from "./embedded-browser-adaptive-budget";
 import { capturePageResume, restorePageResume } from "./embedded-browser-page-resume";
 import { safeEmbeddedBrowserFaviconUrl } from "./embedded-browser-tab-metadata";
 import { runFindInPage, createEmbeddedBrowserFindReporter, toEmbeddedBrowserFindResult, pendingEmbeddedBrowserFindResult, isEmbeddedBrowserFindShortcut } from "./embedded-browser-find";
 import { isEmbeddedBrowserReloadShortcut } from "./embedded-browser-reload";
+import { EmbeddedBrowserTakeoverPill } from "./embedded-browser-takeover-pill";
+import { normalizeTakeoverPillMessage } from "./agent-takeover-pill-bridge";
+import { isAgentInputActive } from "./agent-input-marker";
+import { isUserScrollGuarded, setUserScrollGuard } from "./agent-scroll-guard";
 import { openDetachedWindow, attachDetachedTab, releaseDetachedWindow, closeKeptDetachedWindow, bindKeptDetachedWindow, isDetachedWindowInView, adoptDetachedWindow, showDetachedPlaceholder, hideDetachedPlaceholder, closeDetachedWindow } from "./miniapp-detached-window";
 import { registerMiniAppLoopbackAuth } from "./miniapp-loopback-auth";
 import { MiniAppDevicePermissionGate } from "./miniapp-device-permissions";
 import { revealMiniAppWindow, readMiniAppWindowState, updateMiniAppWindow, focusMiniAppWindow } from "./miniapp-window-handle";
 const logger = getCategoryLogger('archon');
+/** show_tab waits this long for the renderer to put the page on screen. */
+const SHOW_TAB_TIMEOUT_MS = 4000;
+const SHOW_TAB_POLL_MS = 100;
+const INPUT_BLOCKED_NOTICE_INTERVAL_MS = 1000;
 const browserInputDiagnosticLogger = getCategoryLogger('archon', 'browser-input');
 const browserNavigationDiagnosticLogger = getCategoryLogger('archon', 'browser-navigation');
 class BrowserCommentBackpressureError extends Error {
@@ -105,6 +116,22 @@ const MINIAPP_SLEEP_REFUSAL_ORDER = [
 const MAX_IN_MEMORY_HISTORY_PAGE_STATE_BYTES = 4 * 1024 * 1024;
 /** Covers the 30s page load timeout of a page opened by an Agent action. */
 const AGENT_PAGE_OPEN_SETTLE_TIMEOUT_MS = 35000;
+/**
+ * A Browser program keeps the glow on between its ops. Without its end signal
+ * the glow goes off after this idle time; a running program (its start
+ * signal came) only after the long idle time, in case its end never arrives.
+ */
+const PROGRAM_GLOW_IDLE_MS = 2000;
+const RUNNING_PROGRAM_GLOW_IDLE_MS = 60000;
+/** Agent clicks (direct actions and program ops) whose late target=_blank page is the Agent's. */
+const AGENT_CLICK_ACTIONS = {
+    click: true,
+    double_click: true,
+    triple_click: true,
+    click_and_wait_for_navigation: true,
+    dblclick: true,
+    mouseClick: true,
+};
 /** Upper bound for aborted operations on a lost webview page to unwind before rebuild. */
 const WEBVIEW_RECOVERY_OPERATION_SETTLE_MS = 2000;
 /** A foreground Browser tab rebuilds itself after a renderer crash at most once per window. */
@@ -129,8 +156,8 @@ export class EmbeddedBrowserManager {
         this.lastBoundsDiagnosticKey = null;
         this.lastNativeLayerDiagnosticKey = null;
         this.hiddenSweepTimer = null;
-        /** Depth of in-flight agent tool executions; marks tab operations as agent-driven. */
-        this.agentToolCallDepth = 0;
+        /** Only operations in this call's async chain are Agent-driven. */
+        this.agentToolScope = new AsyncLocalStorage();
         this.destroyingTabIds = new Set();
         this.suspendingTabIds = new Set();
         this.coldResumeSnapshots = new Map();
@@ -160,6 +187,10 @@ export class EmbeddedBrowserManager {
         this.adoptedSessions = new Map();
         /** Pages opened by an in-flight Agent action; that action returns after they settle. */
         this.agentPageOpens = new Map();
+        /** The tab each session's Browser program glows on, and when that glow lapses. */
+        this.programGlows = new Map();
+        /** Sessions whose Browser program reported its start and not yet its end. */
+        this.runningPrograms = new Set();
         this.creatingTabs = new Map();
         this.miniAppOperationTails = new Map();
         this.miniAppWindowTransfers = new Set();
@@ -182,6 +213,23 @@ export class EmbeddedBrowserManager {
         this.propsPanelExpanded = false;
         /** The page reported a toggle this run; renderer seeds no longer apply. */
         this.propsPanelPreferenceKnown = false;
+        /** Agent tab lease, page ownership and turn-end tidying per session. */
+        this.agentControl = new AgentBrowserControl((sessionId, snapshot) => this.notifyAgentControlChanged(sessionId, snapshot));
+        /** Tabs the Agent is closing; their close never counts as a user takeover. */
+        this.agentClosingTabIds = new Set();
+        /** Page each session's Agent controlled last, so a moved lease can clear its cursor. */
+        this.lastControlledTabIdBySession = new Map();
+        /** Tabs the user is closing (tab strip close); closing the controlled tab is a takeover. */
+        this.userClosingTabIds = new Set();
+        /** Popups the Agent opened (or a popup closing itself) during the current action. */
+        this.agentTabOutcomes = new Map();
+        this.inputBlockedNotifiedAt = new Map();
+        /** Hover pill on the Agent-controlled web page with the take-over button. */
+        this.takeoverPill = new EmbeddedBrowserTakeoverPill({
+            // A webview page has the host's control surface instead of the in-page pill.
+            isEligible: (tab) => this.blocksUserInput(tab) && !this.usesWebviewSurface(tab),
+            getTab: (tabId) => this.tabs.get(tabId),
+        });
         this.getShortcutOverrides = () => ({});
         this.lastResourceDiagnosticPressure = 'normal';
         this.registry = options.registry ?? new PersistentBrowserRegistry();
@@ -286,6 +334,7 @@ export class EmbeddedBrowserManager {
                 }
             },
             captureTabScreenshot: (tab, params) => captureTabScreenshotWithoutAgentCursor(tab, params ?? {}, (target) => this.getWebContents(target)),
+            isBrowserReadV2Enabled: options.isBrowserReadV2Enabled ?? (() => false),
         });
     }
     /**
@@ -308,6 +357,19 @@ export class EmbeddedBrowserManager {
             signal: input.signal,
             isGenerationCurrent: input.isGenerationCurrent,
         }, (revocationSignal) => this.openMiniAppTabOnce(input, sessionId, revocationSignal));
+    }
+    /**
+     * Presents a Mini App tab of `sessionId` the way an open does: selects it in the session and
+     * reveals its pop-out window. For a tab an open made without presenting (`present: false`).
+     */
+    presentMiniAppTab(input) {
+        const tab = this.tabs.get(input.tabId);
+        if (!tab?.miniApp || tab.sessionId !== input.sessionId || this.isUncommittedMiniAppTab(tab))
+            throw miniAppTabNotFoundError();
+        this.markTabSessionSelected(tab);
+        const detachedWindow = tab.detachedWindow;
+        if (detachedWindow && !detachedWindow.isDestroyed())
+            revealMiniAppWindow(detachedWindow);
     }
     async captureMiniAppPreview(input) {
         const tab = this.resolveBrowserTab({ sessionId: input.sessionId, tabId: input.tabId });
@@ -693,6 +755,37 @@ export class EmbeddedBrowserManager {
             // `mainFrame` itself throws once the WebContents is destroyed.
             const tab = this.resolveMiniAppSenderTab(contents, contents.mainFrame);
             return tab?.miniApp ? { pluginId: tab.miniApp.miniApp.pluginId } : null;
+        }
+        catch {
+            return null;
+        }
+    }
+    /** The live page of a managed Mini App tab, for Main-initiated pushes. Null while asleep or gone. */
+    miniAppTabPage(tabId) {
+        const tab = this.tabs.get(tabId);
+        if (!tab?.miniApp || tab.miniApp.stoppedRunId === tab.miniApp.runId)
+            return null;
+        const page = this.getWebContents(tab);
+        if (!page || page.isDestroyed())
+            return null;
+        return { page, runId: tab.miniApp.runId };
+    }
+    /** Calls `onDeath` once the page is destroyed or its renderer process is gone; returns the disposer. */
+    observeMiniAppPageDeath(page, onDeath) {
+        page.on('destroyed', onDeath);
+        page.on('render-process-gone', onDeath);
+        return () => {
+            page.removeListener('destroyed', onDeath);
+            page.removeListener('render-process-gone', onDeath);
+        };
+    }
+    /** The managed tab a page IPC sender belongs to, judged like `identifyMiniAppPage`. */
+    identifyMiniAppPageTab(contents, frame) {
+        if (!contents)
+            return null;
+        try {
+            const tab = this.resolveMiniAppSenderTab(contents, frame);
+            return tab?.miniApp ? { tabId: tab.tabId, runId: tab.miniApp.runId } : null;
         }
         catch {
             return null;
@@ -1485,7 +1578,10 @@ export class EmbeddedBrowserManager {
                 existing.lastLoadError = null;
             }
             assertMiniAppGenerationCurrent(input.isGenerationCurrent);
-            // A restore (`restoreTabId`) only puts the page back; selection stays the user's.
+            // A restore (`restoreTabId`) only puts the page back; selection stays the user's. An open
+            // that presents later (`present: false`) leaves the selection and the pop-out alone.
+            if (input.present === false)
+                return this.miniAppTabSummary(existing);
             if (input.restoreTabId === undefined)
                 this.markTabSessionSelected(existing);
             // An `open` of an already-detached Mini App is a request to see it.
@@ -1561,15 +1657,19 @@ export class EmbeddedBrowserManager {
             this.keepSleepingTabInSession(sleeping, sleepingPosition);
             tab.lastUsedAt = nowMs();
             // Like an `open` of a live pop-out: a request to see it. Unless the user put the window
-            // away while the page loaded: then it stays where they left it, page and all.
-            if (!reopenedFromWindow || isDetachedWindowInView(keptWindow.window)) {
+            // away while the page loaded, or the caller presents later (`present: false`).
+            if (input.present !== false &&
+                (!reopenedFromWindow || isDetachedWindowInView(keptWindow.window))) {
                 revealMiniAppWindow(keptWindow.window);
             }
         }
-        else if (input.restoreTabId === undefined) {
+        else if (input.restoreTabId === undefined && input.present !== false) {
             this.markTabSessionSelected(tab);
         }
         else {
+            // `present: false` joins the session without the selection (a first tab still gets it).
+            if (input.restoreTabId === undefined)
+                this.attachTabToSession(tab);
             tab.lastUsedAt = nowMs();
         }
         this.notifyMiniAppAttention(tab);
@@ -1840,6 +1940,7 @@ export class EmbeddedBrowserManager {
         catch (error) {
             return { success: false, error: safeError(error) };
         }
+        this.takeOverOnUserPageAction(tab);
         return withDevicePreviewLease(tab, async () => {
             await bestEffortHideAgentCursor(tab);
             return setTabDevicePreviewMode(tab, mode);
@@ -1855,6 +1956,7 @@ export class EmbeddedBrowserManager {
         }
         if (tab.miniApp || tab.detachedWindow)
             return { success: false, error: 'Device preview is only available for browser tabs' };
+        this.takeOverOnUserPageAction(tab);
         return this.withTabOperation(tab, 'device-preview', () => withDevicePreviewLease(tab, async () => {
             await bestEffortHideAgentCursor(tab);
             return updateTabDevicePreview(tab, request);
@@ -1908,6 +2010,7 @@ export class EmbeddedBrowserManager {
         }
         const normalizedBounds = this.normalizeBounds(bounds, viewport, layoutContext);
         tab.lastForegroundBounds = normalizedBounds;
+        const previousVisibleTabId = typeof tab.sessionId === 'string' ? this.sessions.get(tab.sessionId)?.visibleTabId : null;
         if (this.blocksNativeTab(tab)) {
             this.markTabSessionSelected(tab, target?.selectForAgent !== true);
             const onscreen = tab.bounds.x >= 0 && tab.bounds.y >= 0;
@@ -1945,8 +2048,24 @@ export class EmbeddedBrowserManager {
                 ? { success: true, tabId: tab.tabId, deferred: 'blocking-overlay' }
                 : { success: true, tabId: tab.tabId, ignored: 'stale-layout-command' };
         }
-        if (target?.selectForAgent === true && typeof tab.sessionId === 'string') {
-            this.getOrCreateSession(tab.sessionId).agentTabId = null;
+        const userPick = target?.selectForAgent === true;
+        const session = typeof tab.sessionId === 'string' ? this.sessions.get(tab.sessionId) : undefined;
+        const agentReveal = !userPick && session?.agentRevealTabId === tab.tabId;
+        if (session && (userPick || agentReveal))
+            session.agentRevealTabId = null;
+        if (userPick && session)
+            session.agentTabId = null;
+        // Turn end keeps an Agent page the user switched to while it stays on
+        // screen (decision T10). `selectForAgent` marks the user's own pick in the
+        // panel tab strip; the strip hides the old page before it shows the picked
+        // one, so the pick itself is the switch. Otherwise a change of the visible
+        // page counts, unless the Agent asked for it (show_tab, open_tab { show }).
+        // The session's first page, shown with no predecessor, does not count.
+        if (userPick ||
+            (!agentReveal &&
+                typeof previousVisibleTabId === 'number' &&
+                previousVisibleTabId !== tab.tabId)) {
+            this.agentControl.noteUserViewed(tab.tabId);
         }
         this.logNativeLayerDiagnostic(tab, this.getWebContents(tab)?.isFocused?.() ?? null, layoutContext?.hostWebContentsId);
         this.logBoundsDiagnostic(tab, bounds, viewport, normalizedBounds, layoutContext);
@@ -2016,6 +2135,7 @@ export class EmbeddedBrowserManager {
                 target.tabIds = [...target.tabIds, ...source.tabIds];
                 target.selectedTabId = source.selectedTabId ?? target.selectedTabId;
                 target.visibleTabId = source.visibleTabId ?? target.visibleTabId;
+                target.pendingRevealTabId = source.pendingRevealTabId ?? target.pendingRevealTabId;
                 target.updatedAt = nowMs();
             }
             else {
@@ -2037,6 +2157,7 @@ export class EmbeddedBrowserManager {
                 this.ensuringSessionTabs.set(toSessionId, pendingCreation);
             }
         }
+        this.agentControl.moveSession(fromSessionId, toSessionId);
         this.adoptedSessions.set(fromSessionId, toSessionId);
         const prefix = `${fromSessionId}\u0000`;
         for (const [key, snapshot] of [...this.coldResumeSnapshots]) {
@@ -2048,7 +2169,7 @@ export class EmbeddedBrowserManager {
         this.registry.renameSession(fromSessionId, toSessionId);
         this.registry.flush();
     }
-    destroy(params) {
+    destroy(params, options = {}) {
         const normalized = typeof params === 'number' ? { tabId: params } : (params ?? {});
         let targetIds;
         let pagelessTargetIds = [];
@@ -2103,6 +2224,15 @@ export class EmbeddedBrowserManager {
         if (normalized.sessionId !== undefined && normalized.tabId === undefined) {
             this.ensuringSessionTabs.delete(normalized.sessionId);
         }
+        if (options.closedByUser === true && typeof normalized.tabId === 'number') {
+            // Closing the web page the Agent is working in is a takeover.
+            const closingTabId = normalized.tabId;
+            const closingSessionId = this.tabs.get(closingTabId)?.sessionId ?? this.pagelessTabs.get(closingTabId)?.sessionId;
+            if (typeof closingSessionId === 'string' && !this.agentClosingTabIds.has(closingTabId)) {
+                this.userClosingTabIds.add(closingTabId);
+                this.takeOverOnUserClose(closingSessionId, closingTabId);
+            }
+        }
         for (const targetId of targetIds) {
             const tab = this.tabs.get(targetId);
             if (tab)
@@ -2116,8 +2246,15 @@ export class EmbeddedBrowserManager {
         const remainingTabs = [...this.tabs.values(), ...this.pagelessTabs.values()].filter((tab) => tab.sessionId === targetSessionId);
         const hasPendingTabs = [...this.creatingTabs.values()].some((creation) => creation.sessionId === targetSessionId && !creation.cancelled);
         const sessionClosed = targetSessionId !== undefined && remainingTabs.length === 0 && !hasPendingTabs;
+        for (const targetId of [...targetIds, ...pagelessTargetIds]) {
+            this.userClosingTabIds.delete(targetId);
+        }
         if (typeof targetSessionId === 'string' && sessionClosed) {
             this.ensuringSessionTabs.delete(targetSessionId);
+            // Keep a takeover lock alive until the turn ends; otherwise forget the session.
+            if (this.agentControl.peekSession(targetSessionId)?.mode === 'idle') {
+                this.agentControl.dropSession(targetSessionId);
+            }
             this.registry.removeSession(targetSessionId);
             const prefix = `${targetSessionId}\u0000`;
             for (const key of this.coldResumeSnapshots.keys()) {
@@ -2144,20 +2281,9 @@ export class EmbeddedBrowserManager {
     }
     destroySuspendedTab(tab, reason) {
         this.pagelessTabs.delete(tab.tabId);
+        this.forgetAgentTab(tab.tabId);
         this.coldResumeSnapshots.delete(this.coldResumeKey(tab));
-        const session = this.sessions.get(tab.sessionId);
-        if (session) {
-            session.tabIds = session.tabIds.filter((tabId) => tabId !== tab.tabId);
-            if (session.selectedTabId === tab.tabId)
-                session.selectedTabId = session.tabIds[0] ?? null;
-            if (session.agentTabId === tab.tabId)
-                session.agentTabId = null;
-            if (session.visibleTabId === tab.tabId)
-                session.visibleTabId = null;
-            session.updatedAt = nowMs();
-            if (session.tabIds.length === 0)
-                this.sessions.delete(tab.sessionId);
-        }
+        this.removeTabFromSession(tab.sessionId, tab.tabId);
         if (reason === 'explicit')
             this.registry.removeTab(tab.sessionId, tab.persistentTabId);
     }
@@ -2458,10 +2584,14 @@ export class EmbeddedBrowserManager {
             activeTabId: tab?.tabId ?? requestedPagelessTab?.tabId ?? null,
             selectedTabId: sessionState?.selectedTabId ?? tab?.tabId ?? null,
             agentTabId: sessionState?.agentTabId ?? sessionState?.selectedTabId ?? null,
+            pendingRevealTabId: sessionState?.pendingRevealTabId ?? null,
             visibleTabId: typeof tab?.sessionId === 'string'
                 ? (sessionState?.visibleTabId ?? null)
                 : (tab?.tabId ?? null),
             tabs: stateTabs,
+            ...(requestedSessionId
+                ? { browserControl: this.agentControl.snapshot(requestedSessionId) }
+                : {}),
             annotationEnabled: tab?.commentModeEnabled ?? false,
             commentEvents,
             maxCommentEventId: tab
@@ -2490,6 +2620,8 @@ export class EmbeddedBrowserManager {
             createIfMissing: true,
             bounds: OFFSCREEN_BOUNDS,
         });
+        if (origin === 'user')
+            this.takeOverOnUserPageAction(tab);
         tab.lastLoadError = null;
         return this.withTabOperation(tab, 'go-back', () => tab.controller.goBack(), {
             signal,
@@ -2502,6 +2634,8 @@ export class EmbeddedBrowserManager {
             createIfMissing: true,
             bounds: OFFSCREEN_BOUNDS,
         });
+        if (origin === 'user')
+            this.takeOverOnUserPageAction(tab);
         tab.lastLoadError = null;
         return this.withTabOperation(tab, 'go-forward', () => tab.controller.goForward(), {
             signal,
@@ -2514,6 +2648,8 @@ export class EmbeddedBrowserManager {
             createIfMissing: true,
             bounds: OFFSCREEN_BOUNDS,
         });
+        if (origin === 'user')
+            this.takeOverOnUserPageAction(tab);
         tab.lastLoadError = null;
         return this.withTabOperation(tab, 'reload', () => tab.controller.reload(), {
             signal,
@@ -2539,6 +2675,7 @@ export class EmbeddedBrowserManager {
         const wc = this.getWebContents(tab);
         if (!wc)
             return { success: false, error: 'WebContents not available' };
+        this.takeOverOnUserPageAction(tab);
         tab.lastLoadError = null;
         this.noteUserBrowserTakeover(tab);
         wc.reloadIgnoringCache();
@@ -2554,6 +2691,7 @@ export class EmbeddedBrowserManager {
         }
         if (!tab)
             return { success: false, error: 'No embedded tab is available' };
+        this.takeOverOnUserPageAction(tab);
         const nextFactor = Math.min(3, Math.max(0.25, factor));
         const result = await tab.controller.setZoomFactor(nextFactor);
         return {
@@ -2584,6 +2722,8 @@ export class EmbeddedBrowserManager {
         const wc = this.getWebContents(tab);
         if (!wc || wc.isDestroyed())
             return { success: false, error: 'WebContents not available' };
+        // Finding scrolls and selects in the page.
+        this.takeOverOnUserPageAction(tab);
         tab.findInPage = runFindInPage(wc, request);
         return { success: true, tabId: tab.tabId, requestId: tab.findInPage.requestId };
     }
@@ -2623,6 +2763,8 @@ export class EmbeddedBrowserManager {
         const wc = this.getWebContents(tab);
         if (!wc)
             return { success: false, error: 'WebContents not available' };
+        // The Browser session is shared: every page the Agent controls loses its sign-in.
+        this.takeOverAllAgentControl();
         await this.withTabOperation(tab, 'clear-cookies', () => wc.session.clearStorageData({ storages: ['cookies'] }));
         return { success: true, tabId: tab.tabId };
     }
@@ -2637,6 +2779,7 @@ export class EmbeddedBrowserManager {
         const wc = this.getWebContents(tab);
         if (!wc)
             return { success: false, error: 'WebContents not available' };
+        this.takeOverAllAgentControl();
         await this.withTabOperation(tab, 'clear-cache', () => wc.session.clearCache());
         return { success: true, tabId: tab.tabId };
     }
@@ -3023,6 +3166,7 @@ export class EmbeddedBrowserManager {
             // executeTool reports the unresolved target.
         }
         if (tab) {
+            this.takeOverOnUserPageAction(tab);
             tab.userNavigationCount = (tab.userNavigationCount ?? 0) + 1;
             this.noteUserBrowserTakeover(tab);
         }
@@ -3046,7 +3190,7 @@ export class EmbeddedBrowserManager {
         const previousOperationCount = Math.max(0, tab.operationCount ?? 0);
         tab.operationCount = previousOperationCount + 1;
         const userNavigation = options.userNavigation === true || (tab.userNavigationCount ?? 0) > 0;
-        const agentOperation = this.agentToolCallDepth > 0 && !userNavigation;
+        const agentOperation = this.agentToolScope.getStore()?.active === true && !userNavigation;
         if (agentOperation) {
             tab.agentOperationCount = Math.max(0, tab.agentOperationCount ?? 0) + 1;
             tab.lastAgentOperationAt = nowMs();
@@ -3273,21 +3417,32 @@ export class EmbeddedBrowserManager {
         session.updatedAt = nowMs();
     }
     detachTabFromSession(tab) {
-        if (typeof tab.sessionId !== 'string')
-            return;
-        const session = this.sessions.get(tab.sessionId);
+        this.forgetAgentTab(tab.tabId);
+        if (typeof tab.sessionId === 'string')
+            this.removeTabFromSession(tab.sessionId, tab.tabId);
+    }
+    /**
+     * The one place a tab leaves its session's bookkeeping: every per-session
+     * pointer at it is cleared here, so a new pointer field is added once.
+     */
+    removeTabFromSession(sessionId, tabId) {
+        const session = this.sessions.get(sessionId);
         if (!session)
             return;
-        session.tabIds = session.tabIds.filter((tabId) => tabId !== tab.tabId);
-        if (session.selectedTabId === tab.tabId)
+        session.tabIds = session.tabIds.filter((id) => id !== tabId);
+        if (session.selectedTabId === tabId)
             session.selectedTabId = session.tabIds[0] ?? null;
-        if (session.agentTabId === tab.tabId)
+        if (session.agentTabId === tabId)
             session.agentTabId = null;
-        if (session.visibleTabId === tab.tabId)
+        if (session.visibleTabId === tabId)
             session.visibleTabId = null;
+        if (session.pendingRevealTabId === tabId)
+            session.pendingRevealTabId = null;
+        if (session.agentRevealTabId === tabId)
+            session.agentRevealTabId = null;
         session.updatedAt = nowMs();
         if (session.tabIds.length === 0)
-            this.sessions.delete(tab.sessionId);
+            this.sessions.delete(sessionId);
     }
     markTabSelected(tab, preserveAgentTarget = false) {
         this.activeTabId = tab.tabId;
@@ -3323,6 +3478,8 @@ export class EmbeddedBrowserManager {
             return;
         const session = this.getOrCreateSession(tab.sessionId);
         session.visibleTabId = tab.tabId;
+        if (session.pendingRevealTabId === tab.tabId)
+            session.pendingRevealTabId = null;
         session.updatedAt = nowMs();
         if (hiddenMs > 0)
             this.logTabLifecycle('shown', tab, { hiddenMs });
@@ -3434,8 +3591,19 @@ export class EmbeddedBrowserManager {
             availableMemoryMiB: Math.round(budget.availableBytes / 1024 ** 2),
             totalMemoryGiB: Math.round((budget.totalBytes / 1024 ** 3) * 10) / 10,
         });
-        hiddenTabs.sort((a, b) => memoryWeightedLruValue(a.lastUsedAt ?? a.hiddenAt ?? 0, budget.estimatedWorkingSetKiBByTabId.get(a.tabId) ?? 0) -
-            memoryWeightedLruValue(b.lastUsedAt ?? b.hiddenAt ?? 0, budget.estimatedWorkingSetKiBByTabId.get(b.tabId) ?? 0));
+        // Reclaim order follows Codex: other chats' background pages first, then
+        // other chats' selected pages (once their 30-minute protection ends), the
+        // chat the user is on last; least recently used first within each group.
+        const currentSessionId = this.activeTabId === null ? undefined : this.tabs.get(this.activeTabId)?.sessionId;
+        const reclaimRank = (tab) => {
+            if (typeof tab.sessionId !== 'string')
+                return 0;
+            if (tab.sessionId === currentSessionId)
+                return 2;
+            return this.sessions.get(tab.sessionId)?.selectedTabId === tab.tabId ? 1 : 0;
+        };
+        hiddenTabs.sort((a, b) => reclaimRank(a) - reclaimRank(b) ||
+            (a.lastUsedAt ?? a.hiddenAt ?? 0) - (b.lastUsedAt ?? b.hiddenAt ?? 0));
         const reclaimableTabs = hiddenTabs.filter((tab) => this.canDestroyHiddenTab(tab));
         const hiddenTabBudget = Math.min(MAX_HIDDEN_TABS, budget.hiddenTabBudget);
         const overBudgetCount = Math.max(0, reclaimableTabs.length - hiddenTabBudget);
@@ -3603,9 +3771,9 @@ export class EmbeddedBrowserManager {
             // Agent control ended: a dialog it left open goes back to the user's native box.
             this.releaseHeldJsDialogToUser(tab);
             tab.controller.setBackgroundThrottlingAllowed(true);
-            if (tab.hiddenAt != null && this.activeTabId !== tab.tabId) {
-                void this.suspendTab(tab, 'agent-keepalive-expired');
-            }
+            // Time alone never suspends a page the Agent used: only the hidden-tab
+            // budget does, in the sweep.
+            this.ensureHiddenSweepTimer();
         }, delayMs);
         timer.unref?.();
         tab.agentKeepaliveTimer = timer;
@@ -3626,6 +3794,14 @@ export class EmbeddedBrowserManager {
         // An agent mid-turn still holds refs into this page; destroying it would
         // cold-resume the tab and silently invalidate every outstanding handle.
         if (isWithinAgentKeepalive(tab))
+            return false;
+        // The page the Agent controls stays live for the whole turn (Codex keeps
+        // pages in active Browser use the same way).
+        const controllingSession = this.agentControl.sessionOfControlledTab(tab.tabId);
+        const controlMode = controllingSession === undefined
+            ? undefined
+            : this.agentControl.peekSession(controllingSession)?.mode;
+        if (controlMode === 'agent')
             return false;
         const hiddenMs = nowMs() - tab.hiddenAt;
         if (typeof tab.sessionId === 'string' &&
@@ -4142,7 +4318,23 @@ export class EmbeddedBrowserManager {
         }
         // Do not let a slow page open override a newer user selection or a hide.
         const showLayoutCommandId = this.latestShowLayoutCommandId;
-        const openedByAgent = (source.agentExecutionGlowLeases ?? 0) > 0;
+        // During an Agent action, or shortly after an Agent click: a target=_blank
+        // page may start opening after the click returned. Only a page of the
+        // Agent's in agent mode counts: the tab it controls, or its own page the
+        // user has not used. A page the user opens from their own tab (also while
+        // the Agent reads it), after a takeover or after the turn ended is the user's.
+        const sourceSessionId = source.sessionId;
+        const sourceRecord = this.agentControl.tab(source.tabId);
+        const openedByAgent = typeof sourceSessionId === 'string' &&
+            this.agentControl.peekSession(sourceSessionId)?.mode === 'agent' &&
+            (this.agentControl.controlledTabId(sourceSessionId) === source.tabId ||
+                (sourceRecord?.owner === 'agent' &&
+                    sourceRecord.sessionId === sourceSessionId &&
+                    sourceRecord.userTouched !== true)) &&
+            ((source.agentExecutionGlowLeases ?? 0) > 0 || (source.agentClickGraceUntil ?? 0) > nowMs());
+        // One click opens one page; a later page is the user's again.
+        if (openedByAgent)
+            delete source.agentClickGraceUntil;
         // The Agent action that opened this page waits for it, so its result and
         // the renderer event already see the new target.
         const settleAgentPageOpen = openedByAgent && typeof source.sessionId === 'string'
@@ -4173,6 +4365,11 @@ export class EmbeddedBrowserManager {
                 requestedUrl: url,
             });
             const target = opened;
+            // A page the Agent's action opened is a temporary Agent page; one the user opened is theirs.
+            if (openedByAgent)
+                this.registerAgentTab(target, source.tabId);
+            else if (typeof source.sessionId === 'string')
+                this.agentControl.noteUserTouched(source.tabId);
             // Hold the new tab through the foreground handoff; finishing its load
             // must not make the hidden-tab sweeper reclaim it between awaits.
             target.operationCount += 1;
@@ -4199,11 +4396,17 @@ export class EmbeddedBrowserManager {
             target.lastLoadError = presentationLoadError(target.lastLoadError, result, url);
             this.refreshTabState(target);
             if (openedByAgent && result.success !== false && typeof source.sessionId === 'string') {
-                const session = this.sessions.get(source.sessionId);
-                if (session && (session.agentTabId ?? session.selectedTabId) === source.tabId) {
+                // The Agent's click opened it: the lease follows into the new tab.
+                if (this.agentControl.controlledTabId(source.sessionId) === source.tabId) {
                     target.lastAgentOperationAt = nowMs();
                     this.scheduleAgentKeepaliveExpiry(target);
-                    this.adoptAgentOpenedTab(target);
+                    if (!this.agentControl.isEphemeral(source.sessionId))
+                        this.adoptAgentOpenedTab(target);
+                    this.agentControl.grantLease(source.sessionId, target.tabId);
+                    this.agentTabOutcomes.set(source.sessionId, {
+                        openedTabId: target.tabId,
+                        previousTabId: source.tabId,
+                    });
                 }
             }
             // A native overlay may have blocked the early reveal; retry once it is gone.
@@ -4314,7 +4517,10 @@ export class EmbeddedBrowserManager {
             }
             // adoptSession may have moved this tab to another session while it was created.
             const normalizedSessionId = creation.sessionId;
-            const persistedTab = typeof normalizedSessionId === 'string' && !args.miniApp
+            // A sub-Agent's pages are never saved: they end with it.
+            const persistedTab = typeof normalizedSessionId === 'string' &&
+                !args.miniApp &&
+                !this.agentControl.isEphemeral(normalizedSessionId)
                 ? this.registry.createTab(normalizedSessionId, {
                     ...(args.persistentTabId ? { persistentTabId: args.persistentTabId } : {}),
                     ...(args.requestedUrl ? { requestedUrl: args.requestedUrl } : {}),
@@ -4365,6 +4571,12 @@ export class EmbeddedBrowserManager {
             });
             this.bindMiniAppPageReload(tab);
             this.tabs.set(tabId, tab);
+            // A restored page the Agent opened is still its temporary page.
+            if (typeof normalizedSessionId === 'string' &&
+                persistedTab?.owner === 'agent' &&
+                !this.agentControl.tab(tabId)) {
+                this.agentControl.registerTab(normalizedSessionId, tabId, 'agent');
+            }
             // Register before the first navigation so the initial page load is authenticated.
             if (args.miniApp)
                 this.syncMiniAppLoopbackAuth(tab);
@@ -4812,10 +5024,50 @@ export class EmbeddedBrowserManager {
             if (!isEmbeddedBrowserReloadShortcut(input))
                 return;
             event.preventDefault();
+            // Keys typed into the Agent-controlled page are blocked, shortcuts included.
+            if (this.blockPageShortcutOnControlledTab(tab))
+                return;
             tab.lastLoadError = null;
             void this.withTabOperation(tab, 'reload', () => tab.controller.reload(), {
                 userNavigation: true,
             }).catch(() => undefined);
+        });
+    }
+    /**
+     * While the Agent controls this page the user cannot type or click in it
+     * (the panel offers "take over"); elsewhere their input marks the page as used.
+     */
+    bindAgentControlInputGuard(tab, wc) {
+        // A rebuilt page and every newly loaded document or frame needs the scroll guard again.
+        this.syncUserScrollGuard(tab);
+        for (const event of ['dom-ready', 'did-frame-finish-load']) {
+            this.addTabListener(tab, wc, event, () => {
+                if (this.getWebContents(tab) === wc)
+                    this.syncUserScrollGuard(tab, { reinstall: true });
+            });
+        }
+        this.addTabListener(tab, wc, 'before-input-event', (event, input) => {
+            const key = input;
+            this.handleUserPageInput(tab, wc, event, key.type === 'keyDown' || key.type === 'rawKeyDown');
+        });
+        this.addTabListener(tab, wc, 'before-mouse-event', (event, input) => {
+            const mouse = input;
+            // Hover moves stay harmless; presses and releases are the user acting. Wheel
+            // scrolling never arrives here; agent-scroll-guard blocks it in the page.
+            if (mouse.type === 'mouseMove' ||
+                mouse.type === 'mouseEnter' ||
+                mouse.type === 'mouseLeave') {
+                if (!isAgentInputActive(wc)) {
+                    if (mouse.type === 'mouseLeave')
+                        this.takeoverPill.noteUserLeave(tab);
+                    else
+                        this.takeoverPill.noteUserHover(tab);
+                }
+                return;
+            }
+            if (this.handleTakeoverPillPress(tab, wc, event, mouse.type))
+                return;
+            this.handleUserPageInput(tab, wc, event, mouse.type === 'mouseDown' || mouse.type === 'mouseWheel');
         });
     }
     bindWebContentsEvents(tab) {
@@ -4823,6 +5075,7 @@ export class EmbeddedBrowserManager {
         if (!wc)
             return;
         this.downloads.watch(wc.session);
+        this.bindAgentControlInputGuard(tab, wc);
         this.bindFindInPageEvents(tab, wc);
         this.bindPageReloadEvents(tab, wc);
         // WebContentsView mouse events do not bubble to the host document. During
@@ -4882,6 +5135,7 @@ export class EmbeddedBrowserManager {
             });
         }
         this.addTabListener(tab, wc, 'did-navigate', (...args) => {
+            tab.controller.handleAgentSurfaceNavigationCommitted?.();
             this.refreshTabState(tab);
             const state = this.navigationDiagnostics.get(tab.tabId);
             const rawUrl = typeof args[1] === 'string' ? args[1] : tab.url;
@@ -4981,7 +5235,9 @@ export class EmbeddedBrowserManager {
                 });
             }
             if (!tab.miniApp &&
-                (this.isAgentCursorEnabled() || (tab.agentExecutionGlowLeases ?? 0) > 0)) {
+                (this.isAgentCursorEnabled() ||
+                    (tab.agentExecutionGlowLeases ?? 0) > 0 ||
+                    tab.agentProgramGlow === true)) {
                 void tab.controller.installAgentCursorBridge?.();
             }
             if (tab.hiddenAt == null && tab.bounds.x >= 0 && tab.bounds.y >= 0) {
@@ -5651,6 +5907,18 @@ export class EmbeddedBrowserManager {
         return task;
     }
     async handleAgentCursorBridgeEvent(sender, envelope) {
+        const pillMessage = normalizeTakeoverPillMessage(envelope);
+        if (pillMessage) {
+            const tab = this.tabs.get(pillMessage.tabId);
+            if (!tab || !sender || this.getWebContents(tab) !== sender) {
+                return { success: false, error: 'Invalid embedded browser event sender' };
+            }
+            if (tab.sessionId !== pillMessage.sessionId) {
+                return { success: false, error: 'Takeover pill event identity mismatch' };
+            }
+            this.takeoverPill.notePointerOnAction(tab, pillMessage.inside);
+            return { success: true, tabId: tab.tabId };
+        }
         return handleAgentCursorBridgeEvent({
             sender,
             envelope,
@@ -6007,38 +6275,6 @@ export class EmbeddedBrowserManager {
         this.markTabSessionSelected(tab);
         session.agentTabId = null;
     }
-    /**
-     * Record the Agent Turn using this session's Browser. A background Agent page
-     * does not outlive its Turn unnoticed: at a new Turn follow the page the user
-     * is viewing, or, when none is on screen, let the Browser show the Agent page.
-     */
-    syncAgentBrowserTurn(sessionId, turnId) {
-        const session = this.sessions.get(sessionId);
-        if (!turnId || !session)
-            return;
-        const previousTurnId = session.agentTurnId;
-        session.agentTurnId = turnId;
-        const agentTabId = session.agentTabId;
-        if (previousTurnId === undefined ||
-            previousTurnId === turnId ||
-            typeof agentTabId !== 'number' ||
-            agentTabId === session.selectedTabId) {
-            return;
-        }
-        if (!this.isSessionShownInPanel(sessionId)) {
-            const live = this.tabs.get(agentTabId);
-            const suspended = this.suspendedBrowserTab(agentTabId);
-            if (live?.sessionId === sessionId) {
-                this.markTabSessionSelected(live);
-            }
-            else if (suspended?.sessionId === sessionId) {
-                session.selectedTabId = agentTabId;
-                session.updatedAt = nowMs();
-                this.registry.selectTab(sessionId, suspended.persistentTabId);
-            }
-        }
-        session.agentTabId = null;
-    }
     trackAgentPageOpen(sessionId) {
         let settle;
         const settled = new Promise((resolve) => {
@@ -6075,39 +6311,6 @@ export class EmbeddedBrowserManager {
             signal?.removeEventListener('abort', stopWaiting);
         }
     }
-    async ensureAgentBrowserTab(sessionId) {
-        const agentTabId = this.sessions.get(sessionId)?.agentTabId;
-        if (typeof agentTabId === 'number') {
-            const agentTab = this.tabs.get(agentTabId);
-            if (agentTab?.sessionId === sessionId)
-                return agentTab;
-            if (this.pagelessTabs.get(agentTabId)?.sessionId === sessionId) {
-                return this.requireResumedTab(agentTabId, sessionId);
-            }
-        }
-        const pending = this.ensuringSessionTabs.get(sessionId);
-        if (pending)
-            return pending;
-        const selected = this.resolveSelectedTabBySession(sessionId);
-        if (selected)
-            return selected;
-        const selectedTabId = this.sessions.get(sessionId)?.selectedTabId;
-        if (typeof selectedTabId === 'number' &&
-            this.pagelessTabs.get(selectedTabId)?.sessionId === sessionId) {
-            return this.requireResumedTab(selectedTabId, sessionId);
-        }
-        const ordinary = this.resolveOrdinaryTabBySession(sessionId);
-        if (ordinary) {
-            this.markTabSessionSelected(ordinary);
-            return ordinary;
-        }
-        return this.ensureSessionTabCreation(sessionId, () => this.openTab({
-            active: false,
-            bounds: OFFSCREEN_BOUNDS,
-            sessionId,
-            selectInSession: true,
-        }));
-    }
     resolveTabBySession(sessionId) {
         if (typeof sessionId === 'string')
             return this.resolveSelectedTabBySession(sessionId);
@@ -6133,39 +6336,133 @@ export class EmbeddedBrowserManager {
     }
     async executeAgentTool(sessionId, tool, rawArgs, signal, context = {}) {
         // Agent tool routing trusts the runtime-owned session, never model-provided
-        // target fields in rawArgs. Keep the preview/action lease on that same tab.
+        // target fields in rawArgs. Writes go only to the session's controlled tab.
         if (!AGENT_BROWSER_ACTIONS.has(tool)) {
             throw new Error(`Unsupported Agent browser action: ${tool}`);
         }
+        // A page an earlier click opened late (see withAgentClickGrace), or a popup
+        // that closed itself since the last action, is reported by this action.
         await this.waitForAgentPageOpens(sessionId, signal);
-        this.syncAgentBrowserTurn(sessionId, context.turnId);
+        let result;
         try {
-            return await this.runAgentBrowserAction(sessionId, tool, rawArgs, signal);
+            this.beginAgentBrowserCall(sessionId, context);
+            this.agentControl.assertNotTakenOver(sessionId);
+            // A page an earlier click opened after it returned took the lease, or the
+            // controlled popup closed itself and the lease went back to its opener: a
+            // write meant for the page the model last saw would land on another page
+            // unseen. Report the change instead; reads and tab actions run as asked.
+            const pending = this.agentTabOutcomes.get(sessionId);
+            const write = AGENT_READ_ACTIONS[tool] !== true &&
+                resolveElectronBrowserActionRoute(tool)?.owner !== 'host';
+            result =
+                write && pending?.openedTabId !== undefined
+                    ? {
+                        success: false,
+                        code: 'STALE_SNAPSHOT',
+                        error: `${tool} was not run: the previous action opened a new tab and control moved to it.`,
+                    }
+                    : write && pending?.leaseReturnedTo !== undefined
+                        ? {
+                            success: false,
+                            code: 'STALE_SNAPSHOT',
+                            error: `${tool} was not run: the tab you controlled closed itself; control returned to tab ${pending.leaseReturnedTo}. Inspect it before writing.`,
+                            recovery: `Inspect tab ${pending.leaseReturnedTo} before writing.`,
+                        }
+                        : await this.runAgentBrowserAction(sessionId, tool, rawArgs, signal, context.reveal);
+        }
+        catch (error) {
+            this.agentTabOutcomes.delete(sessionId);
+            // A takeover during the action aborts it; report the takeover, not the abort.
+            if (this.agentControl.peekSession(sessionId)?.mode === 'user') {
+                throw browserUserTakeoverError();
+            }
+            throw error;
         }
         finally {
             // A page opened by this action is the target before its result returns.
             await this.waitForAgentPageOpens(sessionId, signal);
-            // Record the Turn on a session state created by this action.
-            this.syncAgentBrowserTurn(sessionId, context.turnId);
+        }
+        if (this.agentControl.peekSession(sessionId)?.mode === 'user') {
+            this.agentTabOutcomes.delete(sessionId);
+            throw browserUserTakeoverError();
+        }
+        return this.withAgentTabOutcome(sessionId, result);
+    }
+    /** Enters the call's turn; a turn that never reported its end is tidied first. */
+    beginAgentBrowserCall(sessionId, context) {
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+            const begun = this.agentControl.beginAgentCall(sessionId, context.turnId, {
+                ...(context.ephemeral ? { ephemeral: true } : {}),
+            });
+            if (!begun.unfinishedTurnId)
+                return;
+            this.finalizeAgentTurn(sessionId, begun.unfinishedTurnId);
         }
     }
-    async runAgentBrowserAction(sessionId, tool, rawArgs, signal) {
-        if (tool === 'open_tab') {
-            return this.runWithAgentToolScope(() => this.openAgentTab(sessionId, rawArgs, signal));
+    /** Adds the popup and lease changes of the action to its result. */
+    withAgentTabOutcome(sessionId, result) {
+        const outcome = this.agentTabOutcomes.get(sessionId);
+        this.agentTabOutcomes.delete(sessionId);
+        if (!outcome || !result || typeof result !== 'object' || Array.isArray(result))
+            return result;
+        const record = result;
+        const extra = {};
+        if (typeof outcome.openedTabId === 'number') {
+            const opened = this.tabs.get(outcome.openedTabId);
+            if (opened) {
+                this.refreshTabState(opened);
+                extra.openedTab = { tabId: opened.tabId, url: opened.url, title: opened.title };
+                extra.previousTabId = outcome.previousTabId ?? null;
+                extra.notice =
+                    'The page opened a new tab; it is now the controlled tab. Inspect it before acting.';
+            }
         }
-        const tab = await this.ensureAgentBrowserTab(sessionId);
-        if (tool === 'navigate' &&
-            hasLoadedBrowserPage(tab.url) &&
-            rawArgs.replaceCurrentTab !== true) {
-            throw new Error('CURRENT_TAB_OCCUPIED: Current Browser tab already has a loaded page; retry with open_tab');
+        if (typeof outcome.leaseReturnedTo === 'number') {
+            extra.leaseReturnedTo = outcome.leaseReturnedTo;
+            extra.notice = 'The opened tab closed itself; control returned to the tab that opened it.';
         }
-        // The Electron provider owns this visible loaded-tab guard. Browser Core
-        // remains provider-neutral and performs navigation after this host policy check.
-        const trustedArgs = tool === 'navigate'
-            ? Object.fromEntries(Object.entries(rawArgs).filter(([key]) => key !== 'replaceCurrentTab'))
-            : rawArgs;
-        const execute = () => this.toolRuntime.executeAgentTool({ sessionId, tabId: tab.tabId }, tool, trustedArgs, signal);
-        return this.runWithAgentToolScope(() => executeWithAgentExecutionGlow(tab, () => executeWithAgentCursorLease(tab, execute, {
+        if (Object.keys(extra).length === 0)
+            return result;
+        return { ...record, ...extra, controlledTabId: this.agentControl.controlledTabId(sessionId) };
+    }
+    async runAgentBrowserAction(sessionId, tool, rawArgs, signal, reveal) {
+        switch (tool) {
+            case 'open_tab': {
+                const opened = await this.runWithAgentToolScope(() => this.openAgentTab(sessionId, rawArgs, signal));
+                if (opened.success === false || typeof opened.tabId !== 'number')
+                    return opened;
+                if (this.isMiniAppTabId(opened.tabId)) {
+                    // Opening a Mini App shows it; a user in another chat sees it on return.
+                    this.notePendingReveal(sessionId, opened.tabId);
+                    return opened;
+                }
+                if (rawArgs.show !== true)
+                    return opened;
+                return { ...opened, ...(await this.showAgentTab(sessionId, opened.tabId, reveal, signal)) };
+            }
+            case 'show_tab':
+                return this.showAgentTab(sessionId, this.resolveShowTabId(sessionId, rawArgs), reveal, signal);
+            case 'list_tabs':
+                return this.listAgentTabs(sessionId);
+            case 'select_tab':
+                return this.selectAgentTab(sessionId, rawArgs);
+            case 'close_tab':
+                return this.closeAgentTab(sessionId, rawArgs);
+            case 'mark_tab':
+                return this.markAgentTab(sessionId, rawArgs);
+            case 'release_tab':
+                return this.releaseAgentTab(sessionId, rawArgs);
+            default:
+                break;
+        }
+        const tab = await this.resolveAgentTargetTab(sessionId, tool);
+        // A Mini App page keeps the app: navigate never replaces it with another URL.
+        if (tool === 'navigate' && tab.miniApp)
+            throw miniAppNavigateBlockedError();
+        const execute = () => this.toolRuntime.executeAgentTool({ sessionId, tabId: tab.tabId }, tool, rawArgs, signal);
+        return this.runWithAgentToolScope(() => executeWithAgentExecutionGlow(tab, () => executeWithAgentCursorLease(tab, AGENT_CLICK_ACTIONS[tool] === true
+            ? () => this.withAgentClickGrace(tab, execute)
+            : execute, {
             hideBeforeAction: tool === 'navigate' ||
                 tool === 'back' ||
                 tool === 'forward' ||
@@ -6174,6 +6471,1070 @@ export class EmbeddedBrowserManager {
                 tool === 'scroll',
         })));
     }
+    /**
+     * Runs an Agent click on `tab`. A page the tab opens until the click
+     * returns, or within the popup wait after it, is the Agent's: a
+     * target=_blank page may start opening after the click returned.
+     */
+    async withAgentClickGrace(tab, click) {
+        tab.agentClickGraceUntil = Number.POSITIVE_INFINITY;
+        try {
+            return await click();
+        }
+        finally {
+            // A page opened during the click already used the grace.
+            if (tab.agentClickGraceUntil !== undefined) {
+                tab.agentClickGraceUntil = nowMs() + PROGRAM_POPUP_WAIT_MS;
+            }
+        }
+    }
+    /**
+     * The internal `program_op` action: one page operation of a Browser program
+     * (run_script on a PTC Turn), never a model action. It follows the Agent's
+     * control rules like a direct action: a takeover stops it, a write needs the
+     * controlled tab, a read may name any tab of the session. Tab ops take the
+     * same paths as the tab actions. Every outcome is a result, never a throw.
+     */
+    async executeAgentProgramOp(sessionId, op, signal, context = {}) {
+        const name = typeof op.op === 'string' ? op.op : 'unknown';
+        const startedAt = nowMs();
+        const trustedSessionId = sessionId.trim();
+        // Set once the op reached the page: a takeover then may have hit a write that landed.
+        const dispatched = { write: false };
+        let result;
+        try {
+            if (signal?.aborted)
+                throw new Error('ABORTED: The Browser program was cancelled.');
+            if (!trustedSessionId)
+                throw new Error('Browser tool requires an active session');
+            this.pauseProgramGlowIdle(trustedSessionId);
+            await this.waitForAgentPageOpens(trustedSessionId, signal);
+            this.beginAgentBrowserCall(trustedSessionId, context);
+            this.agentControl.assertNotTakenOver(trustedSessionId);
+            // A popup an earlier op opened was reported by it; one that closed itself
+            // since then (its lease went back to its opener) is reported by this op.
+            const returned = this.agentTabOutcomes.get(trustedSessionId)?.leaseReturnedTo;
+            this.agentTabOutcomes.delete(trustedSessionId);
+            if (returned !== undefined) {
+                this.agentTabOutcomes.set(trustedSessionId, { leaseReturnedTo: returned });
+            }
+            result =
+                PROGRAM_TAB_OPS[name] === true
+                    ? programTabResult(name, await this.runProgramTabOp(trustedSessionId, name, op, signal, context.reveal), startedAt, op)
+                    : await this.runProgramPageOp(trustedSessionId, name, op, startedAt, dispatched, signal);
+            if (this.agentControl.peekSession(trustedSessionId)?.mode === 'user') {
+                result = programUserTakeoverResult(name, result, startedAt, op);
+            }
+        }
+        catch (error) {
+            // A takeover during the op aborts it; report the takeover, not the abort.
+            // A write the page already received may have landed: its outcome is unknown.
+            const takenOver = trustedSessionId !== '' && this.agentControl.peekSession(trustedSessionId)?.mode === 'user';
+            result = takenOver
+                ? programUserTakeoverResult(name, dispatched.write
+                    ? { step: { op: name, write: true, durationMs: nowMs() - startedAt } }
+                    : undefined, startedAt, op)
+                : programThrownResult(name, error, startedAt, op);
+        }
+        if (!trustedSessionId)
+            return result;
+        this.armProgramGlowIdle(trustedSessionId);
+        // A popup that closed itself handed the lease back to its opener.
+        const leaseReturnedTo = this.agentTabOutcomes.get(trustedSessionId)?.leaseReturnedTo;
+        this.agentTabOutcomes.delete(trustedSessionId);
+        return typeof leaseReturnedTo === 'number' ? { ...asRecord(result), leaseReturnedTo } : result;
+    }
+    /**
+     * A program's tab op, as the matching tab action: `tabs` lists the same rows
+     * as list_tabs (with the program's `current` names for the controlled tab),
+     * `newPage` is open_tab, `selectTab` is select_tab, `closeTab` is close_tab,
+     * `keep` is mark_tab, `show` is show_tab. A tab outside the session fails in
+     * the program's words.
+     */
+    async runProgramTabOp(sessionId, name, op, signal, reveal) {
+        if (name === 'newPage') {
+            // A program names the page it opens; an address-bar search or a local file is not one.
+            if (typeof op.url !== 'string' || !/^https?:\/\//iu.test(op.url)) {
+                return {
+                    success: false,
+                    code: 'INVALID_OP',
+                    error: 'newPage needs an absolute http(s) URL.',
+                };
+            }
+            const url = op.url;
+            return this.runWithAgentToolScope(() => this.openAgentTab(sessionId, { url }, signal));
+        }
+        if (name === 'tabs') {
+            // browser.panel() only reads the list: resolving the current page could open a blank one.
+            const currentTabId = op.current === false ? null : await this.programCurrentTabId(sessionId);
+            const listed = this.listAgentTabs(sessionId);
+            const rows = Array.isArray(listed.tabs) ? listed.tabs : [];
+            return {
+                ...listed,
+                currentTabId,
+                tabs: rows.map((row) => ({ ...row, current: row.controlled === true })),
+            };
+        }
+        const keep = name === 'keep' ? readProgramKeepOp(op) : undefined;
+        const tabId = keep?.tabId ?? op.tabId ?? this.agentControl.controlledTabId(sessionId);
+        if (typeof tabId !== 'number' || !this.isSessionTabId(sessionId, tabId)) {
+            return programTabFailure('TAB_NOT_FOUND', typeof tabId === 'number' ? tabId : null);
+        }
+        if (keep) {
+            const marked = this.markAgentTab(sessionId, keep);
+            // page.keep() speaks the program's language, not mark_tab's.
+            return marked.retention === 'carryover'
+                ? { ...marked, notice: PROGRAM_CARRYOVER_NOTICE }
+                : marked;
+        }
+        if (name === 'show')
+            return this.showAgentTab(sessionId, tabId, reveal, signal);
+        if (name === 'selectTab')
+            return this.selectAgentTab(sessionId, { tabId });
+        // page.close() closes a page the Agent opened; the user's page (or a Mini
+        // App the user opened) stays open. close_tab may still close it when asked.
+        const record = this.agentControl.tab(tabId);
+        if (record?.owner !== 'agent' || record.sessionId !== sessionId) {
+            return programCloseNotOwnedFailure(tabId);
+        }
+        return this.closeAgentTab(sessionId, { tabId });
+    }
+    /**
+     * The page `browser.page()` lands on: the controlled tab, else the page the
+     * user has selected, else (a session without tabs) a blank Agent page that
+     * takes the lease, as for a first direct action. Null only when no tab of
+     * the session can be named.
+     */
+    async programCurrentTabId(sessionId) {
+        const controlledTabId = this.agentControl.controlledTabId(sessionId);
+        if (controlledTabId !== null && this.isSessionTabId(sessionId, controlledTabId)) {
+            return controlledTabId;
+        }
+        const selectedTabId = this.sessions.get(sessionId)?.selectedTabId;
+        if (typeof selectedTabId === 'number' && this.isSessionTabId(sessionId, selectedTabId)) {
+            return selectedTabId;
+        }
+        if (this.ensuringSessionTabs.has(sessionId) || !this.sessionHasBrowserTabs(sessionId)) {
+            return (await this.resolveAgentTargetTab(sessionId, 'navigate')).tabId;
+        }
+        return (this.resolveOrdinaryTabBySession(sessionId)?.tabId ?? this.sessionTabIds(sessionId)[0] ?? null);
+    }
+    /**
+     * A program's page op on the tab it names, else on the tab a direct action
+     * of the same kind would use. A write runs only on the controlled tab; a
+     * write on another Agent page of the session takes the lease first (as
+     * page.bringToFront() would), one on the user's page is refused. A click
+     * that opened a page (target=_blank or window.open) reports it as the
+     * program's popup; the lease follows into it as for a direct click. A fast
+     * click returns before a target=_blank page starts opening, so that click
+     * looks for it a little longer.
+     */
+    async runProgramPageOp(sessionId, name, op, startedAt, dispatched, signal) {
+        const read = PROGRAM_READ_OPS[name] === true;
+        const requestedTabId = programOpTabId(op);
+        let tab;
+        let leaseTaken = false;
+        if (requestedTabId === null) {
+            try {
+                tab = await this.resolveAgentTargetTab(sessionId, read ? 'query' : name === 'goto' ? 'navigate' : name);
+            }
+            catch (error) {
+                if (asRecord(error).code === 'TAB_NOT_CONTROLLED') {
+                    throw programTabNotControlledError(null);
+                }
+                throw error;
+            }
+        }
+        else {
+            // Refuse before resuming a sleeping page or invoking any page operation.
+            if (!this.isSessionTabId(sessionId, requestedTabId)) {
+                return programTabResult(name, programTabFailure('TAB_NOT_FOUND', requestedTabId), startedAt, op);
+            }
+            if (!read && this.agentControl.controlledTabId(sessionId) !== requestedTabId) {
+                const record = this.agentControl.tab(requestedTabId);
+                // A page the user has used this turn is theirs to keep working in.
+                if (record?.owner !== 'agent' ||
+                    record.sessionId !== sessionId ||
+                    record.userTouched === true) {
+                    throw programTabNotControlledError(requestedTabId);
+                }
+                // The Agent's own page (also one kept from an earlier turn): writing it selects it.
+                this.selectAgentTab(sessionId, { tabId: requestedTabId });
+                leaseTaken = true;
+            }
+            tab = await this.programOpTab(sessionId, requestedTabId);
+            if (!tab) {
+                return programTabResult(name, programTabFailure('TAB_NOT_FOUND', requestedTabId), startedAt, op);
+            }
+        }
+        const target = tab;
+        // A Mini App page keeps the app: goto never replaces it with another URL.
+        if (name === 'goto' && target.miniApp)
+            throw miniAppNavigateBlockedError();
+        await this.holdProgramGlow(sessionId, target);
+        const execute = () => {
+            dispatched.write = !read;
+            return this.toolRuntime.executeAgentProgramOp(target, op, signal);
+        };
+        const ran = await this.runWithAgentToolScope(() => executeWithAgentExecutionGlow(target, () => executeWithAgentCursorLease(target, AGENT_CLICK_ACTIONS[name] === true
+            ? () => this.withAgentClickGrace(target, execute)
+            : execute, {
+            hideBeforeAction: name === 'goto' || name === 'back' || name === 'reload' || name === 'mouseWheel',
+        })));
+        const result = leaseTaken ? { ...asRecord(ran), leaseTaken: true } : ran;
+        // mouse.click / mouse.dblclick (one mouseClick op) open popups like a click
+        // does, without its opensNewTab hint: only the pages already opening are awaited.
+        if (name !== 'click' && name !== 'dblclick' && name !== 'mouseClick')
+            return result;
+        const findPopup = async () => {
+            await this.waitForAgentPageOpens(sessionId, signal);
+            return this.agentTabOutcomes.get(sessionId)?.openedTabId;
+        };
+        let popupTabId = await findPopup();
+        if (popupTabId === undefined && asRecord(result).opensNewTab === true) {
+            const deadline = nowMs() + PROGRAM_POPUP_WAIT_MS;
+            while (popupTabId === undefined && !signal?.aborted && nowMs() < deadline) {
+                await sleep(PROGRAM_POPUP_POLL_MS);
+                popupTabId = await findPopup();
+            }
+        }
+        return popupTabId === undefined
+            ? result
+            : { ...asRecord(result), tabId: popupTabId, openedInNewTab: true };
+    }
+    /** The program's glow moves to `tab` and stays on between its ops. */
+    async holdProgramGlow(sessionId, tab) {
+        const held = this.programGlows.get(sessionId);
+        if (held?.tab === tab)
+            return;
+        if (held)
+            this.releaseProgramGlow(sessionId);
+        this.programGlows.set(sessionId, { tab });
+        await holdAgentProgramGlow(tab);
+    }
+    releaseProgramGlow(sessionId) {
+        const held = this.programGlows.get(sessionId);
+        if (!held)
+            return;
+        clearTimeout(held.idleTimer);
+        this.programGlows.delete(sessionId);
+        if (this.tabs.get(held.tab.tabId) === held.tab)
+            void releaseAgentProgramGlow(held.tab);
+        else
+            held.tab.agentProgramGlow = false;
+    }
+    /** An op of the program starts: its glow does not lapse while the op runs. */
+    pauseProgramGlowIdle(sessionId) {
+        const held = this.programGlows.get(sessionId);
+        if (!held?.idleTimer)
+            return;
+        clearTimeout(held.idleTimer);
+        delete held.idleTimer;
+    }
+    /** An op of the program ended: without a next op its glow lapses (see PROGRAM_GLOW_IDLE_MS). */
+    armProgramGlowIdle(sessionId) {
+        const held = this.programGlows.get(sessionId);
+        if (!held)
+            return;
+        clearTimeout(held.idleTimer);
+        held.idleTimer = setTimeout(() => this.releaseProgramGlow(sessionId), this.runningPrograms.has(sessionId) ? RUNNING_PROGRAM_GLOW_IDLE_MS : PROGRAM_GLOW_IDLE_MS);
+        held.idleTimer.unref?.();
+    }
+    isSessionTabId(sessionId, tabId) {
+        const live = this.tabs.get(tabId);
+        if (live?.sessionId === sessionId && !this.isUncommittedMiniAppTab(live))
+            return true;
+        return this.pagelessTabs.get(tabId)?.sessionId === sessionId;
+    }
+    /**
+     * A tab of the session a program op names, resumed if it sleeps (a sleeping
+     * Mini App fails with MINIAPP_TAB_ASLEEP); null when it is not one.
+     */
+    async programOpTab(sessionId, tabId) {
+        const live = this.tabs.get(tabId);
+        if (live?.sessionId === sessionId)
+            return live;
+        const pageless = this.pagelessTabs.get(tabId);
+        if (pageless?.sessionId !== sessionId)
+            return null;
+        if (pageless.kind === 'miniapp') {
+            throw new Error('MINIAPP_TAB_ASLEEP: This Mini App tab is asleep; reopen it with open_tab { miniAppId }');
+        }
+        return this.requireResumedTab(tabId, sessionId);
+    }
+    /**
+     * The tab an action runs on. Writes need the controlled tab; reads fall back
+     * to the user's current page. Without any tab the session gets a blank Agent
+     * page, and navigate may claim a blank selected page.
+     */
+    async resolveAgentTargetTab(sessionId, tool) {
+        const controlledTabId = this.agentControl.controlledTabId(sessionId);
+        if (controlledTabId !== null) {
+            const live = this.tabs.get(controlledTabId);
+            if (live?.sessionId === sessionId)
+                return live;
+            const pageless = this.pagelessTabs.get(controlledTabId);
+            if (pageless?.sessionId === sessionId) {
+                if (pageless.kind === 'miniapp') {
+                    throw new Error('MINIAPP_TAB_ASLEEP: The controlled Mini App tab is asleep; reopen it with open_tab { miniAppId }');
+                }
+                return this.requireResumedTab(controlledTabId, sessionId);
+            }
+            this.agentControl.releaseLease(sessionId);
+        }
+        const isRead = AGENT_READ_ACTIONS[tool] === true;
+        const pending = this.ensuringSessionTabs.get(sessionId);
+        if (pending) {
+            const tab = await pending;
+            if (!isRead)
+                this.agentControl.grantLease(sessionId, tab.tabId);
+            return tab;
+        }
+        const selected = this.resolveSelectedTabBySession(sessionId);
+        if (isRead) {
+            if (selected)
+                return selected;
+            const selectedTabId = this.sessions.get(sessionId)?.selectedTabId;
+            if (typeof selectedTabId === 'number' &&
+                this.pagelessTabs.get(selectedTabId)?.sessionId === sessionId) {
+                return this.requireResumedTab(selectedTabId, sessionId);
+            }
+        }
+        if (!this.sessionHasBrowserTabs(sessionId)) {
+            const created = await this.ensureSessionTabCreation(sessionId, () => this.openTab({
+                active: false,
+                bounds: OFFSCREEN_BOUNDS,
+                sessionId,
+                selectInSession: true,
+            }));
+            this.registerAgentTab(created);
+            this.agentControl.grantLease(sessionId, created.tabId);
+            return created;
+        }
+        if (isRead) {
+            const ordinary = this.resolveOrdinaryTabBySession(sessionId);
+            if (ordinary)
+                return ordinary;
+        }
+        if (tool === 'navigate' &&
+            selected &&
+            !selected.miniApp &&
+            !hasLoadedBrowserPage(selected.url)) {
+            // A blank page the user left open is the natural target of a first navigate.
+            this.agentControl.grantLease(sessionId, selected.tabId);
+            return selected;
+        }
+        throw tabNotControlledError();
+    }
+    sessionHasBrowserTabs(sessionId) {
+        if ((this.sessions.get(sessionId)?.tabIds.length ?? 0) > 0)
+            return true;
+        for (const tab of this.tabs.values()) {
+            if (tab.sessionId === sessionId && !this.isUncommittedMiniAppTab(tab))
+                return true;
+        }
+        for (const record of this.pagelessTabs.values()) {
+            if (record.sessionId === sessionId)
+                return true;
+        }
+        return false;
+    }
+    /** Session tabs in panel order, live and pageless. */
+    sessionTabIds(sessionId) {
+        const ordered = [...(this.sessions.get(sessionId)?.tabIds ?? [])];
+        for (const tab of this.tabs.values()) {
+            if (tab.sessionId === sessionId &&
+                !this.isUncommittedMiniAppTab(tab) &&
+                !ordered.includes(tab.tabId)) {
+                ordered.push(tab.tabId);
+            }
+        }
+        for (const record of this.pagelessTabs.values()) {
+            if (record.sessionId === sessionId && !ordered.includes(record.tabId)) {
+                ordered.push(record.tabId);
+            }
+        }
+        return ordered;
+    }
+    isMiniAppTabId(tabId) {
+        return (Boolean(this.tabs.get(tabId)?.miniApp) || this.pagelessTabs.get(tabId)?.kind === 'miniapp');
+    }
+    registerAgentTab(tab, openerTabId) {
+        if (typeof tab.sessionId !== 'string')
+            return;
+        this.agentControl.registerTab(tab.sessionId, tab.tabId, 'agent', {
+            ...(openerTabId !== undefined ? { openerTabId } : {}),
+        });
+        if (tab.persistentTabId && !this.agentControl.isEphemeral(tab.sessionId)) {
+            this.registry.setTabOwner(tab.sessionId, tab.persistentTabId, 'agent');
+        }
+    }
+    persistTabOwner(sessionId, tabId, owner) {
+        if (this.agentControl.isEphemeral(sessionId))
+            return;
+        const persistentTabId = this.tabs.get(tabId)?.persistentTabId ?? this.suspendedBrowserTab(tabId)?.persistentTabId;
+        if (typeof persistentTabId === 'string') {
+            this.registry.setTabOwner(sessionId, persistentTabId, owner);
+        }
+    }
+    requireSessionTabId(sessionId, rawArgs) {
+        const tabId = rawArgs.tabId;
+        if (typeof tabId !== 'number' || !Number.isSafeInteger(tabId)) {
+            throw new Error('tabId is required; call list_tabs to get tab IDs');
+        }
+        const live = this.tabs.get(tabId);
+        if (live?.sessionId === sessionId && !this.isUncommittedMiniAppTab(live))
+            return tabId;
+        if (this.pagelessTabs.get(tabId)?.sessionId === sessionId)
+            return tabId;
+        throw new Error(`TAB_NOT_FOUND: Tab ${tabId} is not open in this session; call list_tabs`);
+    }
+    describeAgentTab(sessionId, tabId) {
+        const live = this.tabs.get(tabId);
+        const pageless = this.pagelessTabs.get(tabId);
+        if (live)
+            this.refreshTabState(live);
+        const isMiniApp = this.isMiniAppTabId(tabId);
+        const record = this.agentControl.tab(tabId);
+        const owner = this.agentControl.ownerOf(tabId);
+        const visibleTabId = this.sessions.get(sessionId)?.visibleTabId ?? null;
+        const controlledTabId = this.agentControl.controlledTabId(sessionId);
+        const entry = { tabId };
+        if (isMiniApp) {
+            const miniApp = live?.miniApp?.miniApp ?? (pageless?.kind === 'miniapp' ? pageless.miniApp : undefined);
+            entry.surfaceKind = 'miniapp';
+            if (miniApp)
+                entry.title = miniApp.displayName;
+        }
+        else {
+            entry.surfaceKind = 'web';
+            entry.url = live?.url ?? (pageless?.kind === 'browser' ? pageless.url : '');
+            entry.title = live?.title ?? (pageless?.kind === 'browser' ? pageless.title : '');
+            entry.owner = owner;
+            if (owner === 'agent')
+                entry.retention = record?.retention ?? 'temporary';
+        }
+        if (tabId === controlledTabId)
+            entry.controlled = true;
+        if (tabId === visibleTabId)
+            entry.visible = true;
+        if (!live)
+            entry.asleep = true;
+        if (record?.takenOverAt !== undefined &&
+            record.takenOverTurnId !== this.agentControl.peekSession(sessionId)?.turnId) {
+            entry.takenOverLastTurn = true;
+        }
+        return entry;
+    }
+    /**
+     * This chat's tabs for the turn context the renderer sends as a turn starts,
+     * so the model sees them without calling list_tabs. Read-only.
+     */
+    describeTabsForTurn(sessionId) {
+        if (!sessionId.trim() || this.agentControl.isEphemeral(sessionId))
+            return [];
+        return this.sessionTabIds(sessionId).map((tabId) => {
+            const { controlled: _controlled, takenOverLastTurn: _takenOver, ...entry } = this.describeAgentTab(sessionId, tabId);
+            return entry;
+        });
+    }
+    listAgentTabs(sessionId) {
+        const tabs = this.sessionTabIds(sessionId).map((tabId) => this.describeAgentTab(sessionId, tabId));
+        const takenOver = tabs.some((tab) => tab.takenOverLastTurn === true);
+        return {
+            success: true,
+            tabs,
+            controlledTabId: this.agentControl.controlledTabId(sessionId),
+            visibleTabId: this.sessions.get(sessionId)?.visibleTabId ?? null,
+            panelVisible: this.isBrowserPanelVisible(sessionId),
+            ...(takenOver
+                ? {
+                    notice: 'The user took over a tab last turn; its content may have changed. Inspect it again before acting.',
+                }
+                : {}),
+        };
+    }
+    selectAgentTab(sessionId, rawArgs) {
+        const tabId = this.requireSessionTabId(sessionId, rawArgs);
+        if (this.pagelessTabs.get(tabId)?.kind === 'miniapp') {
+            throw new Error('MINIAPP_TAB_ASLEEP: This Mini App tab is asleep; reopen it with open_tab { miniAppId }');
+        }
+        const previousTabId = this.agentControl.controlledTabId(sessionId);
+        const entry = this.describeAgentTab(sessionId, tabId);
+        this.agentControl.grantLease(sessionId, tabId, { bumpRevision: true });
+        this.agentControl.consumeTakenOver(tabId);
+        // The renderer may reveal the Agent page only while the panel shows nothing else.
+        const session = this.sessions.get(sessionId);
+        if (session && session.selectedTabId !== tabId)
+            session.agentTabId = tabId;
+        const notices = [];
+        if (entry.takenOverLastTurn === true) {
+            notices.push('The user took over this tab last turn; inspect it before acting.');
+        }
+        if (entry.surfaceKind === 'web' && entry.owner === 'user') {
+            notices.push("This is the user's tab: navigate replaces its page. Use open_tab for other URLs unless the user asked to change this page.");
+        }
+        return {
+            success: true,
+            ...entry,
+            controlled: true,
+            previousTabId,
+            controlledTabId: tabId,
+            visibleTabId: session?.visibleTabId ?? null,
+            panelVisible: this.isBrowserPanelVisible(sessionId),
+            ...(notices.length > 0 ? { notice: notices.join(' ') } : {}),
+        };
+    }
+    /** Whether the user can see this chat's Browser: one of its pages is shown in the panel. */
+    isBrowserPanelVisible(sessionId) {
+        const visibleTabId = this.sessions.get(sessionId)?.visibleTabId;
+        return typeof visibleTabId === 'number' && this.tabs.get(visibleTabId)?.sessionId === sessionId;
+    }
+    resolveShowTabId(sessionId, rawArgs) {
+        if (rawArgs.tabId !== undefined)
+            return this.requireSessionTabId(sessionId, rawArgs);
+        const controlledTabId = this.agentControl.controlledTabId(sessionId);
+        if (controlledTabId === null) {
+            throw new Error('TAB_NOT_CONTROLLED: No tab is under Agent control; pass show_tab { tabId } from list_tabs.');
+        }
+        return controlledTabId;
+    }
+    /**
+     * Shows a page of this session to the user: it becomes the selected tab and
+     * the renderer opens the Browser panel when this chat is on screen. Control
+     * and turn-end retention do not change.
+     */
+    async showAgentTab(sessionId, tabId, reveal, signal) {
+        if (this.agentControl.isEphemeral(sessionId)) {
+            throw new Error("SUBAGENT_BROWSER_PRIVATE: A sub-Agent's Browser is private and cannot be shown");
+        }
+        const pageless = this.pagelessTabs.get(tabId);
+        if (pageless?.kind === 'miniapp') {
+            throw new Error('MINIAPP_TAB_ASLEEP: This Mini App tab is asleep; reopen it with open_tab { miniAppId }');
+        }
+        const session = this.getOrCreateSession(sessionId);
+        const live = this.tabs.get(tabId);
+        if (live) {
+            this.markTabSessionSelected(live, true);
+        }
+        else if (pageless) {
+            session.selectedTabId = tabId;
+            this.registry.selectTab(sessionId, pageless.persistentTabId);
+        }
+        // The renderer reveals the selected Agent target when it opens the panel.
+        session.agentTabId = tabId;
+        session.agentRevealTabId = tabId;
+        this.notePendingReveal(sessionId, tabId);
+        reveal?.();
+        const shown = await this.waitForVisibleTab(sessionId, tabId, signal);
+        const pending = !shown && this.sessions.get(sessionId)?.pendingRevealTabId === tabId;
+        return {
+            success: true,
+            ...this.describeAgentTab(sessionId, tabId),
+            shown,
+            ...(pending ? { pending: true } : {}),
+            panelVisible: this.isBrowserPanelVisible(sessionId),
+            visibleTabId: this.sessions.get(sessionId)?.visibleTabId ?? null,
+            ...(shown
+                ? {}
+                : {
+                    notice: pending
+                        ? 'The user is not viewing this chat or the Browser panel could not open; the page opens when they come back to this chat. It stays ready in the background; do not show it again.'
+                        : 'The page was not shown. It stays ready in the background.',
+                }),
+        };
+    }
+    /** Remembers the page to show when the user comes back to this chat (newest request wins). */
+    notePendingReveal(sessionId, tabId) {
+        // A sub-Agent's Browser is never shown to the user.
+        if (this.agentControl.isEphemeral(sessionId))
+            return;
+        const session = this.sessions.get(sessionId);
+        if (!session || session.visibleTabId === tabId)
+            return;
+        session.pendingRevealTabId = tabId;
+    }
+    /**
+     * The renderer shows this chat's Browser again: hands over the page the
+     * Agent asked to show while the user was elsewhere. `peek` leaves the
+     * request in place, so a renderer that gives up (the user left the chat
+     * again before it could show the page) loses nothing; it forgets the request
+     * with a second call naming the `tabId` it handled (a newer request stays).
+     * A page that is gone, or already on screen, is not shown again.
+     */
+    consumePendingReveal(sessionId, options = {}) {
+        const session = this.sessions.get(sessionId);
+        const tabId = session?.pendingRevealTabId;
+        if (!session || typeof tabId !== 'number')
+            return null;
+        if (options.tabId !== undefined && options.tabId !== tabId)
+            return null;
+        if (session.visibleTabId === tabId) {
+            session.pendingRevealTabId = null;
+            return null;
+        }
+        if (!options.peek)
+            session.pendingRevealTabId = null;
+        const live = this.tabs.get(tabId);
+        const pageless = this.pagelessTabs.get(tabId);
+        if (live?.sessionId !== sessionId && pageless?.sessionId !== sessionId)
+            return null;
+        return { tabId, kind: this.isMiniAppTabId(tabId) ? 'miniapp' : 'web' };
+    }
+    async waitForVisibleTab(sessionId, tabId, signal) {
+        const deadline = nowMs() + SHOW_TAB_TIMEOUT_MS;
+        for (;;) {
+            if (this.sessions.get(sessionId)?.visibleTabId === tabId)
+                return true;
+            if (signal?.aborted || nowMs() >= deadline)
+                return false;
+            await new Promise((resolve) => setTimeout(resolve, SHOW_TAB_POLL_MS));
+        }
+    }
+    /**
+     * release_tab: the model hands the controlled page to the user for a step
+     * only they can do (sign-in, verification). The user's input is no longer
+     * blocked and does not take the page over; an Agent page stays through this
+     * turn end. The Agent selects the tab again before writing it.
+     */
+    releaseAgentTab(sessionId, rawArgs) {
+        if (this.agentControl.isEphemeral(sessionId)) {
+            throw new Error("SUBAGENT_BROWSER_PRIVATE: A sub-Agent's Browser is private; the user cannot act in it");
+        }
+        const requested = rawArgs.tabId === undefined ? undefined : this.requireSessionTabId(sessionId, rawArgs);
+        const released = this.agentControl.releaseControl(sessionId, requested);
+        if (released === null) {
+            return {
+                success: true,
+                releasedControl: false,
+                controlledTabId: null,
+                notice: 'No tab was under your control; nothing changed.',
+            };
+        }
+        return {
+            success: true,
+            ...this.describeAgentTab(sessionId, released),
+            releasedControl: true,
+            controlledTabId: null,
+            notice: 'The user can now act in this page. Before writing it again, select_tab it and inspect it: the user may have changed it.',
+        };
+    }
+    markAgentTab(sessionId, rawArgs) {
+        if (this.agentControl.isEphemeral(sessionId)) {
+            throw new Error("SUBAGENT_TAB_NOT_RETAINABLE: A sub-Agent's pages close when it ends and cannot be kept");
+        }
+        const tabId = this.requireSessionTabId(sessionId, rawArgs);
+        const retention = rawArgs.retention;
+        if (retention !== 'carryover' && retention !== 'deliverable') {
+            throw new Error('retention must be "carryover" or "deliverable"');
+        }
+        if (this.isMiniAppTabId(tabId)) {
+            return {
+                success: true,
+                tabId,
+                surfaceKind: 'miniapp',
+                notice: 'Mini App tabs never close at turn end; no mark is needed.',
+            };
+        }
+        if (this.agentControl.ownerOf(tabId) === 'user') {
+            return {
+                success: true,
+                tabId,
+                owner: 'user',
+                notice: "This is the user's tab; it never closes at turn end. No mark is needed.",
+            };
+        }
+        if (retention === 'deliverable') {
+            // Delivered pages belong to the user at once, so a crash cannot lose them.
+            this.agentControl.promoteToUser(tabId);
+            this.persistTabOwner(sessionId, tabId, 'user');
+            return { success: true, tabId, owner: 'user', retention: 'deliverable' };
+        }
+        this.agentControl.setRetention(tabId, 'carryover');
+        return {
+            success: true,
+            tabId,
+            owner: 'agent',
+            retention: 'carryover',
+            notice: CARRYOVER_NOTICE,
+        };
+    }
+    async closeAgentTab(sessionId, rawArgs) {
+        const tabId = this.requireSessionTabId(sessionId, rawArgs);
+        const wasControlled = this.agentControl.controlledTabId(sessionId) === tabId;
+        if (this.isMiniAppTabId(tabId))
+            return this.closeAgentMiniAppTab(sessionId, tabId);
+        this.closeTabsAsAgent(sessionId, [tabId]);
+        const releasedControl = wasControlled;
+        return {
+            success: true,
+            closedTabIds: [tabId],
+            releasedControl,
+            controlledTabId: this.agentControl.controlledTabId(sessionId),
+            ...(releasedControl
+                ? {
+                    notice: 'The controlled tab is closed. Call select_tab or open_tab before the next page-changing action.',
+                }
+                : {}),
+        };
+    }
+    /** Same path as the user closing a Mini App tab, without the confirmation. */
+    async closeAgentMiniAppTab(sessionId, tabId) {
+        const live = this.tabs.get(tabId);
+        const pageless = this.pagelessTabs.get(tabId);
+        const pluginId = live?.miniApp?.miniApp.pluginId ??
+            (pageless?.kind === 'miniapp' ? pageless.miniApp.pluginId : undefined);
+        if (!pluginId)
+            throw new Error(`TAB_NOT_FOUND: Tab ${tabId} is not a Mini App tab`);
+        const { readRunningMiniAppCredential } = await import('./miniapp-surface');
+        const running = (await readRunningMiniAppCredential(pluginId)) !== undefined;
+        if (!running) {
+            this.closeTabsAsAgent(sessionId, [tabId]);
+            return {
+                success: true,
+                closedTabIds: [tabId],
+                stoppedApp: false,
+                otherSessionsAffected: false,
+                controlledTabId: this.agentControl.controlledTabId(sessionId),
+            };
+        }
+        const affected = this.prepareMiniAppClose(pluginId, 'agent', sessionId);
+        const { closeMiniApp } = await import('../../ipc/miniApp.ipc');
+        const closed = await closeMiniApp({ sessionId, pluginId }, { closedBy: 'agent' });
+        if (!closed.success) {
+            for (const id of affected.tabIds)
+                this.agentClosingTabIds.delete(id);
+            throw new Error('MINIAPP_UNAVAILABLE: Mini App could not be closed');
+        }
+        return {
+            success: true,
+            closedTabIds: closed.closedTabIds ?? affected.tabIds,
+            stoppedApp: true,
+            otherSessionsAffected: affected.otherSessions,
+            controlledTabId: this.agentControl.controlledTabId(sessionId),
+        };
+    }
+    /**
+     * Before every page of a Mini App closes (it stops the app in all sessions):
+     * no close of a Mini App page counts as a takeover; the user's close only
+     * ends the Agent's lease on it.
+     */
+    prepareMiniAppClose(pluginId, closedBy, sessionId) {
+        const tabIds = [];
+        let otherSessions = false;
+        const consider = (tabId, tabSessionId) => {
+            tabIds.push(tabId);
+            if (typeof tabSessionId === 'string' && tabSessionId !== sessionId)
+                otherSessions = true;
+            if (closedBy === 'agent' || tabSessionId !== sessionId) {
+                this.agentClosingTabIds.add(tabId);
+            }
+            else if (typeof tabSessionId === 'string') {
+                // Mini App pages are never taken over: the user's close only ends the lease.
+                this.userClosingTabIds.add(tabId);
+            }
+        };
+        for (const tab of this.tabs.values()) {
+            if (tab.miniApp?.miniApp.pluginId === pluginId)
+                consider(tab.tabId, tab.sessionId);
+        }
+        for (const record of this.pagelessTabs.values()) {
+            if (record.kind === 'miniapp' && record.miniApp.pluginId === pluginId) {
+                consider(record.tabId, record.sessionId);
+            }
+        }
+        return { tabIds, otherSessions };
+    }
+    /** Closes tabs on the Agent's behalf: never a takeover, never a lease hand-back. */
+    closeTabsAsAgent(sessionId, tabIds) {
+        for (const tabId of tabIds) {
+            this.agentClosingTabIds.add(tabId);
+            try {
+                this.destroy({ sessionId, tabId });
+            }
+            finally {
+                this.agentClosingTabIds.delete(tabId);
+            }
+        }
+    }
+    /**
+     * The Agent's `miniapp.open` in `turnId` opened this Mini App page: that turn
+     * now controls it, as with open_tab { miniAppId }. A taken-over turn gets nothing.
+     */
+    grantAgentMiniAppControl(sessionId, turnId, tabId) {
+        const tab = this.tabs.get(tabId);
+        if (!tab?.miniApp || tab.sessionId !== sessionId)
+            return;
+        this.beginAgentBrowserCall(sessionId, { turnId });
+        if (this.agentControl.peekSession(sessionId)?.mode === 'user')
+            return;
+        this.agentControl.grantLease(sessionId, tabId);
+    }
+    /** Turn lifecycle from the Runtime (turn end, a Browser program's start and end). */
+    handleAgentLifecycle(event) {
+        const sessionId = event.sessionId.trim();
+        if (!sessionId)
+            return;
+        if (event.type === 'program_start') {
+            // The glow comes on with the program's first page op and stays on until its end.
+            this.runningPrograms.add(sessionId);
+            return;
+        }
+        this.runningPrograms.delete(sessionId);
+        this.releaseProgramGlow(sessionId);
+        if (event.type === 'program_end')
+            return;
+        if (event.ephemeral === true || this.agentControl.isEphemeral(sessionId)) {
+            // A sub-Agent's Browser ends with it, including pages it marked. Its Mini App
+            // pages stay: closing one would stop the app for every session.
+            const tabIds = this.sessionTabIds(sessionId).filter((tabId) => !this.isMiniAppTabId(tabId));
+            if (tabIds.length > 0)
+                this.closeTabsAsAgent(sessionId, tabIds);
+            this.agentControl.dropSession(sessionId);
+            return;
+        }
+        if (!this.agentControl.peekSession(sessionId))
+            return;
+        this.finalizeAgentTurn(sessionId, event.turnId);
+    }
+    /** Turn end: release the lease, hand touched or delivered pages to the user, close the rest. */
+    finalizeAgentTurn(sessionId, turnId) {
+        // Nothing the turn's pages did is reported to the next turn.
+        this.agentTabOutcomes.delete(sessionId);
+        // A turn that ends leaves no Agent cursor on any page it kept.
+        for (const tabId of this.sessionTabIds(sessionId)) {
+            const tab = this.tabs.get(tabId);
+            if (tab)
+                void tab.controller.hideAgentCursor?.();
+        }
+        const outcome = this.agentControl.finalizeTurn(sessionId, turnId, {
+            visibleTabId: this.sessions.get(sessionId)?.visibleTabId ?? null,
+            isMiniApp: (tabId) => this.isMiniAppTabId(tabId),
+            sessionTabIds: this.sessionTabIds(sessionId),
+        });
+        for (const tabId of outcome.promoteToUser)
+            this.persistTabOwner(sessionId, tabId, 'user');
+        if (outcome.close.length > 0) {
+            logger.info({
+                msg: '[EmbeddedBrowser] closing temporary Agent tabs at turn end',
+                sessionId,
+                count: outcome.close.length,
+            });
+            this.closeTabsAsAgent(sessionId, outcome.close);
+        }
+    }
+    /**
+     * A press on the pill's take-over button: block it from the page and take
+     * over. Its release is swallowed as well. Returns true when handled.
+     */
+    handleTakeoverPillPress(tab, wc, event, type) {
+        if (isAgentInputActive(wc))
+            return false;
+        if (type === 'mouseUp' && this.takeoverPill.consumeSwallowedMouseUp(tab)) {
+            event.preventDefault();
+            return true;
+        }
+        if (type !== 'mouseDown' || typeof tab.sessionId !== 'string')
+            return false;
+        if (!this.takeoverPill.claimActionPress(tab))
+            return false;
+        event.preventDefault();
+        this.takeOverAgentControl(tab.sessionId, tab.tabId);
+        return true;
+    }
+    /** The renderer resolved the pill's theme, typography and copy. */
+    setTakeoverPillAppearance(appearance) {
+        return this.takeoverPill.setAppearance(appearance)
+            ? { success: true }
+            : { success: false, error: 'Invalid takeover pill appearance' };
+    }
+    /** The user pressed "take over" on the tab the Agent controls, or navigated it from the panel. */
+    takeOverAgentControl(sessionId, tabId, reason = 'button') {
+        if (this.isMiniAppTabId(tabId)) {
+            return { success: false, error: 'Mini App tabs are not taken over' };
+        }
+        const taken = this.agentControl.takeover(sessionId, tabId, reason, nowMs());
+        if (!taken)
+            return { success: false, error: 'Agent is not controlling this tab' };
+        this.persistTabOwner(sessionId, tabId, 'user');
+        const tab = this.tabs.get(tabId);
+        if (tab) {
+            this.abortTabOperations(tab, 'user-takeover');
+            this.noteUserBrowserTakeover(tab);
+            void tab.controller.hideAgentCursor?.();
+        }
+        return { success: true, tabId };
+    }
+    notifyAgentControlChanged(sessionId, snapshot) {
+        this.takeoverPill.sync();
+        this.syncUserScrollGuards();
+        // The Agent cursor stays parked between actions on the page it works on.
+        // Once control moves to another page or ends, that page keeps no cursor.
+        const previousTabId = this.lastControlledTabIdBySession.get(sessionId);
+        if (previousTabId !== undefined && previousTabId !== snapshot.controlledTabId) {
+            const previous = this.tabs.get(previousTabId);
+            if (previous)
+                void previous.controller.hideAgentCursor?.();
+        }
+        if (snapshot.controlledTabId === null)
+            this.lastControlledTabIdBySession.delete(sessionId);
+        else
+            this.lastControlledTabIdBySession.set(sessionId, snapshot.controlledTabId);
+        if (this.agentControl.isEphemeral(sessionId))
+            return;
+        const renderer = this.getHostRenderer();
+        renderer?.send(IPC_CHANNELS.EMBEDDED_BROWSER_CONTROL_CHANGED, {
+            sessionId,
+            mode: snapshot.mode,
+            controlledTabId: snapshot.controlledTabId,
+        });
+    }
+    /**
+     * A tab left its session for good. A popup that closed itself while the
+     * Agent controlled it hands control back to the page that opened it.
+     */
+    forgetAgentTab(tabId) {
+        const closedBy = this.agentClosingTabIds.has(tabId)
+            ? 'agent'
+            : this.userClosingTabIds.has(tabId)
+                ? 'user'
+                : undefined;
+        this.agentClosingTabIds.delete(tabId);
+        this.userClosingTabIds.delete(tabId);
+        this.inputBlockedNotifiedAt.delete(tabId);
+        this.takeoverPill.forget(tabId);
+        const forgotten = this.agentControl.forgetTab(tabId, {
+            ...(closedBy ? { closedBy } : {}),
+            isAlive: (candidate, sessionId) => this.isSessionTabId(sessionId, candidate),
+        });
+        // The popup is gone: report the return only, never the closed page as the new target.
+        if (forgotten.sessionId && forgotten.leaseReturnedTo !== undefined) {
+            this.agentTabOutcomes.set(forgotten.sessionId, {
+                leaseReturnedTo: forgotten.leaseReturnedTo,
+            });
+        }
+    }
+    /**
+     * User input on a page. On the tab the Agent controls it is blocked (the
+     * hover pill offers the take-over); elsewhere it marks the page as used by
+     * the user so turn end keeps it. Agent-injected input passes.
+     */
+    handleUserPageInput(tab, wc, event, meaningful) {
+        if (isAgentInputActive(wc))
+            return;
+        if (this.blocksUserInput(tab)) {
+            event.preventDefault();
+            if (meaningful) {
+                this.notifyUserInputBlocked(tab);
+                // The pill explains why the page ignores the user and offers the take-over.
+                this.takeoverPill.noteUserHover(tab);
+            }
+            return;
+        }
+        if (!meaningful)
+            return;
+        this.agentControl.noteUserTouched(tab.tabId);
+        // A shared Mini App page: a page this input opens is the user's, not the
+        // late popup of an Agent click a moment before.
+        delete tab.agentClickGraceUntil;
+    }
+    /** Scrolling follows the input block: Electron's input hooks never see the wheel. */
+    syncUserScrollGuards() {
+        for (const tab of this.tabs.values())
+            this.syncUserScrollGuard(tab);
+    }
+    syncUserScrollGuard(tab, options = {}) {
+        const wc = this.getWebContents(tab);
+        if (!wc)
+            return;
+        const blocked = this.blocksUserInput(tab);
+        if (this.usesWebviewSurface(tab))
+            browserGuestRegistry.setAgentControlled(wc, blocked);
+        if (blocked === isUserScrollGuarded(wc) && !(blocked && options.reinstall))
+            return;
+        void setUserScrollGuard(wc, blocked).catch(() => undefined);
+    }
+    usesWebviewSurface(tab) {
+        return tab.backendSelection?.rendererBackend === 'webview';
+    }
+    /** "Take over" pressed on the host control surface covering a webview page. */
+    takeOverWebviewGuest(guest) {
+        for (const tab of this.tabs.values()) {
+            if (this.getWebContents(tab) !== guest)
+                continue;
+            if (typeof tab.sessionId === 'string' && this.blocksUserInput(tab)) {
+                this.takeOverAgentControl(tab.sessionId, tab.tabId);
+            }
+            return;
+        }
+    }
+    /**
+     * The Agent-controlled web page refuses user input until the user takes it
+     * over. Mini App pages stay usable: the user and the Agent share them.
+     */
+    blocksUserInput(tab) {
+        return !tab.miniApp && this.agentControl.shouldBlockUserInput(tab.tabId);
+    }
+    /** Closing the web page the Agent controls is a takeover; a Mini App page only ends the lease. */
+    takeOverOnUserClose(sessionId, tabId) {
+        if (this.isMiniAppTabId(tabId))
+            return;
+        this.agentControl.takeover(sessionId, tabId, 'close', nowMs());
+    }
+    /**
+     * The user acts on a page from the panel: address bar, back, forward,
+     * reload, find, zoom, device preview, screenshot. On the web page the Agent
+     * controls this takes it over first, as in Kimi Code; elsewhere it marks the
+     * page as used by the user.
+     */
+    takeOverOnUserPageAction(tab) {
+        if (this.blocksUserInput(tab) && typeof tab.sessionId === 'string') {
+            this.takeOverAgentControl(tab.sessionId, tab.tabId, 'navigation');
+            return;
+        }
+        this.agentControl.noteUserTouched(tab.tabId);
+    }
+    /** A user screenshot from the panel counts as acting on the page (Kimi Code does the same). */
+    takeOverForUserScreenshot(target) {
+        try {
+            const tab = this.resolveBrowserTab(target, { allowLegacyActive: true });
+            if (tab)
+                this.takeOverOnUserPageAction(tab);
+        }
+        catch {
+            // The screenshot reports the unresolved target.
+        }
+    }
+    /** Clearing Browser data affects every page: take over each page the Agent controls. */
+    takeOverAllAgentControl() {
+        for (const tab of this.tabs.values()) {
+            if (typeof tab.sessionId === 'string' && this.blocksUserInput(tab)) {
+                this.takeOverAgentControl(tab.sessionId, tab.tabId, 'navigation');
+            }
+        }
+    }
+    /** True (and the user is told) when a shortcut typed into the Agent-controlled page is blocked. */
+    blockPageShortcutOnControlledTab(tab) {
+        if (!this.blocksUserInput(tab)) {
+            this.agentControl.noteUserTouched(tab.tabId);
+            return false;
+        }
+        this.notifyUserInputBlocked(tab);
+        return true;
+    }
+    notifyUserInputBlocked(tab) {
+        if (typeof tab.sessionId !== 'string')
+            return;
+        const now = nowMs();
+        const last = this.inputBlockedNotifiedAt.get(tab.tabId) ?? 0;
+        if (now - last < INPUT_BLOCKED_NOTICE_INTERVAL_MS)
+            return;
+        this.inputBlockedNotifiedAt.set(tab.tabId, now);
+        this.getHostRenderer()?.send(IPC_CHANNELS.EMBEDDED_BROWSER_INPUT_BLOCKED, {
+            sessionId: tab.sessionId,
+            tabId: tab.tabId,
+        });
+    }
     async openAgentTab(sessionId, rawArgs, signal) {
         const trustedSessionId = sessionId.trim();
         if (!trustedSessionId)
@@ -6181,9 +7542,17 @@ export class EmbeddedBrowserManager {
         if (signal?.aborted)
             throw new Error('Operation aborted');
         const miniAppId = asString(rawArgs.miniAppId).trim();
+        const previousTabId = this.agentControl.controlledTabId(trustedSessionId);
         if (miniAppId) {
             if (rawArgs.url !== undefined)
                 throw new Error('Choose either url or miniAppId');
+            const reused = Array.from(this.tabs.values()).some((tab) => tab.sessionId === trustedSessionId &&
+                tab.miniApp?.miniApp.pluginId === miniAppId &&
+                !this.isUncommittedMiniAppTab(tab));
+            const woken = !reused &&
+                Array.from(this.pagelessTabs.values()).some((record) => record.kind === 'miniapp' &&
+                    record.sessionId === trustedSessionId &&
+                    record.pluginId === miniAppId);
             const { openManagedMiniAppSurface } = await import('./miniapp-surface');
             const opened = await openManagedMiniAppSurface({
                 initiator: 'agent',
@@ -6209,16 +7578,21 @@ export class EmbeddedBrowserManager {
                 throw new Error('MINIAPP_UNAVAILABLE: Mini App page was closed while opening');
             }
             signal?.throwIfAborted();
+            // Opening a Mini App shows it to the user (the one open that switches the view).
             this.adoptAgentOpenedTab(tab);
-            return { success: true, ...opened };
+            this.agentControl.grantLease(trustedSessionId, tab.tabId);
+            return {
+                success: true,
+                ...opened,
+                reused,
+                woken,
+                previousTabId,
+                controlledTabId: tab.tabId,
+            };
         }
         const url = asString(rawArgs.url).trim();
         if (!url)
             throw new Error('url or miniAppId is required');
-        const agentTabId = this.sessions.get(trustedSessionId)?.agentTabId;
-        const previousTab = (typeof agentTabId === 'number' ? this.tabs.get(agentTabId) : null) ??
-            this.resolveSelectedTabBySession(trustedSessionId) ??
-            this.resolveOrdinaryTabBySession(trustedSessionId);
         let openedTab = null;
         const rollbackOpenedTab = () => {
             const failedTab = openedTab;
@@ -6233,6 +7607,7 @@ export class EmbeddedBrowserManager {
                 bounds: OFFSCREEN_BOUNDS,
                 sessionId: trustedSessionId,
             });
+            this.registerAgentTab(openedTab);
             // Keep the staged page unselected until navigation succeeds. Publishing
             // it early lets the renderer request `show`, which promotes the hidden
             // page and cancels its in-flight background render operation.
@@ -6242,7 +7617,8 @@ export class EmbeddedBrowserManager {
             if (navigation.success === false) {
                 const failedNavigation = {
                     ...navigation,
-                    previousTabId: previousTab?.tabId ?? null,
+                    previousTabId,
+                    controlledTabId: previousTabId,
                     openedInNewTab: false,
                 };
                 rollbackOpenedTab();
@@ -6250,11 +7626,16 @@ export class EmbeddedBrowserManager {
             }
             // Never replace the page the user is viewing; the renderer decides
             // whether an idle side panel may reveal this one.
-            this.adoptAgentOpenedTab(openedTab);
+            if (!this.agentControl.isEphemeral(trustedSessionId))
+                this.adoptAgentOpenedTab(openedTab);
+            this.agentControl.grantLease(trustedSessionId, openedTab.tabId);
             return {
                 ...navigation,
                 tabId: openedTab.tabId,
-                previousTabId: previousTab?.tabId ?? null,
+                previousTabId,
+                controlledTabId: openedTab.tabId,
+                owner: 'agent',
+                retention: 'temporary',
                 openedInNewTab: true,
             };
         }
@@ -6264,13 +7645,16 @@ export class EmbeddedBrowserManager {
         }
     }
     async runWithAgentToolScope(execute) {
-        this.agentToolCallDepth += 1;
-        try {
-            return await execute();
-        }
-        finally {
-            this.agentToolCallDepth = Math.max(0, this.agentToolCallDepth - 1);
-        }
+        const scope = { active: true };
+        return this.agentToolScope.run(scope, async () => {
+            try {
+                return await execute();
+            }
+            finally {
+                // Timers inherited from a finished call must not mark later maintenance as Agent work.
+                scope.active = false;
+            }
+        });
     }
     async executeTool(tool, rawArgs, signal) {
         const startedAt = nowMs();
@@ -6480,11 +7864,22 @@ function hasLoadedBrowserPage(url) {
 }
 let embeddedBrowserManager = null;
 const managedMiniAppAttentionListeners = new Set();
+/**
+ * The Browser's config switches as manager options. Each one reads the config
+ * (and its environment override) on every call, so a changed switch applies to
+ * the next Browser call without a restart.
+ */
+export function embeddedBrowserConfigOptions(readConfig = getConfig) {
+    return {
+        isAgentCursorEnabled: () => readConfig().beta.browserAgentCursor === true,
+        isBrowserReadV2Enabled: () => resolveBrowserReadV2(readConfig().beta.browserReadV2),
+    };
+}
 export function getEmbeddedBrowserManager() {
     if (!embeddedBrowserManager) {
         const manager = new EmbeddedBrowserManager({
             registry: createPersistentBrowserRegistry(),
-            isAgentCursorEnabled: () => getConfig().beta.browserAgentCursor === true,
+            ...embeddedBrowserConfigOptions(),
             onMiniAppAttentionChanged: () => {
                 for (const listener of managedMiniAppAttentionListeners)
                     listener();

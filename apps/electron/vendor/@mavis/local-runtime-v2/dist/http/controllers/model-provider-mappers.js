@@ -11,6 +11,7 @@ export function toModelInfo(record) {
 function toModelIdentityFields(record) {
     return {
         displayName: record.displayName,
+        ...(typeof record.hint === 'string' && record.hint.trim() ? { hint: record.hint.trim() } : {}),
         ...(record.configurationSource ? { configurationSource: record.configurationSource } : {}),
         enabled: record.enabled,
         selected: record.selected,

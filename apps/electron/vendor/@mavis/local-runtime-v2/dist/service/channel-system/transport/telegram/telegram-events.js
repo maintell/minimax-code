@@ -51,6 +51,9 @@ function buildTelegramInboundCtx(input) {
     const agentName = readFirstString(body, ['agentName', 'agentId', 'agent']) ?? input.defaultAgentName;
     const clientName = readFirstString(body, ['clientName', 'clientId', 'client_id']) ?? telegramClientId(agentName);
     const threadId = stringish(message.message_thread_id);
+    // The message this update carries. Outbound replies quote it through Bot API
+    // `reply_parameters`, so a burst of queued messages stays matchable.
+    const sourceMessageId = stringish(message.message_id);
     return {
         platform: 'telegram',
         chatType: readFirstString(chat, ['type']) ?? 'private',
@@ -58,15 +61,25 @@ function buildTelegramInboundCtx(input) {
         senderId,
         clientName,
         ...(threadId ? { threadId } : {}),
+        ...(sourceMessageId ? { sourceMessageId } : {}),
         ...(readFirstString(body, ['lane']) ? { lane: readFirstString(body, ['lane']) } : {}),
         // Private chats are implicitly addressed to the bot; groups need a
         // textual or entity mention.
-        hasMention: body.hasMention === true ||
-            body.mentioned === true ||
-            isPrivateChat(chat) ||
-            telegramTextMentionsBot(text, botName) ||
-            telegramEntitiesMentionBot(message.entities, text, botName),
+        hasMention: computeHasMention({ body, chat, message, text, botName }),
     };
+}
+/**
+ * Whether this update addresses the bot: an explicit flag, a private chat, or
+ * a textual / entity mention of the bot handle.
+ */
+function computeHasMention(input) {
+    const { body, chat, message, text, botName } = input;
+    if (body.hasMention === true || body.mentioned === true)
+        return true;
+    if (isPrivateChat(chat))
+        return true;
+    return (telegramTextMentionsBot(text, botName) ||
+        telegramEntitiesMentionBot(message.entities, text, botName));
 }
 /**
  * Telegram's Bot API puts each media-bearing message variant on a dedicated

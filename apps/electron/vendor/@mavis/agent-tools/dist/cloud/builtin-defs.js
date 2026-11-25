@@ -67,6 +67,21 @@ export const CloudEditToolDef = {
         '- `replace_all: true` replaces every occurrence instead.',
     schema: CloudEditToolSchema,
 };
+/**
+ * Foreground `bash` timeout the cloud runtime sends when the model gives none.
+ * Omitting `timeout_seconds` would leave the limit to the sandbox provider
+ * (e2b pyworker 30s, pod-manager 60s), so the tool always sends this value.
+ */
+export const CLOUD_BASH_DEFAULT_TIMEOUT_SECONDS = 60;
+/**
+ * Cap archon-server applies to `timeout_seconds` for both ExecuteShell
+ * (foreground) and StartShellJob (background): archon_server
+ * internal/domain/shell/service/service.go `defaultMaxTimeoutSeconds`.
+ * Foreground requests are clamped to it before sending so the sent value, the
+ * schema text and the server agree. archon_server dev raised the StartShellJob
+ * cap to 1800s (0af098b6); update the background text once that reaches main.
+ */
+export const CLOUD_BASH_MAX_TIMEOUT_SECONDS = 600;
 export const CloudBashToolDef = {
     name: 'bash',
     executionMode: 'sequential',
@@ -80,9 +95,7 @@ export const CloudBashToolDef = {
     schema: Type.Object({
         command: Type.String({ description: 'Shell command line to execute in the sandbox.' }),
         timeout: Type.Optional(Type.Number({
-            // sandbox-control ExecShell default 60s; archon_server clamps to 600s
-            // (internal/domain/shell/service/service.go defaultMaxTimeoutSeconds).
-            description: 'Timeout in seconds. Default 60, max 600.',
+            description: `Timeout in seconds. Default ${CLOUD_BASH_DEFAULT_TIMEOUT_SECONDS}, max ${CLOUD_BASH_MAX_TIMEOUT_SECONDS}.`,
         })),
     }),
 };

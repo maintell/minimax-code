@@ -210,13 +210,18 @@ export class ConversationApplication {
     }
     async abortSession(_ctx, req) {
         const abortSource = normalizeAbortSource(req.reason);
+        // A user stop lands when its Goal pause has run: the Goal is paused and the
+        // stop cascade owns the background work, even while the Turn still closes.
+        let stopLanded = false;
         const result = await this.withSessionLifecycle('abort', async () => {
             if (!(await this.options.sessionReader.find(req.id)))
                 throw sessionNotFound(req.id);
             if ((await this.getActiveTurn(req.id))?.ownedByOtherRuntime) {
                 // Only the Runtime holding the lease can stop this Turn. Leaving the
                 // Session is a no-op here; an explicit stop must not report success or
-                // pause a Goal that the other Runtime is still driving.
+                // pause a Goal that the other Runtime is still driving. Archiving differs
+                // on purpose (SessionLifecycleApplication.pauseActiveGoalForArchive): it
+                // ends the Session for the user, so it pauses the Goal whoever runs it.
                 if (abortSource === 'session_leave')
                     return { status: 'not-running' };
                 throw turnOwnedByOtherRuntimeError();
@@ -229,14 +234,20 @@ export class ConversationApplication {
                     ? {
                         // Leaving a conversation pauses its Goal exactly like an explicit
                         // stop; only `user_stop` additionally cascades into background work.
-                        onAccepted: () => this.pauseActiveGoalForAbort(req.id),
+                        onAccepted: async () => {
+                            await this.pauseActiveGoalForAbort(req.id);
+                            stopLanded = true;
+                        },
                     }
                     : {}),
             });
         });
         if (result.status === 'aborted' ||
             result.status === 'released' ||
-            result.status === 'not-running') {
+            result.status === 'not-running' ||
+            // The Turn keeps closing after the wait; the stop itself has landed, and
+            // the Turn's terminal event reports the close (see CONTEXT.md, 正在停止).
+            (result.status === 'abort-timeout' && stopLanded)) {
             return { success: true };
         }
         const timeout = result.status === 'abort-timeout';

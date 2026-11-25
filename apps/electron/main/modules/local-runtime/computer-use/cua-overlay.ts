@@ -258,6 +258,9 @@ export class CuaDesktopOverlay {
             // macOS otherwise pushes frameless windows below the menu bar, moving the
             // bottom edge off screen. This option only affects macOS.
             ...(kind === 'edge' ? { enableLargerThanScreen: true } : {}),
+            // macOS pulls full-screen-capable windows into the active full-screen Space, where the
+            // transparent overlay renders over a black backdrop. Windows only uses it to gate setFullScreen.
+            fullscreenable: false,
             show: false,
             frame: false,
             transparent: true,

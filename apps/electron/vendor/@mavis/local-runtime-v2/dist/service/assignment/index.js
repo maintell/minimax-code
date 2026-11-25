@@ -10,4 +10,5 @@ export { clearDeliveryBaselines, DeliveryBaselineRepository, exportDeliveryBasel
 export { ownContextState, ownGoalState, spaceContextKey } from './state/context-delta.js';
 export { createAssignmentExecutionReminderExtension } from './execution-reminder.js';
 export { createAssignmentPermissionDecisions } from './permission/decisions.js';
+export { resolveApprovalProject, sessionCreateProject, } from './permission/session-create-project.js';
 //# sourceMappingURL=index.js.map

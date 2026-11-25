@@ -31,19 +31,44 @@ function createBrowserSkillExclusiveStepHook(options) {
 }
 export function createBrowserUseExtension(options) {
     const exclusiveSkillStep = createBrowserSkillExclusiveStepHook(options);
+    const notify = (type, sessionId, turnId) => {
+        try {
+            options.notifyLifecycle?.(type, sessionId, turnId);
+        }
+        catch {
+            // Browser lifecycle delivery is best-effort and never changes the Turn.
+        }
+    };
     return {
         id: 'browser-use-policy',
         description: 'Enforces Browser Skill ordering before Browser tool execution.',
         init(api) {
             api.on('after_llm_call', (input) => exclusiveSkillStep(input));
-            api.on('turn_end', (event) => options.clearTurn(event.sessionId, event.turnId));
+            api.on('turn_end', (event) => {
+                options.clearTurn(event.sessionId, event.turnId);
+                notify('turn_end', event.sessionId, event.turnId);
+            });
         },
     };
 }
+/**
+ * Browser actions that read the page without changing it. One of these
+ * failing inside run_code (a selector that matched nothing, a wait that timed
+ * out) leaves the page as it was, so the program's later Browser calls may
+ * still run.
+ */
+const READ_ONLY_BROWSER_ACTIONS = {
+    inspect: true,
+    query: true,
+    wait: true,
+    screenshot: true,
+    list_tabs: true,
+};
 export function createBrowserUseTurnToolSafetyGuard(options) {
     // run_code calls whose Browser children must stop: a program cannot be
     // trusted to check r.isError, and a later dependent action on the shared
-    // page must not run after an earlier one failed.
+    // page must not run after an earlier one failed. A failed read does not
+    // stop it. Child calls exist only in PTC turns (toolCallMode 'ptc').
     const stoppedPrograms = new Set();
     // An authentication takeover marker (`safety.requiredNextTool`) is only a
     // prompt-level signal for the model; this guard never blocks tools on it.
@@ -66,12 +91,35 @@ export function createBrowserUseTurnToolSafetyGuard(options) {
             return undefined;
         },
         afterToolCall(input) {
-            if (!isTrustedBrowserToolCall(input.toolCall))
+            if (!input.parentToolCallId || !isTrustedBrowserToolCall(input.toolCall))
                 return;
-            if (input.parentToolCallId && input.isError)
+            if (input.isError &&
+                !isReadOnlyFailureWithKnownOutcome(input.toolCall.name, input.args, input.result)) {
                 stoppedPrograms.add(input.parentToolCallId);
+            }
         },
     };
+}
+/**
+ * A failed read-only Browser call (the compact `browser` tool's `action`, or a
+ * split `browser_<action>` tool) whose error does not leave the page state
+ * unknown.
+ */
+function isReadOnlyFailureWithKnownOutcome(toolName, args, result) {
+    const details = isRecord(result) && isRecord(result.details) ? result.details : undefined;
+    // The result names the action; a split `browser_<action>` tool names it too.
+    const action = [
+        details?.action,
+        isRecord(args) ? args.action : undefined,
+        toolName.replace(/^browser_/u, ''),
+    ].find((value) => typeof value === 'string');
+    if (typeof action !== 'string' || READ_ONLY_BROWSER_ACTIONS[action] !== true)
+        return false;
+    const browserResult = isRecord(details?.result) ? details.result : undefined;
+    // BROWSER_OPERATION_TIMEOUT leaves the page state unknown even for a read:
+    // the page stopped answering and the tab may have been reset.
+    return (details?.code !== 'BROWSER_OPERATION_TIMEOUT' &&
+        browserResult?.code !== 'BROWSER_OPERATION_TIMEOUT');
 }
 function isLegacyBrowserFeatureEnable(input) {
     if (input.toolCall.name !== 'request_feature_enable')

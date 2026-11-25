@@ -1,15 +1,18 @@
 import { UserMessageCommitAdmissionError, UserMessageCommitConflictError, } from './repo/contract.js';
 import { createUserMessageId } from '../shared/user-message-id.js';
+/** A Message commit rejection that every retry of the same input meets again. */
+export function isDeterministicUserMessageCommitRejection(error) {
+    return (error instanceof UserMessageCommitAdmissionError ||
+        error instanceof UserMessageCommitConflictError);
+}
 /** Retries transient Message writes once without repeating deterministic rejections. */
 export async function retryUserMessageCommit(operation) {
     try {
         return await operation();
     }
     catch (error) {
-        if (error instanceof UserMessageCommitAdmissionError ||
-            error instanceof UserMessageCommitConflictError) {
+        if (isDeterministicUserMessageCommitRejection(error))
             throw error;
-        }
         return operation();
     }
 }

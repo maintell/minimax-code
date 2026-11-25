@@ -1,6 +1,7 @@
 export { BUNNY_AGENT_NAME, BUNNY_LIBRARY_ROOT_AGENTS, BunnyBackupNotFoundError, BunnyTaskModelInvalidError, isBunnyPermissionMode, } from './contracts.js';
 export { BunnyWorklineService, readBunnyWorklines } from './orchestration/workline.service.js';
 export { renderScheduleSpaceLabel } from './orchestration/schedule-space-label.js';
+export { createBunnyScheduleOriginStore } from './schedule-origins.js';
 export { projectBunnyGreetingOrigin } from './orchestration/greeting-origin.js';
 export { BunnyService } from './orchestration/bunny.service.js';
 export { bindBunnyMemoryTriggers } from './memory/triggers.js';

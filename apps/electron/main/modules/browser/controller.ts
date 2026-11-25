@@ -14,7 +14,10 @@ import { BrowserActions } from "./browser-actions";
 import { DevicePreviewController } from "./device-preview-controller";
 import { DevicePreviewWindow } from "./device-preview-window";
 import { AgentCursorController } from "./agent-cursor-controller";
-import { AGENT_CURSOR_WORLD_ID, AGENT_CURSOR_BRIDGE_SCRIPT } from "./agent-cursor-bridge";
+import { AGENT_CURSOR_BRIDGE_SCRIPT, AGENT_CURSOR_WORLD_ID } from "./agent-cursor-bridge";
+import { TAKEOVER_PILL_BRIDGE_SCRIPT, TAKEOVER_PILL_CONTROL_NAME } from "./agent-takeover-pill-bridge";
+/** Upper bound for one Agent cursor/glow isolated-world script. */
+const AGENT_SURFACE_EVALUATE_TIMEOUT_MS = 3000;
 export let EMBEDDED_BROWSER_PARTITION = 'persist:mavis-browser';
 /**
  * Electron's own default for a `WebContentsView` created with no explicit
@@ -94,6 +97,10 @@ export class BrowserController {
         this.agentCursorDiagnose = () => undefined;
         this.agentExecutionGlowActive = false;
         this.agentSurfaceBridgeReady = false;
+        this.agentSurfacePaused = () => false;
+        /** A main-document navigation started and has not committed yet (see evaluateAgentSurface). */
+        this.agentSurfaceDocumentPending = false;
+        this.takeoverPillVisible = false;
         this.browserActions = new BrowserActions();
         this.devicePreviewController = new DevicePreviewController(() => this.browserActions.getCDPHelper());
         this.browserActions.setInputCoordinateScaleProvider?.(() => this.devicePreviewController.getDisplayScale());
@@ -103,7 +110,7 @@ export class BrowserController {
                 if (!installed) {
                     return { success: false, result: null, error: 'Agent surface bridge unavailable' };
                 }
-                return this.evaluateInIsolatedWorld(AGENT_CURSOR_WORLD_ID, script);
+                return this.evaluateAgentSurface(script);
             },
             isEnabled: () => this.agentCursorEnabled(),
             isVisible: () => this.agentCursorVisible(),
@@ -290,6 +297,7 @@ export class BrowserController {
             this.backgroundThrottlingAllowed = true;
             this.agentExecutionGlowActive = false;
             this.agentSurfaceBridgeReady = false;
+            this.agentSurfaceDocumentPending = false;
             void this.agentCursorController.reset();
             this.devicePreviewController.reset();
             this.deferredInitialization = null;
@@ -752,6 +760,10 @@ export class BrowserController {
         this.agentCursorVisible = options.isVisible;
         this.agentCursorDiagnose = options.diagnose ?? (() => undefined);
     }
+    /** Report whether the page is paused by a JavaScript dialog (Browser Core owns that state). */
+    setAgentSurfacePausedProbe(probe) {
+        this.agentSurfacePaused = probe;
+    }
     async installAgentCursorBridge() {
         if (!this.agentCursorEnabled() && !this.agentExecutionGlowActive)
             return false;
@@ -763,11 +775,16 @@ export class BrowserController {
     }
     handleAgentSurfaceNavigationStarted() {
         this.agentSurfaceBridgeReady = false;
+        this.agentSurfaceDocumentPending = true;
+    }
+    /** The main frame committed its new document; the overlay can be installed there. */
+    handleAgentSurfaceNavigationCommitted() {
+        this.agentSurfaceDocumentPending = false;
     }
     async ensureAgentSurfaceBridge() {
         if (this.agentSurfaceBridgeReady)
             return true;
-        const result = await this.evaluateInIsolatedWorld(AGENT_CURSOR_WORLD_ID, AGENT_CURSOR_BRIDGE_SCRIPT);
+        const result = await this.evaluateAgentSurface(AGENT_CURSOR_BRIDGE_SCRIPT);
         this.agentSurfaceBridgeReady = result.success && result.result === true;
         return this.agentSurfaceBridgeReady;
     }
@@ -791,8 +808,11 @@ export class BrowserController {
     }
     async withAgentCursorHiddenForCapture(capture) {
         const hideGlow = this.agentExecutionGlowActive;
+        const hidePill = this.takeoverPillVisible;
         if (hideGlow)
             await this.sendAgentSurfaceCommand({ type: 'capture-hide' });
+        if (hidePill)
+            await this.dispatchTakeoverPillCommand({ type: 'capture-hide' });
         try {
             return await this.agentCursorController.withHiddenForCapture(capture);
         }
@@ -800,12 +820,79 @@ export class BrowserController {
             if (hideGlow && this.agentExecutionGlowActive) {
                 await this.sendAgentSurfaceCommand({ type: 'capture-restore' });
             }
+            if (hidePill)
+                await this.dispatchTakeoverPillCommand({ type: 'capture-restore' });
         }
+    }
+    /** Show (or refresh) the in-page takeover pill; idempotent, reinstalls after navigation. */
+    async showTakeoverPill(params) {
+        this.takeoverPillVisible = true;
+        const command = {
+            type: 'show',
+            ...params,
+            zoom: 1 / (this.getZoomFactor() || 1),
+        };
+        if (await this.dispatchTakeoverPillCommand(command))
+            return true;
+        const installed = await this.evaluateInIsolatedWorld(AGENT_CURSOR_WORLD_ID, TAKEOVER_PILL_BRIDGE_SCRIPT);
+        if (!installed.success || installed.result !== true)
+            return false;
+        return this.dispatchTakeoverPillCommand(command);
+    }
+    async hideTakeoverPill(options) {
+        if (!this.takeoverPillVisible)
+            return;
+        this.takeoverPillVisible = false;
+        await this.dispatchTakeoverPillCommand({
+            type: 'hide',
+            immediate: options?.immediate === true,
+        });
+    }
+    async dispatchTakeoverPillCommand(command) {
+        const script = `globalThis.${TAKEOVER_PILL_CONTROL_NAME}?.dispatch(${JSON.stringify(command)}) === true`;
+        const result = await this.evaluateInIsolatedWorld(AGENT_CURSOR_WORLD_ID, script);
+        return result.success && result.result === true;
     }
     async dispatchAgentSurfaceCommand(command) {
         const script = `globalThis.__mavisEmbeddedBrowserAgentCursorControl?.dispatch(${JSON.stringify(command)}) === true`;
-        const result = await this.evaluateInIsolatedWorld(AGENT_CURSOR_WORLD_ID, script);
+        const result = await this.evaluateAgentSurface(script);
         return result.success && result.result === true;
+    }
+    /**
+     * The Agent cursor and execution glow are presentation only. A page paused
+     * by a JavaScript dialog runs no isolated-world script until the dialog is
+     * answered, so skip them while one is known to be open and bound them
+     * otherwise: a missing overlay must never hold the Browser action result.
+     *
+     * Skip them too while the main frame loads a new document it has not
+     * committed: the isolated-world script waits for that commit, and the
+     * overlay would be drawn on the page being replaced. Real Electron 42, a
+     * submit whose next page answered after 14 s: the glow and cursor scripts
+     * around one click each waited out the 3 s bound, so the click reported 3 s
+     * after Browser Core had returned and the next action started 3 s late.
+     * The new document gets the overlay from the next Agent action.
+     */
+    async evaluateAgentSurface(script) {
+        if (this.agentSurfacePaused()) {
+            return { success: false, result: null, error: 'Page is paused by a JavaScript dialog' };
+        }
+        // Loading ends without a commit too (a download, HTTP 204, a stopped load).
+        if (this.agentSurfaceDocumentPending && this.webContents?.isLoadingMainFrame()) {
+            return { success: false, result: null, error: 'A new document is loading' };
+        }
+        let timer;
+        const timeout = new Promise((resolve) => {
+            timer = setTimeout(() => resolve({ success: false, result: null, error: 'Agent surface script timed out' }), AGENT_SURFACE_EVALUATE_TIMEOUT_MS);
+        });
+        try {
+            return await Promise.race([
+                this.evaluateInIsolatedWorld(AGENT_CURSOR_WORLD_ID, script),
+                timeout,
+            ]);
+        }
+        finally {
+            clearTimeout(timer);
+        }
     }
     async sendAgentSurfaceCommand(command) {
         if (!(await this.ensureAgentSurfaceBridge()))

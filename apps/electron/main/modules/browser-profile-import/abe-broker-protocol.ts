@@ -17,8 +17,15 @@
  * 失败一律 fail closed：解析不出来的响应按协议错误处理，绝不猜测。
  */
 
-/** Chrome 存 Envelope Key 的机器级 CNG/KSP 密钥名。 */
+/** Chrome 存 v3 Envelope Key 的机器级 CNG/KSP 密钥名。 */
 export let CHROME_CNG_KEY_NAME = 'Google Chromekey1';
+/**
+ * Chrome 存 v4 Envelope Key 的机器级 CNG/KSP 密钥名。
+ *
+ * Chrome 158 起私有 Envelope 版本升到 4，同时换用第二把机器密钥。两把密钥在同
+ * 一台机器上同时存在，用错不会报错（AES 无认证），只会让最终 AEAD 报 auth_failed。
+ */
+export let CHROME_CNG_KEY_NAME_V4 = 'Google Chromekey2';
 /** 单个请求/响应里允许的最大 payload（base64 解码后）。 */
 export let MAX_BROKER_PAYLOAD_BYTES = 64 * 1024;
 /** 单行 JSON 的最大长度，防止 broker 异常时把内存吃光。 */

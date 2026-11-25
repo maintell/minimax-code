@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { CARRIED_CONFIG_STATE_FILES, isConfigStateEntry } from './config-state-paths.js';
+import { PRIVATE_CONFIG_FILE_MODE } from './private-config-file.js';
 export const NEW_DATA_DIR_BASENAME = '.minimax';
 export const LEGACY_DATA_DIR_BASENAME = '.mavis';
 const noopLogger = {
@@ -82,7 +84,8 @@ function removePathForLink(pathToRemove, state, logger) {
 }
 function contentState(dirPath) {
     try {
-        const entries = fs.readdirSync(dirPath);
+        // config.yaml lifecycle markers are not user data.
+        const entries = fs.readdirSync(dirPath).filter((name) => !isConfigStateEntry(name));
         if (entries.length === 0)
             return 'empty';
         if (entries.length === 1 && entries[0] === 'workspace') {
@@ -151,6 +154,38 @@ function ensureCompatLink(legacyDir, newDir, logger, nowMs) {
     if (!prepareLegacyPathForLink(legacyDir, newDir, logger, nowMs))
         return;
     createCompatLink(legacyDir, newDir, logger);
+}
+/** The config.yaml lifecycle markers of a primary dir that migration is about to replace. */
+function readConfigStateMarkers(dir) {
+    const markers = [];
+    for (const name of CARRIED_CONFIG_STATE_FILES) {
+        try {
+            markers.push([name, fs.readFileSync(path.join(dir, name))]);
+        }
+        catch {
+            // Not there.
+        }
+    }
+    return markers;
+}
+/**
+ * Puts the markers back after the legacy data moved in, so a deletion not yet
+ * shown is still reported; markers the legacy dir brought along win.
+ */
+function restoreConfigStateMarkers(dir, markers, logger) {
+    for (const [name, content] of markers) {
+        try {
+            fs.writeFileSync(path.join(dir, name), content, {
+                flag: 'wx',
+                mode: PRIVATE_CONFIG_FILE_MODE,
+            });
+        }
+        catch (error) {
+            if (error.code !== 'EEXIST') {
+                logger.warn(`Failed to keep ${name} in migrated data dir ${dir}: ${String(error)}`);
+            }
+        }
+    }
 }
 function removeEmptyPrimaryForMigration(newDir, logger) {
     try {
@@ -250,6 +285,7 @@ function resolveDataDirPair(newDir, legacyDir, logger, nowMs) {
             }
             if ((legacyState.kind === 'directory' || legacyState.kind === 'link') &&
                 legacyContent === 'hasData') {
+                const markers = readConfigStateMarkers(newDir);
                 if (!removeEmptyPrimaryForMigration(newDir, logger))
                     return legacyDir;
                 if (legacyState.kind === 'link') {
@@ -259,6 +295,7 @@ function resolveDataDirPair(newDir, legacyDir, logger, nowMs) {
                 else if (!migrateLegacyIntoPrimary(legacyDir, newDir, logger)) {
                     return legacyDir;
                 }
+                restoreConfigStateMarkers(newDir, markers, logger);
                 createCompatLink(legacyDir, newDir, logger);
                 return newDir;
             }

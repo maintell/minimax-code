@@ -1,5 +1,5 @@
 import { usesSegmentContextProfile } from '@mavis/shared/agent-coordination';
-import { emergencyFilesGrantSource, } from '../../agent-host/runner/policy/session-readable-grants.js';
+import { emergencyFilesGrantSource, } from '../session-readable-grants.js';
 import { createEmergencyArtifacts } from './emergency-state.repository.js';
 import { createHistoryRepair } from './history-repair.js';
 import { classifyTurnFailure } from './turn-failure-classification.js';

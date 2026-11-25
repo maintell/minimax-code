@@ -10,6 +10,7 @@ import { migration as m0004 } from './migrations/cron/migration-0004-copy-legacy
 import { migration as m0036 } from './migrations/cron/migration-0036-repair-cron-manual-request-index.js';
 import { migration as m0005 } from './migrations/plugin/migration-0005-adopt-plugin-state.js';
 import { migration as m0050 } from './migrations/plugin/migration-0050-create-plugin-miniapp-permission.js';
+import { migration as m0068 } from './migrations/plugin/migration-0068-create-extension-preview-consents.js';
 import { migration as m0051 } from './migrations/goal/migration-0051-add-goal-cache-write-unreported.js';
 import { migration as m0023 } from './migrations/miniapp/migration-0023-create-miniapp-state.js';
 import { migration as m0030 } from './migrations/miniapp/migration-0030-repair-liveboard-state-version-collision.js';
@@ -56,6 +57,12 @@ import { migration as m0054 } from './migrations/runtime/migration-0054-create-p
 import { migration as m0055 } from './migrations/session/migration-0055-create-message-search-index.js';
 import { migration as m0064 } from './migrations/session/migration-0064-create-session-auto-resume.js';
 import { migration as m0065 } from './migrations/cron/migration-0065-add-cron-run-scheduled-for.js';
+import { migration as m0066 } from './migrations/session/migration-0066-converge-session-file-syncs-cron-scheduled-for.js';
+import { migration as m0067 } from './migrations/session/migration-0067-file-sync-owner.js';
+import { migration as m0069 } from './migrations/skill/migration-0069-create-skill-usage.js';
+import { migration as m0070 } from './migrations/session/migration-0070-add-project-listed-at.js';
+import { migration as m0071 } from './migrations/session/migration-0071-create-session-merge-requests.js';
+import { migration as m0072 } from './migrations/session/migration-0072-drop-turn-end-merge-request-links.js';
 export const ALL_MIGRATIONS = [
     m0001,
     m0002,
@@ -115,5 +122,12 @@ export const ALL_MIGRATIONS = [
     m0063,
     m0064,
     m0065,
+    m0066,
+    m0067,
+    m0068,
+    m0069,
+    m0070,
+    m0071,
+    m0072,
 ];
 //# sourceMappingURL=migrations.js.map

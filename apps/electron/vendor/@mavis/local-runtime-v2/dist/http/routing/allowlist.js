@@ -359,6 +359,28 @@ const OWNER_METHOD_GROUPS = {
     llmContextInspector: LLM_CONTEXT_INSPECTOR_METHODS,
     preference: PREFERENCE_OWNER_METHODS,
     agentShell: new Set(['getAgentShellStatus', 'putAgentShellPreference']),
+    mergeRequest: new Set([
+        'listSessionMergeRequests',
+        'batchGetSessionMergeRequestBadges',
+        'getMergeRequestJobLog',
+        'linkSessionMergeRequest',
+        'unlinkSessionMergeRequest',
+        'getCodeHostingStatus',
+        'getMergeRequestChanges',
+        'getMergeRequestMergeOptions',
+        'mergeMergeRequest',
+        'getMergeRequestCleanupPlan',
+        'cleanupMergeRequestWorktree',
+        'retryMergeRequestPipeline',
+        'replyMergeRequestDiscussion',
+        'resolveMergeRequestDiscussion',
+        'addMergeRequestComment',
+        'updateMergeRequest',
+        'searchMergeRequestReviewers',
+        'getMergeRequestCreateDefaults',
+        'createMergeRequest',
+        'searchMergeRequestLinkCandidates',
+    ]),
     sandbox: SANDBOX_METHODS,
     globalInstructions: GLOBAL_INSTRUCTIONS_METHODS,
     channel: CHANNEL_OWNER_METHODS,
@@ -372,6 +394,7 @@ const WORKTREE_METHODS = new Set([
     'listManagedWorkspaceGitWorktrees',
     'removeManagedWorkspaceGitWorktree',
     'removeManagedWorkspaceGitWorktreesBatch',
+    'restoreSessionWorktree',
 ]);
 const MCP_METHODS = new Set([
     'listLocalMcpServers',
@@ -409,6 +432,19 @@ const HOOK_METHODS = new Set([
     'deleteLocalHook',
     'setLocalHookEnabled',
     'setLocalHookScopeEnabled',
+]);
+/** Plugin Extension transport has no v1 owner; absent services answer 503. */
+const PLUGIN_EXTENSION_METHODS = new Set([
+    'listExtensionEntries',
+    'renderExtension',
+    'pressExtension',
+    'inputExtension',
+    'selectExtension',
+    'ackExtensionApplied',
+    'reportExtensionFallback',
+    'answerExtensionQuery',
+    'closeExtensionPane',
+    'subscribeExtensionStream',
 ]);
 /**
  * 只有生产组装提供完整 Application 依赖图时，Session/Application 路由才会启用。
@@ -450,6 +486,11 @@ const SESSION_APPLICATION_METHODS = new Set([
     'revertTurnDiff',
     'reapplyTurnDiff',
     'listSessionFiles',
+    'getSessionFileSyncs',
+    'recordSessionFileSync',
+    'querySessionFileSyncSources',
+    'invalidateSessionFileSyncSources',
+    'bindSessionFileSyncOwner',
     'listArtifacts',
     'saveArtifactSpace',
     'getArtifactSpace',
@@ -464,6 +505,7 @@ const SESSION_APPLICATION_METHODS = new Set([
     'querySidebarProjectSessions',
     'querySidebarAgents',
     'getSidebarSession',
+    'moveSidebarProject',
     'listProjects',
     'createProject',
     'updateProject',
@@ -503,12 +545,13 @@ const RETIRED_CRON_METHODS = new Set([
     'deleteCron',
 ]);
 export function migratedMethodsForHost(hasOwnerServices, hasSessionApplications = false) {
-    // 每个 host 都挂载始终可用的探针和 worktree 路由；缺失 facade 时明确返回 503。
+    // 每个 host 都挂载始终可用的探针、worktree、MCP、Hook 与 Plugin Extension 路由；缺失 facade 时明确返回 503。
     const migrated = new Set([
         ...ALWAYS_MOUNTED_METHODS,
         ...WORKTREE_METHODS,
         ...MCP_METHODS,
         ...HOOK_METHODS,
+        ...PLUGIN_EXTENSION_METHODS,
     ]);
     if (typeof hasOwnerServices === 'boolean') {
         if (!hasOwnerServices)

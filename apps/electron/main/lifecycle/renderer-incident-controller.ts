@@ -2,7 +2,7 @@ const RENDERER_INCIDENT_WINDOW_MS = 60000;
 const FORCED_RELOAD_PROCESS_EXIT_GRACE_MS = 10000;
 const FORCED_RENDERER_EXIT_WAIT_MS = 2000;
 /** Disposable worker hosts terminate on renderer death instead of reloading a user window. */
-export function observeDisposableRendererExit(contents, terminate) {
+export function observeDisposableRendererExit(contents, terminate, onDispose) {
     let active = true;
     const dispose = () => {
         if (!active)
@@ -10,15 +10,26 @@ export function observeDisposableRendererExit(contents, terminate) {
         active = false;
         contents.removeListener('render-process-gone', gone);
         contents.removeListener('destroyed', dispose);
+        onDispose?.();
     };
-    const gone = () => {
+    const gone = (_event, details) => {
         if (!active)
             return;
         dispose();
-        terminate();
+        terminate(details);
     };
     contents.on('render-process-gone', gone);
     contents.on('destroyed', dispose);
+    return dispose;
+}
+/** Capture renderers are transient: terminate their operation rather than reload recording state. */
+export function attachCaptureRendererIncidentHandler(window, onFailure) {
+    const onUnresponsive = () => {
+        dispose();
+        onFailure(new Error('Capture renderer is unresponsive'));
+    };
+    const dispose = observeDisposableRendererExit(window.webContents, (details) => onFailure(new Error(`Capture renderer exited: ${details.reason}`)), () => window.removeListener('unresponsive', onUnresponsive));
+    window.on('unresponsive', onUnresponsive);
     return dispose;
 }
 /** `killed` is usually an external kill (`pkill`, Activity Monitor); a reload brings the window back. */

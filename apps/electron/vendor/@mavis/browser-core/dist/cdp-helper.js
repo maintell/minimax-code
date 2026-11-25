@@ -1,11 +1,13 @@
 import { browserPrintableKeyDescriptor } from './browser-keyboard.js';
 import { CDPPageScanner } from './cdp-page-scanner.js';
+import { EDITABLE_FIELD_SOURCE } from './browser-editable-field.js';
 import { describeCdpException, isRecord } from './browser-state.js';
-import { browserInputDiagnosticLogger, formatConsoleStack, MAX_CONSOLE_DIAGNOSTIC_ENTRIES, MAX_CONSOLE_DIAGNOSTIC_PAGE_BYTES, MAX_NETWORK_DIAGNOSTIC_ENTRIES, MAX_NETWORK_DIAGNOSTIC_PAGE_BYTES, networkStatusMatches, normalizeNetworkResourceType, sanitizeNetworkDiagnosticUrl, sanitizeNetworkText, summarizeRemoteObject, } from './cdp-diagnostic-helpers.js';
+import { browserInputDiagnosticLogger, formatConsoleStack, MAX_CONSOLE_DIAGNOSTIC_ENTRIES, MAX_CONSOLE_DIAGNOSTIC_PAGE_BYTES, summarizeRemoteObject, } from './cdp-diagnostic-helpers.js';
+import { CDPNetworkDiagnostics } from './cdp-network-diagnostics.js';
 import { uploadFilesByBackendNodeId as runFileUpload } from './cdp-file-upload.js';
 import { abortReason, abortableDelay, BROWSER_TIMEOUTS, isBrowserOperationInterruption, throwIfAborted, withTimeout, } from './operation-timeout.js';
 import { CDPDragError, CDPTextInputError, DEFAULT_CDP_TIMEOUT_MS, DRAG_CANCEL_DATA, DRAG_PATH_STEPS, } from './cdp-helper-contracts.js';
-import { buildBoundedConsoleDiagnosticMessage, MAX_CONSOLE_ARGUMENTS, sanitizeConsoleDiagnosticUrl, truncateConsoleValue, } from './console-diagnostic-sanitizer.js';
+import { buildBoundedConsoleDiagnosticMessage, MAX_CONSOLE_ARGUMENTS, sanitizeConsoleDiagnosticUrl, } from './console-diagnostic-sanitizer.js';
 export { DEFAULT_VIEWPORT } from './cdp-page-scanner.js';
 export { sanitizeConsoleDiagnosticUrl } from './console-diagnostic-sanitizer.js';
 /**
@@ -40,11 +42,10 @@ export class CDPHelper {
     consoleDiagnosticsEnabled = false;
     consoleMainFrameId = null;
     consoleExecutionContextFrames = new Map();
-    networkDiagnosticSequence = 0;
-    networkDiagnostics = [];
     networkDiagnosticsEnabled = false;
-    networkMainFrameId = null;
-    networkRequests = new Map();
+    network = new CDPNetworkDiagnostics();
+    /** Set by interruption recovery: the re-attached listener keeps the network records. */
+    preserveNetworkOnAttach = false;
     constructor(transport, getInputCoordinateScale = () => 1) {
         this.getInputCoordinateScale = getInputCoordinateScale;
         this.transport = transport;
@@ -64,7 +65,8 @@ export class CDPHelper {
         this.isDirty = true;
         this.pageScanner.reset();
         this.resetConsoleDiagnostics();
-        this.resetNetworkDiagnostics(true);
+        this.preserveNetworkOnAttach = false;
+        this.network.reset(true);
     }
     /** Return the provider transport so adapters can share one debugger owner. */
     getTransport() {
@@ -93,7 +95,8 @@ export class CDPHelper {
         this.domListenerDesired = false;
         this.removeDOMListener();
         this.resetConsoleDiagnostics();
-        this.resetNetworkDiagnostics();
+        this.preserveNetworkOnAttach = false;
+        this.network.reset();
         void this.detachDebugger().catch(() => undefined);
     }
     detachDebugger(force = false) {
@@ -167,12 +170,15 @@ export class CDPHelper {
             this.lastInterruptionRecoverySucceeded = true;
             return true;
         }
+        // Recovery keeps the same logical page session: its network records and
+        // sequence survive, marked with the reset (in evaluation the query after a
+        // timed-out submit came back empty and the model submitted again). Mark
+        // first: removing the listener forgets the requests still in flight.
+        this.network.markReset();
+        this.preserveNetworkOnAttach = true;
         this.removeDOMListener();
         this.pageScanner.reset();
         this.resetConsoleDiagnostics();
-        // Recovery keeps the same logical page session, so preserve the monotonic
-        // sequence used by Network query checkpoints while discarding stale data.
-        this.resetNetworkDiagnostics();
         this.isDirty = true;
         let succeeded = false;
         try {
@@ -357,12 +363,12 @@ export class CDPHelper {
                     : {});
                 const frame = (frameTree.frame && typeof frameTree.frame === 'object' ? frameTree.frame : {});
                 this.consoleMainFrameId = typeof frame.id === 'string' ? frame.id : null;
-                this.networkMainFrameId = this.consoleMainFrameId;
+                this.network.mainFrameId = this.consoleMainFrameId;
             }
             if (this.consoleMainFrameId === null)
                 return;
-            if (this.networkMainFrameId === null)
-                this.networkMainFrameId = this.consoleMainFrameId;
+            if (this.network.mainFrameId === null)
+                this.network.mainFrameId = this.consoleMainFrameId;
             this.isDirty = true; // 初始标记为脏，需要获取一次
         }
         catch (error) {
@@ -405,8 +411,12 @@ export class CDPHelper {
     attachDOMMessageListener() {
         this.resetConsoleDiagnostics();
         this.resetConsoleDiagnosticScope();
-        this.resetNetworkDiagnostics();
-        this.resetNetworkDiagnosticScope();
+        // A listener after interruption recovery continues the same page's records.
+        if (this.preserveNetworkOnAttach)
+            this.preserveNetworkOnAttach = false;
+        else
+            this.network.reset();
+        this.network.resetScope();
         this.domEventDisposer?.();
         this.domEventDisposer = this.transport.onEvent(({ method, params, sessionId }) => {
             if (method === 'DOM.childNodeInserted' ||
@@ -435,7 +445,7 @@ export class CDPHelper {
         return (this.domListenerAttached &&
             this.pageDomainEnabled &&
             this.consoleMainFrameId !== null &&
-            this.networkMainFrameId !== null);
+            this.network.mainFrameId !== null);
     }
     /**
      * 停止 DOM 变化监听
@@ -457,7 +467,7 @@ export class CDPHelper {
         this.consoleDiagnosticsEnabled = false;
         this.networkDiagnosticsEnabled = false;
         this.resetConsoleDiagnosticScope();
-        this.resetNetworkDiagnosticScope();
+        this.network.resetScope();
     }
     getConsoleDiagnostics(options = {}) {
         const requestedLimit = Number.isFinite(options.limit) ? Number(options.limit) : 100;
@@ -503,46 +513,7 @@ export class CDPHelper {
         };
     }
     getNetworkDiagnostics(options = {}) {
-        const requestedLimit = Number.isFinite(options.limit) ? Number(options.limit) : 100;
-        const limit = Math.max(1, Math.min(MAX_NETWORK_DIAGNOSTIC_ENTRIES, Math.floor(requestedLimit)));
-        const requestedStatus = new Set(options.status ?? []);
-        const requestedResourceTypes = new Set(options.resourceTypes ?? []);
-        const filter = options.filter ?? '';
-        const requestedAfterSequence = Number.isFinite(options.afterSequence)
-            ? Number(options.afterSequence)
-            : 0;
-        const afterSequence = Math.max(0, Math.floor(requestedAfterSequence));
-        const filteredEntries = this.networkDiagnostics.filter((entry) => entry.sequence > afterSequence &&
-            networkStatusMatches(entry, requestedStatus) &&
-            (requestedResourceTypes.size === 0 || requestedResourceTypes.has(entry.resourceType)) &&
-            (filter.length === 0 || entry.url.includes(filter)));
-        const totalEntries = filteredEntries.length;
-        const limitedEntries = filteredEntries.slice(Math.max(0, totalEntries - limit));
-        const entries = [];
-        for (let index = limitedEntries.length - 1; index >= 0; index -= 1) {
-            const entry = limitedEntries[index];
-            if (!entry)
-                continue;
-            const candidateEntries = [entry, ...entries].map((candidate) => this.publicNetworkDiagnosticEntry(candidate));
-            const candidatePage = {
-                entries: candidateEntries,
-                lastSequence: this.networkDiagnosticSequence,
-                totalEntries,
-                returnedEntries: candidateEntries.length,
-                truncated: candidateEntries.length < totalEntries,
-            };
-            if (Buffer.byteLength(JSON.stringify(candidatePage), 'utf8') > MAX_NETWORK_DIAGNOSTIC_PAGE_BYTES) {
-                break;
-            }
-            entries.unshift(entry);
-        }
-        return {
-            entries: entries.map((entry) => this.publicNetworkDiagnosticEntry(entry)),
-            lastSequence: this.networkDiagnosticSequence,
-            totalEntries,
-            returnedEntries: entries.length,
-            truncated: entries.length < totalEntries,
-        };
+        return this.network.page(options);
     }
     isConsoleDiagnosticsAvailable() {
         return (this.domListenerAttached &&
@@ -554,7 +525,7 @@ export class CDPHelper {
         return (this.domListenerAttached &&
             this.pageDomainEnabled &&
             this.networkDiagnosticsEnabled &&
-            this.networkMainFrameId !== null);
+            this.network.mainFrameId !== null);
     }
     getMainFrameId() {
         return this.consoleMainFrameId;
@@ -562,7 +533,7 @@ export class CDPHelper {
     handleDiagnosticMessage(method, params) {
         const payload = (params && typeof params === 'object' ? params : {});
         if (method.startsWith('Network.')) {
-            this.handleNetworkDiagnosticMessage(method, payload);
+            this.network.handleMessage(method, payload);
             return;
         }
         if (method === 'Runtime.executionContextCreated') {
@@ -598,10 +569,10 @@ export class CDPHelper {
             const frame = (payload.frame && typeof payload.frame === 'object' ? payload.frame : {});
             if (!frame.parentId) {
                 this.resetConsoleDiagnostics();
-                this.resetNetworkDiagnosticsForNavigation(typeof frame.loaderId === 'string' ? frame.loaderId : undefined);
+                this.network.resetForNavigation(typeof frame.loaderId === 'string' ? frame.loaderId : undefined);
                 this.consoleExecutionContextFrames.clear();
                 this.consoleMainFrameId = typeof frame.id === 'string' ? frame.id : null;
-                this.networkMainFrameId = this.consoleMainFrameId;
+                this.network.mainFrameId = this.consoleMainFrameId;
             }
             return;
         }
@@ -609,9 +580,9 @@ export class CDPHelper {
             if (typeof payload.frameId === 'string') {
                 if (payload.frameId === this.consoleMainFrameId) {
                     this.resetConsoleDiagnostics();
-                    this.resetNetworkDiagnostics();
+                    this.network.reset();
                     this.resetConsoleDiagnosticScope();
-                    this.resetNetworkDiagnosticScope();
+                    this.network.resetScope();
                     return;
                 }
                 for (const [contextId, frameId] of this.consoleExecutionContextFrames) {
@@ -690,103 +661,6 @@ export class CDPHelper {
             this.consoleDiagnostics.splice(0, this.consoleDiagnostics.length - MAX_CONSOLE_DIAGNOSTIC_ENTRIES);
         }
     }
-    handleNetworkDiagnosticMessage(method, payload) {
-        const requestId = typeof payload.requestId === 'string' ? payload.requestId : '';
-        if (!requestId)
-            return;
-        if (method === 'Network.requestWillBeSent') {
-            if (payload.frameId !== this.networkMainFrameId)
-                return;
-            const timestamp = typeof payload.timestamp === 'number' ? payload.timestamp : 0;
-            const previous = this.networkRequests.get(requestId);
-            const redirectResponse = (payload.redirectResponse && typeof payload.redirectResponse === 'object'
-                ? payload.redirectResponse
-                : null);
-            if (previous && redirectResponse) {
-                this.applyNetworkResponse(previous, redirectResponse);
-                previous.outcome = 'redirect';
-                this.finishNetworkDiagnostic(previous, timestamp);
-                this.networkRequests.delete(requestId);
-            }
-            const request = (payload.request && typeof payload.request === 'object' ? payload.request : {});
-            this.networkDiagnosticSequence += 1;
-            const entry = {
-                requestId,
-                startedAtMonotonic: timestamp,
-                ...(typeof payload.loaderId === 'string' ? { loaderId: payload.loaderId } : {}),
-                sequence: this.networkDiagnosticSequence,
-                method: truncateConsoleValue(typeof request.method === 'string' ? request.method.toUpperCase() : 'GET', 32),
-                url: sanitizeNetworkDiagnosticUrl(typeof request.url === 'string' ? request.url : '<unknown>'),
-                resourceType: normalizeNetworkResourceType(payload.type),
-                outcome: 'pending',
-                timestamp: typeof payload.wallTime === 'number' ? Math.round(payload.wallTime * 1_000) : Date.now(),
-            };
-            this.networkRequests.set(requestId, entry);
-            this.appendNetworkDiagnostic(entry);
-            return;
-        }
-        const entry = this.networkRequests.get(requestId);
-        if (!entry)
-            return;
-        if (method === 'Network.responseReceived') {
-            const response = (payload.response && typeof payload.response === 'object' ? payload.response : {});
-            this.applyNetworkResponse(entry, response);
-            if (entry.status !== undefined && entry.status >= 400)
-                entry.outcome = 'http-error';
-            if (entry.resourceType === 'other') {
-                entry.resourceType = normalizeNetworkResourceType(payload.type);
-            }
-            return;
-        }
-        if (method === 'Network.loadingFinished') {
-            if (entry.outcome === 'pending')
-                entry.outcome = 'success';
-            this.finishNetworkDiagnostic(entry, typeof payload.timestamp === 'number' ? payload.timestamp : entry.startedAtMonotonic);
-            this.networkRequests.delete(requestId);
-            return;
-        }
-        if (method === 'Network.loadingFailed') {
-            entry.outcome = 'failed';
-            entry.failureReason = sanitizeNetworkText(typeof payload.errorText === 'string'
-                ? payload.errorText
-                : payload.canceled === true
-                    ? 'canceled'
-                    : 'request failed');
-            this.finishNetworkDiagnostic(entry, typeof payload.timestamp === 'number' ? payload.timestamp : entry.startedAtMonotonic);
-            this.networkRequests.delete(requestId);
-        }
-    }
-    applyNetworkResponse(entry, response) {
-        if (typeof response.status === 'number')
-            entry.status = response.status;
-        if (typeof response.statusText === 'string' && response.statusText.length > 0) {
-            entry.statusText = sanitizeNetworkText(response.statusText);
-        }
-        if (typeof response.mimeType === 'string' && response.mimeType.length > 0) {
-            entry.mimeType = truncateConsoleValue(sanitizeNetworkText(response.mimeType), 256);
-        }
-    }
-    finishNetworkDiagnostic(entry, endedAtMonotonic) {
-        entry.durationMs = Math.max(0, Math.round((endedAtMonotonic - entry.startedAtMonotonic) * 1_000));
-    }
-    appendNetworkDiagnostic(entry) {
-        this.networkDiagnostics.push(entry);
-        if (this.networkDiagnostics.length <= MAX_NETWORK_DIAGNOSTIC_ENTRIES)
-            return;
-        const removed = this.networkDiagnostics.splice(0, this.networkDiagnostics.length - MAX_NETWORK_DIAGNOSTIC_ENTRIES);
-        for (const candidate of removed) {
-            if (this.networkRequests.get(candidate.requestId) === candidate) {
-                this.networkRequests.delete(candidate.requestId);
-            }
-        }
-    }
-    publicNetworkDiagnosticEntry(entry) {
-        const publicEntry = { ...entry };
-        delete publicEntry.requestId;
-        delete publicEntry.startedAtMonotonic;
-        delete publicEntry.loaderId;
-        return publicEntry;
-    }
     releaseConsoleRemoteObjects(value) {
         if (!Array.isArray(value))
             return;
@@ -804,24 +678,6 @@ export class CDPHelper {
     resetConsoleDiagnosticScope() {
         this.consoleMainFrameId = null;
         this.consoleExecutionContextFrames.clear();
-    }
-    resetNetworkDiagnostics(resetSequence = false) {
-        if (resetSequence)
-            this.networkDiagnosticSequence = 0;
-        this.networkDiagnostics = [];
-        this.networkRequests.clear();
-    }
-    resetNetworkDiagnosticsForNavigation(loaderId) {
-        if (!loaderId) {
-            this.resetNetworkDiagnostics();
-            return;
-        }
-        this.networkDiagnostics = this.networkDiagnostics.filter((entry) => entry.loaderId === loaderId);
-        this.networkRequests = new Map([...this.networkRequests].filter(([, entry]) => entry.loaderId === loaderId));
-    }
-    resetNetworkDiagnosticScope() {
-        this.networkMainFrameId = null;
-        this.networkRequests.clear();
     }
     isMainFrameConsoleContext(executionContextId) {
         return (typeof executionContextId === 'number' &&
@@ -1500,12 +1356,7 @@ export class CDPHelper {
         return this.callFunctionOnBackendNode(backendNodeId, `function(expectedText) {
         const tag = String(this.tagName || '').toLowerCase();
         const role = String(this.getAttribute?.('role') || '').toLowerCase();
-        const inputType = this instanceof HTMLInputElement ? String(this.type || '').toLowerCase() : '';
-        const editableInput = this instanceof HTMLInputElement && ![
-          'button', 'checkbox', 'file', 'hidden', 'image', 'radio', 'reset', 'submit'
-        ].includes(inputType);
-        const editable = editableInput || this instanceof HTMLTextAreaElement ||
-          this.isContentEditable === true || role === 'textbox' || role === 'searchbox';
+        const editable = (${EDITABLE_FIELD_SOURCE})(this);
         const text = this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement
           ? String(this.value || '')
           : String(this.innerText || this.textContent || '');
@@ -1537,14 +1388,7 @@ export class CDPHelper {
         while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
         const tag = String(active?.tagName || '').toLowerCase();
         const role = String(active?.getAttribute?.('role') || '').toLowerCase();
-        const inputType = active instanceof HTMLInputElement
-          ? String(active.type || '').toLowerCase()
-          : '';
-        const editableInput = active instanceof HTMLInputElement && ![
-          'button', 'checkbox', 'file', 'hidden', 'image', 'radio', 'reset', 'submit'
-        ].includes(inputType);
-        const editable = editableInput || active instanceof HTMLTextAreaElement ||
-          active?.isContentEditable === true || role === 'textbox' || role === 'searchbox';
+        const editable = (${EDITABLE_FIELD_SOURCE})(active);
         const text = active instanceof HTMLInputElement || active instanceof HTMLTextAreaElement
           ? String(active.value || '')
           : String(active?.innerText || active?.textContent || '');
@@ -1766,7 +1610,11 @@ export class CDPHelper {
         for (const option of this.options) option.selected = requested.has(option.value);
         this.dispatchEvent(new Event('input', { bubbles: true }));
         this.dispatchEvent(new Event('change', { bubbles: true }));
-        return Array.from(this.selectedOptions, (option) => option.value);
+        // Not Array.from: Prototype.js/MooTools replace it and drop the map
+        // function, returning DOM nodes that returnByValue cannot serialize.
+        return Array.prototype.filter
+          .call(this.options, (option) => option.selected)
+          .map((option) => option.value);
       }`, [values]);
     }
     /**
@@ -1799,10 +1647,10 @@ export class CDPHelper {
     getViewportBoundsByBackendNodeId(...args) {
         return this.pageScanner.getViewportBoundsByBackendNodeId(...args);
     }
-    async getInteractiveElements(signal) {
+    async getInteractiveElements(signal, options = {}) {
         this.pageScanner.reset();
         try {
-            const elements = await withTimeout((scanSignal) => this.pageScanner.scan(scanSignal), BROWSER_TIMEOUTS.cdpScan, 'CDP interactive element scan', { signal });
+            const elements = await withTimeout((scanSignal) => this.pageScanner.scan(scanSignal, options), BROWSER_TIMEOUTS.cdpScan, 'CDP interactive element scan', { signal });
             if (this.domListenerDesired && !this.domListenerAttached) {
                 this.startDOMListenerInBackground();
             }

@@ -116,6 +116,7 @@ export function createSessionMiniAppLifecycle(plugins, supervisor, sessions, opt
                     sessionId: context.sessionId,
                     pluginId: context.pluginId,
                     ...(context.path !== undefined ? { path: context.path } : {}),
+                    ...(context.turnId ? { turnId: context.turnId } : {}),
                     ...(context.signal ? { signal: context.signal } : {}),
                 });
                 return { miniApp: runningSummary(miniApp), opened: true };
@@ -362,6 +363,7 @@ const PREPARATION_REASON_BY_HOST_CODE = {
     MINIAPP_AGENT_CONCURRENCY_INVALID: 'MINIAPP_AGENT_CONCURRENCY_INVALID',
     MINIAPP_HOST_ACCESS_INVALID: 'MINIAPP_HOST_ACCESS_INVALID',
     MINIAPP_DEVICE_ACCESS_INVALID: 'MINIAPP_DEVICE_ACCESS_INVALID',
+    MINIAPP_FILE_HANDLERS_INVALID: 'MINIAPP_FILE_HANDLERS_INVALID',
     MINIAPP_MANIFEST_FIELD_UNSUPPORTED: 'MINIAPP_MANIFEST_FIELD_UNSUPPORTED',
     MINIAPP_ENGINES_INVALID: 'MINIAPP_ENGINES_INVALID',
     MINIAPP_TOOL_ACCESS_INVALID: 'MINIAPP_TOOL_ACCESS_INVALID',

@@ -1,10 +1,13 @@
 export * from './contracts.js';
 export * from './initialize.js';
 export { readLocalPermissionMode } from './request-contracts.js';
+export { emitPermissionCheckMetric, emitPermissionModeChangeMetric, } from './approval/permission-metrics.js';
+export { engineDecisionSource } from './decision/decision-attribution.js';
 export { replyLocalPermissionRequests } from './approval/permissions.js';
 export { serializePermissionRequest } from './request-contracts.js';
 export { buildLocalPermissionRuleContents } from './host-rules.js';
 export { createProtectedRootDecisions, } from './protected-roots/protected-roots.js';
+export { runtimeStateProtectedRoots } from './protected-roots/runtime-state.js';
 export { isInside } from './protected-roots/canonical-paths.js';
 export { LocalPermissionApprovalService } from './approval.service.js';
 export { LocalPermissionRuleStore } from './rules/rules.js';

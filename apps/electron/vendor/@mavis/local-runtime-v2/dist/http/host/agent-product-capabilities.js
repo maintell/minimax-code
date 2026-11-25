@@ -1,3 +1,6 @@
+import { buildPermissionToolDescription, requestLocalPermissionApproval, } from '../../service/permission/index.js';
+import { safeJsonStringify } from '../../infra/transport/host-http.js';
+import { COMPUTER_USE_PLUGIN_ID } from '../../service/computer-use/index.js';
 import { LocalMatrixClient } from '../../service/matrix/index.js';
 import { createHookExtension } from '@mavis/agent-runtime';
 import { coordinatorSystemReminderAllowlist } from '@mavis/shared/agent-coordination';
@@ -9,7 +12,7 @@ export function createV1AttachmentRegistration(source) {
         register: attachments.register,
         discard: attachments.discard,
         resolveSource: attachments.resolveSource,
-        inspectStoredAsset: attachments.inspectStoredAsset,
+        resolveRegisteredSource: attachments.resolveRegisteredSource,
     };
 }
 /**
@@ -40,6 +43,7 @@ export function createV1AgentHostProductCapabilities(source, evalReporterFactory
                 config: hosted.config,
                 memory: hosted.memory,
                 skills: hosted.skills,
+                namespacedSkillGates: hosted.skillToolGates,
                 modelRepairLogger: hosted.runnerLogger,
             },
             modelResolver: createV1ModelResolver(hosted),
@@ -48,6 +52,7 @@ export function createV1AgentHostProductCapabilities(source, evalReporterFactory
         // source when the broker client is present; compatibility alone stays
         // globally closed.
         turnRuntimeFacts: {
+            computerUsePluginId: COMPUTER_USE_PLUGIN_ID,
             snapshot: () => ({ computerUseGloballyEnabled: false }),
         },
         checkpointState: hosted.checkpointState,
@@ -293,6 +298,26 @@ export function createV1MiniAppToolRules(routeContext) {
             behavior: 'allow',
             rules: [{ tool_name: toolName }],
         }),
+        readMetricsClient: () => routeContext().metricsClient,
+    };
+}
+export function createV1ExtensionPermission(routeContext) {
+    return {
+        checkPermission: (params) => routeContext().permissionService.checkPermission(params),
+        requestApproval: (params) => {
+            const ctx = routeContext();
+            return requestLocalPermissionApproval(ctx, {
+                sessionId: params.sessionId,
+                requester: `plugin:${params.pluginId}`,
+                agentName: ctx.agentName,
+                turnId: params.turnId,
+                toolName: params.toolName,
+                toolInput: safeJsonStringify(params.toolInput),
+                toolDescription: buildPermissionToolDescription(params.toolInput),
+                ruleContents: [],
+                reason: params.reason,
+            }, params.signal);
+        },
     };
 }
 //# sourceMappingURL=agent-product-capabilities.js.map

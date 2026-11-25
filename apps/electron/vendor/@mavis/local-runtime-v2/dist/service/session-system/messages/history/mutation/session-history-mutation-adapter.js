@@ -1,6 +1,7 @@
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { canonicalActiveHistoryRevision, copyCanonicalHistorySnapshotFile, inspectCanonicalHistorySequence, rewriteCanonicalHistorySnapshotFile, verifyCanonicalHistorySnapshotFile, } from '../../../sessions/representation/canonical-history-contract.js';
+import { validateRetractTurnInput } from '@mavis/harness';
+import { canonicalActiveHistoryRevision, copyCanonicalHistorySnapshotFile, inspectCanonicalHistorySequence, verifyCanonicalHistorySnapshotFile, } from '../../../sessions/representation/canonical-history-contract.js';
 import { createCanonicalHistoryFileAdapter } from '../../../sessions/representation/canonical-history.js';
 import { ensureCanonicalHistoryMaterialized, } from '../canonical-history-materializer.js';
 import { assertPlannedLineage, scanCanonicalHistoryArtifacts, } from './canonical-history-scanner.js';
@@ -8,7 +9,7 @@ import { createSessionHistoryLocationResolver, } from '../session-history-locati
 import { ensureResolvedSessionHistoryPaths, resolveSessionHistoryPaths, utcSessionHistoryRelativeDir, } from '../session-history-paths.js';
 import { decodeHistoryMutationStagingManifest, historyMutationStagingPaths, toHistoryMutationStagingManifest, } from './session-history-staging.js';
 import { createSessionHistoryIoLane, createSessionHistoryCompactionBarrier, } from './session-history-coordination.js';
-import { planRetractTurn, planSettleTurnTail, retractTurnArtifactIndex, toTurnHistoryMutationCommit, validateRetractTurnInput, } from './session-turn-history-mutation.js';
+import { planRetractTurn, planSettleTurnTail, retractTurnArtifactIndex, toTurnHistoryMutationCommit, } from './session-turn-history-mutation.js';
 export { canonicalHistoryRecordEntry, } from './canonical-history-scanner.js';
 const SNAPSHOT_NAME = /^g(\d{12})--[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$/u;
 /** SessionSystem owns validated publication of the physical canonical-history bundle. */
@@ -255,17 +256,12 @@ async function stageUnpersisted(context, input) {
     let targetRevision;
     try {
         ensureResolvedSessionHistoryPaths(paths, target);
-        const revisions = sourcePaths
-            ? await publishUnpersistedSnapshots(sourcePaths, paths, input)
-            : new Map();
-        const active = remapFirstRecordParent(input.active, revisions);
-        assertPlannedLineage(input.generation, active, input.snapshots.map((snapshot) => ({
-            ...snapshot,
-            revision: revisions.get(snapshot.revision) ?? snapshot.revision,
-        })));
-        await writeFile(paths.messages, jsonl(active), { encoding: 'utf8', mode: 0o600 });
+        if (sourcePaths)
+            await copySnapshotFiles(sourcePaths, paths, input.snapshots);
+        assertPlannedLineage(input.generation, input.active, input.snapshots);
+        await writeFile(paths.messages, jsonl(input.active), { encoding: 'utf8', mode: 0o600 });
         await validatePublished(paths, target.sessionId, input.generation, true);
-        targetRevision = canonicalActiveHistoryRevision(active);
+        targetRevision = canonicalActiveHistoryRevision(input.active);
     }
     catch (error) {
         await cleanup(paths);
@@ -406,10 +402,7 @@ async function publishFork(context, sourcePaths, paths, input) {
         canonicalActiveHistoryRevision(existing) !== expectedRevision) {
         throw new Error('Fork target canonical history already contains a different revision');
     }
-    await mkdir(paths.snapshots, { recursive: true, mode: 0o700 });
-    for (const snapshot of input.snapshots) {
-        await copyCanonicalHistorySnapshotFile(join(sourcePaths.snapshots, snapshot.fileName), join(paths.snapshots, snapshot.fileName), snapshot.revision);
-    }
+    await copySnapshotFiles(sourcePaths, paths, input.snapshots);
     if (initializedEmptyTarget && input.active.length > 0) {
         await context.files.replaceActive(paths.messages, input.active);
     }
@@ -545,67 +538,14 @@ async function writeStagedActive(files, path, active) {
     }
 }
 /**
- * Copies each snapshot into a new Session in generation order, or rewrites its records when the
- * caller rewrites messages. Returns the old-to-new revision of every rewritten snapshot.
+ * Copies every planned snapshot into a new Session, byte for byte. A copy keeps its revision, so
+ * the snapshots are independent of each other and need no ordering.
  */
-async function publishUnpersistedSnapshots(sourcePaths, paths, input) {
-    const revisions = new Map();
-    const rewriteMessage = input.source.rewriteMessage;
+async function copySnapshotFiles(sourcePaths, paths, snapshots) {
     await mkdir(paths.snapshots, { recursive: true, mode: 0o700 });
-    const ordered = [...input.snapshots].sort((left, right) => left.generation - right.generation);
-    for (const snapshot of ordered) {
-        const sourcePath = join(sourcePaths.snapshots, snapshot.fileName);
-        const targetPath = join(paths.snapshots, snapshot.fileName);
-        if (!rewriteMessage) {
-            await copyCanonicalHistorySnapshotFile(sourcePath, targetPath, snapshot.revision);
-            continue;
-        }
-        const revision = await rewriteCanonicalHistorySnapshotFile({ path: sourcePath, revision: snapshot.revision }, targetPath, (record, index) => {
-            const rewritten = { ...record, message: rewriteMessage(record.message) };
-            return index === 0 ? remapParentRevision(rewritten, revisions) : rewritten;
-        });
-        revisions.set(snapshot.revision, revision);
+    for (const snapshot of snapshots) {
+        await copyCanonicalHistorySnapshotFile(join(sourcePaths.snapshots, snapshot.fileName), join(paths.snapshots, snapshot.fileName), snapshot.revision);
     }
-    return revisions;
-}
-function remapFirstRecordParent(records, revisions) {
-    const [first, ...rest] = records;
-    return first && revisions.size > 0 ? [remapParentRevision(first, revisions), ...rest] : records;
-}
-/** Points a generation marker at the rewritten revision of its parent snapshot. */
-function remapParentRevision(record, revisions) {
-    let copied = record;
-    const artifact = record.history_artifact;
-    if (artifact) {
-        const parent = artifact.parentSnapshot;
-        copied = {
-            ...copied,
-            history_artifact: {
-                ...artifact,
-                parentSnapshot: { ...parent, revision: revisions.get(parent.revision) ?? parent.revision },
-            },
-        };
-    }
-    const marker = record.message.archonCompaction;
-    if (isRecord(marker) && isRecord(marker.parentSnapshot)) {
-        const parent = marker.parentSnapshot;
-        if (typeof parent.revision === 'string') {
-            copied = {
-                ...copied,
-                message: {
-                    ...copied.message,
-                    archonCompaction: {
-                        ...marker,
-                        parentSnapshot: {
-                            ...parent,
-                            revision: revisions.get(parent.revision) ?? parent.revision,
-                        },
-                    },
-                },
-            };
-        }
-    }
-    return copied;
 }
 async function snapshotReader(context, sessionId) {
     const session = await requireSession(context.options, sessionId);

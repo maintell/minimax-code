@@ -1,12 +1,17 @@
 import { MINIMAX_FIRST_RUN_DEFAULT_MODEL_ID, MINIMAX_MODELS } from './minimax-model-catalog.js';
 import { QUOTA_AUTO_RESUME_DEFAULTS, parseQuotaAutoResumeConfig, } from './quota-auto-resume-config.js';
+import { parseMergeRequestsConfig } from './merge-requests-config.js';
 import fs from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 import { configFileSignature } from './config-file-signature.js';
-import { parseNotificationsConfig, parsePluginsConfig, parseStartupRecoveryFault, } from './config-section-parsers.js';
+import { createSectionFallback } from './config-section-fallback.js';
+import { parseContextManagementConfig } from './context-management-config.js';
+import { fileSha256, reportConfigIssues, readConfigFileForResolve, holdsOnlyDefaults, readConfigTextWithSha256, snapshotConfigFile, textSha256, trackConfigFileLifecycle, withWholeFileFallback, } from './config-file-state.js';
+import { parseNotificationsConfig, parsePluginsConfig, readableForbiddenPlugins, parseStartupRecoveryFault, } from './config-section-parsers.js';
 import { restrictConfigFileSync, writePrivateConfigFileSync } from './private-config-file.js';
 import { parseConfigText, serializeConfigPreservingComments, } from './comment-preserving-config-write.js';
 import { resolveRunawayGuardConfig } from './runaway-guard-config.js';
-import { MEMORY_V2_DEFAULTS, parseMemoryConfig, resolveMemoryDefaults, } from './memory-config.js';
+import { freshInstallMemoryConfig, MEMORY_V2_DEFAULTS, migrateLegacyMemoryOffToV2, parseMemoryConfig, } from './memory-config.js';
 import path from 'node:path';
 import os from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -18,10 +23,12 @@ import { parseExplicitPtc } from './ptc-default-config.js';
 import { parseReviewConfig } from './review-config.js';
 import { parseBunnyConfig } from './bunny-local-config.js';
 import { parseDiagnosticsConfig } from './diagnostics-config.js';
+import { parseWorktreeConfig } from './worktree-config.js';
 import { parseOpenCodeAdapterConfig } from './opencode-config.js';
 import { parseExplicitEnabled } from './prompt-suggestion-config.js';
 import { ASR_DEFAULTS, parseAsrConfig } from './asr.js';
 import { parsePermissionConfig } from './permission-config.js';
+import { parseSkillEvolveConfig, SKILL_EVOLVE_CONFIG_DEFAULTS, } from './skill-evolve-config.js';
 import { DEFAULT_SKILLS_CONFIG, parseSkillsConfig } from './skills-config.js';
 import { DEFAULT_AGENT_RUNTIME_FRAMEWORK, parseAgentRuntimeConfig, } from './agent-runtime-config.js';
 import { resolveDataDir } from './data-dir.js';
@@ -29,7 +36,7 @@ import { parseAgentsConfig } from './agent-capabilities.js';
 import { ASK_USER_CONFIG_DEFAULTS, parseAskUserConfig, } from './ask-user-config.js';
 import { DATA_CONTRIBUTION_CONFIG_DEFAULTS, parseDataContributionConfig, } from './data-contribution-config.js';
 import { GOAL_CONFIG_DEFAULTS, parseGoalConfig } from './goal-config.js';
-import { parseDefaultAdvisorConfig } from './advisor-config.js';
+import { parseAdvisorConfigFields } from './advisor-config.js';
 import { parsePluginRecommendationConfig } from './plugin-recommendation-config.js';
 import { TOOL_RESULT_COMPACTION_DEFAULTS, parseToolResultCompactionConfig, } from './tool-result-compaction-config.js';
 import { parseMcpToolSearchConfig } from './mcp-tool-search-config.js';
@@ -37,6 +44,8 @@ import { REQUEST_MEDIA_DEFAULTS, parseRequestMediaConfig, } from './request-medi
 import { BROWSER_CONFIG_DEFAULTS, parseBrowserConfig, } from './browser-config.js';
 import { parseSandboxConfig, SANDBOX_CONFIG_DEFAULTS, } from './sandbox-config.js';
 import { parseSubagentConfig, SUBAGENT_CONFIG_DEFAULTS, } from './subagent-config.js';
+import { betaResolutionContextFor } from './beta-resolution-context.js';
+export { betaResolutionContextFor, currentBetaResolutionContext, productionBetaResolutionContext, } from './beta-resolution-context.js';
 export { MEMORY_V2_DEFAULTS } from './memory-config.js';
 function isLegacyRuntimeEnvAllowed() {
     return process.env.__MAVIS_ALLOW_LEGACY_RUNTIME_ENV === '1';
@@ -172,8 +181,8 @@ export const BETA_FEATURE_DEFS = {
     filePanelBrowser: { defaultVisibility: 'online', configurableVisibility: 'online' },
     filePanelBrowserMultiTab: { defaultVisibility: 'online', configurableVisibility: 'online' },
     browserUseTooling: { defaultVisibility: 'online', configurableVisibility: 'online' },
-    browserUseAutoOpenPanel: { defaultVisibility: 'online', configurableVisibility: 'online' },
     browserAgentCursor: { defaultVisibility: 'online', configurableVisibility: 'online' },
+    browserReadV2: { defaultVisibility: 'none', configurableVisibility: 'online' },
     desktopPlanMode: { defaultVisibility: 'online', configurableVisibility: 'online' },
     desktopPlanModeAgentEntry: { defaultVisibility: 'none', configurableVisibility: 'online' },
     // On by default everywhere except the public production build: dev/test/staging through the
@@ -212,7 +221,9 @@ export const BETA_FEATURE_DEFS = {
     codexOAuth: { defaultVisibility: 'online', configurableVisibility: 'online' },
     pluginMarketplaces: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
     modelAccess: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
-    advisor: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
+    advisor: { defaultVisibility: 'online', configurableVisibility: 'online' },
+    reviewStatus: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
+    inlineActions: { defaultVisibility: 'internal', configurableVisibility: 'internal' },
 };
 assertBetaFeatureDefinitions(BETA_FEATURE_DEFS);
 function getBetaFeatureChannel(context) {
@@ -234,7 +245,7 @@ function isDefaultEnabledForBuildEnvironment(def, context) {
     const buildEnv = context.defaultBuildEnvironment ?? context.buildEnv ?? getBetaDefaultBuildEnvironment();
     return def.defaultBuildEnvironments?.includes(buildEnv) === true;
 }
-function getBetaDefaultBuildEnvironment() {
+export function getBetaDefaultBuildEnvironment() {
     const electronBuildEnv = isElectronProcess() ? process.env.NEXT_PUBLIC_BUILD_ENV : undefined;
     return isValidRuntimeBuildEnv(electronBuildEnv) ? electronBuildEnv : getRuntimeBuildEnv();
 }
@@ -277,7 +288,7 @@ export function isBetaFeatureProdReady(feature) {
 export function isInternalBuild(env = process.env) {
     return env.__MAVIS_BUILD_INTERNAL === 'true';
 }
-function isInsideBuild(env = process.env) {
+export function isInsideBuild(env = process.env) {
     return env.__MAVIS_BUILD_INSIDE === 'true';
 }
 export { DATA_CONTRIBUTION_CONFIG_DEFAULTS, readDataContributionEnabled, } from './data-contribution-config.js';
@@ -607,18 +618,43 @@ function syncManagedPresetBaseUrl(configPath) {
     const presetBaseURL = PRESET_BASE_URLS[getRuntimePresetKey()];
     if (currentBaseURL === presetBaseURL || !isManagedPresetBaseUrl(currentBaseURL))
         return;
-    const originalContent = fs.readFileSync(configPath);
-    options.baseURL = presetBaseURL;
+    rewriteConfigOnDisk(configPath, (document) => {
+        const target = document.provider?.minimax?.options;
+        if (!target || target.baseURL === presetBaseURL)
+            return false;
+        target.baseURL = presetBaseURL;
+        return true;
+    }, 'managed preset baseURL sync', 'using runtime provider settings');
+}
+/**
+ * Applies an optional on-disk migration to config.yaml, keeping comments and
+ * formatting. `mutate` edits the parsed document and reports whether it
+ * changed anything; nothing is written otherwise.
+ */
+function rewriteConfigOnDisk(configPath, mutate, label, fallbackNote = 'using the current settings') {
+    if (!fs.existsSync(configPath))
+        return;
+    // `originalContent` is the byte-level snapshot the integrity check below
+    // compares against, so the document has to be serialized from those same
+    // bytes: read the text once and diff against its parse.
+    let originalContent;
     try {
-        // `originalContent` is the byte-level snapshot the integrity check below
-        // compares against, so the document has to be serialized from those same
-        // bytes: read the text once and diff against its parse.
-        const originalText = originalContent.toString('utf-8');
-        writePrivateConfigFileSync(configPath, serializeConfigPreservingComments(originalText, parseConfigText(originalText), raw));
+        originalContent = fs.readFileSync(configPath);
+    }
+    catch {
+        // An unreadable config falls back to defaults on read; never rewrite it.
+        return;
+    }
+    const originalText = originalContent.toString('utf-8');
+    const document = parseConfigText(originalText);
+    if (!mutate(document))
+        return;
+    try {
+        writePrivateConfigFileSync(configPath, serializeConfigPreservingComments(originalText, parseConfigText(originalText), document));
     }
     catch (error) {
-        // This on-disk sync is optional, but a failure after truncation is not safe
-        // to hide. Only continue when the original document is still intact.
+        // These on-disk migrations are optional, but a failure after truncation is
+        // not safe to hide. Only continue when the original document is still intact.
         let unchanged = false;
         try {
             unchanged = fs.readFileSync(configPath).equals(originalContent);
@@ -629,7 +665,7 @@ function syncManagedPresetBaseUrl(configPath) {
         if (!unchanged)
             throw error;
         // Do not include the error message: config errors may contain credentials.
-        console.warn('[config] managed preset baseURL sync skipped; config file unchanged, using runtime provider settings');
+        console.warn(`[config] ${label} skipped; config file unchanged, ${fallbackNote}`);
     }
 }
 function buildPresetEntry(key) {
@@ -673,37 +709,21 @@ const DEFAULTS = {
         resolveBetaFeature(key, undefined, { buildEnv: 'dev' }),
     ])),
     agents: { default: {} },
+    // 记忆配置的唯一缺省值：所有渠道默认使用 V2，生成与使用开启。只填补缺失字段：配置里写了版本或开关的，
+    // 按所写的值解析，设置页关闭后不会被缺省值重新打开；配置没有显式选择版本（`explicitMemoryVersion`）时取这里的版本。
+    // 新安装与升级前已关闭旧版记忆的用户由 ensureConfigFile 显式写入关闭。
     memory: {
         // 已有配置缺少此字段时保留历史行为；新安装由 ensureConfigFile 显式关闭。
         enabled: true,
+        v2_enabled: true,
         proactive: false,
         dailyDigest: {
             enabled: false,
         },
-        v2: { ...MEMORY_V2_DEFAULTS },
+        v2: { ...MEMORY_V2_DEFAULTS, writeEnabled: true, recallEnabled: true },
     },
     subagent: { ...SUBAGENT_CONFIG_DEFAULTS },
-    skillEvolve: {
-        enabled: true,
-        inSession: {
-            N: 20,
-            minIntervalSeconds: 30,
-            maxPendingPerSession: 1,
-        },
-        signalCooldownHours: 24,
-        minConfidence: 0.7,
-        excludeAgents: ['skill-editor'],
-        disableModelPrefixes: ['MiniMax-M2'],
-        builtinMrEnabled: false,
-        sourceRepo: undefined,
-        proposal: {
-            enabled: false,
-            eligibleAgents: ['mavis'],
-            minMessageCount: 40,
-            skipPassiveSessionEnd: true,
-        },
-        lifecycle: { staleThresholdDays: 15, archiveThresholdDays: 30 }, // tightened from legacy 30d/90d
-    },
+    skillEvolve: SKILL_EVOLVE_CONFIG_DEFAULTS,
     sessionRotate: {
         enabled: true,
         activeSessionLookbackHours: 12,
@@ -725,6 +745,8 @@ const DEFAULTS = {
     // Unset: the effective default is resolved with the remote policy.
     },
     quotaAutoResume: QUOTA_AUTO_RESUME_DEFAULTS,
+    mergeRequests: parseMergeRequestsConfig({}),
+    productionParity: false,
     nextStepBox: {},
     plugins: parsePluginsConfig(undefined),
     pluginRecommendation: parsePluginRecommendationConfig({}),
@@ -763,7 +785,7 @@ const DEFAULTS = {
         defaultFramework: DEFAULT_AGENT_RUNTIME_FRAMEWORK,
     },
     logRetentionDays: 3,
-    worktreeRefreshBeforeCreate: true,
+    ...parseWorktreeConfig({}),
     review: {
         mode: 'subagent',
         turnDiffCard: 'concise',
@@ -772,7 +794,9 @@ const DEFAULTS = {
     goal: structuredClone(GOAL_CONFIG_DEFAULTS),
     sandbox: structuredClone(SANDBOX_CONFIG_DEFAULTS),
     goalWarnings: [],
+    configIssues: [],
 };
+/** Creates or prepares config.yaml and reports what it wrote (see ConfigFileWrite). */
 function ensureConfigFile() {
     const configPath = getConfigPath();
     const dir = path.dirname(configPath);
@@ -780,8 +804,19 @@ function ensureConfigFile() {
         fs.mkdirSync(dir, { recursive: true });
     }
     if (fs.existsSync(configPath)) {
+        const fromSha256 = fileSha256(configPath);
         prepareConfigFileForRead(configPath);
-        return;
+        // 只迁移本 profile 的 config.yaml；外部传入的配置文件按同一规则解析，不改写文件。
+        rewriteConfigOnDisk(configPath, migrateLegacyMemoryOffToV2, 'legacy memory switch migration');
+        const { text, sha256: toSha256 } = readConfigTextWithSha256(configPath);
+        // Untouched defaults written before lifecycle tracking existed are not the user's.
+        const matchesDefaults = text !== undefined &&
+            isManagedRuntime() &&
+            holdsOnlyDefaults(parseConfigText(text), defaultConfigDocuments());
+        return {
+            ...(toSha256 !== fromSha256 ? { rewrite: { fromSha256, toSha256 } } : {}),
+            ...(matchesDefaults ? { matchesDefaultsSha256: toSha256 } : {}),
+        };
     }
     // In non-managed runtime (pnpm dev / npm package), the UI onboarding flow
     // owns config.yaml generation — it walks the user through getting an API
@@ -799,25 +834,38 @@ function ensureConfigFile() {
         if (configPath !== defaultConfigPath && fs.existsSync(defaultConfigPath)) {
             restrictConfigFileSync(defaultConfigPath);
             writePrivateConfigFileSync(configPath, fs.readFileSync(defaultConfigPath), true);
+            return { copied: true };
         }
-        return;
+        return {};
     }
-    const preset = DEFAULT_MODEL_PRESETS[getRuntimePresetKey()];
-    const content = yaml.dump({
+    const defaults = yaml.dump(defaultConfigDocument());
+    writePrivateConfigFileSync(configPath, defaults, true);
+    return { generatedSha256: textSha256(defaults) };
+}
+/** Defaults of every build and region, with and without the preset provider, as parsed back. */
+let cachedDefaultConfigDocuments;
+function defaultConfigDocuments() {
+    // Fixed for the process: every preset, both provider modes.
+    cachedDefaultConfigDocuments ??= Object.keys(DEFAULT_MODEL_PRESETS).flatMap((key) => [true, false].map((withProvider) => parseConfigText(yaml.dump(defaultConfigDocument(key, withProvider)))));
+    return cachedDefaultConfigDocuments;
+}
+/** The config.yaml a managed runtime writes on first install. */
+function defaultConfigDocument(presetKey = getRuntimePresetKey(), withProvider = managedPresetBaseUrlSyncEnabled) {
+    const preset = DEFAULT_MODEL_PRESETS[presetKey];
+    return {
         logLevel: DEFAULTS.logLevel,
-        provider: managedPresetBaseUrlSyncEnabled ? preset.provider : undefined,
+        provider: withProvider ? preset.provider : undefined,
         defaultModel: preset.defaultModel,
         // 首装即写出 "数据用于优化体验" 开关，让 Desktop / TUI 全新安装都有一份可见、
         // 可编辑的显式默认值(开启),而不是隐式依赖 `DEFAULTS`。只写 `enabled`——
         // `enabledSource` 是解析时生成的,落进文件只会变成一个没人读的死字段。
         dataContribution: { enabled: DATA_CONTRIBUTION_CONFIG_DEFAULTS.enabled },
-        // 仅新安装写入，避免改变已有用户缺省开启的选择。
-        memory: { enabled: false },
+        // 仅新安装写入，避免改变已有用户缺省开启的选择；V2 的生成与使用同样默认关闭。
+        memory: freshInstallMemoryConfig(),
         // 首装写出可编辑的安全默认值；已有文件不补写、不覆盖用户选择。
         skipWindowsHardSafetyChecks: DEFAULTS.skipWindowsHardSafetyChecks,
         skipParentDeathGuard: DEFAULTS.skipParentDeathGuard,
-    });
-    writePrivateConfigFileSync(configPath, content, true);
+    };
 }
 function readConfigFile(configPath = getConfigPath()) {
     try {
@@ -862,17 +910,47 @@ export function getConfig() {
     if (_cached && signature === cachedConfigSignature)
         return _cached;
     _cached = null;
-    ensureConfigFile();
+    const before = snapshotConfigFile(getConfigPath());
+    const write = ensureConfigFile();
     // The signature is taken before the content (as Magpie's filememo stats before it reads): a
     // write by another runtime landing between the two pairs the old signature with whatever was
     // read, and the next call reads again. The other order could pair new content's signature
     // with old content and keep it until the file changed again.
     const readSignature = configFileSignature(getConfigPath());
-    _cached = resolveConfigFromRaw(readConfigFile(), getDataDir());
+    const file = readConfigFileForResolve(getConfigPath());
+    const fileIssues = [
+        ...trackConfigFileLifecycle(getConfigPath(), before, write, file),
+        ...file.issues,
+    ];
+    const resolved = withWholeFileFallback(resolveConfigFromRaw(file.raw, getDataDir()), file);
+    _cached =
+        fileIssues.length > 0
+            ? { ...resolved, configIssues: [...fileIssues, ...resolved.configIssues] }
+            : resolved;
     cachedConfigSignature = readSignature;
+    reportConfigIssues(_cached.configIssues);
     return _cached;
 }
 export function resolveConfigFromRaw(raw, dataDir) {
+    // A section parser that rejects its input must not take the whole config down:
+    // a single bad value would otherwise stop every runtime from starting, and a
+    // restart reads the same file again. The section falls back to its default and
+    // the problem is reported through `configIssues` instead.
+    const configIssues = [];
+    const section = createSectionFallback(raw, configIssues);
+    // Sections whose default would undo the user's intent: when invalid, a
+    // stricter value replaces the default (plugins: official only; skillEvolve: off)
+    // and the issue says so, which is what the notice copy goes by.
+    const failClosed = (name, parse, strict, fallback) => {
+        const start = configIssues.length;
+        const value = section(name, parse, fallback);
+        if (configIssues.length === start)
+            return value;
+        for (let index = start; index < configIssues.length; index += 1) {
+            configIssues[index] = { ...configIssues[index], failClosed: true };
+        }
+        return strict(value);
+    };
     const rawSSEErrorPush = raw.sseErrorPush;
     const sseErrorPush = rawSSEErrorPush != null &&
         typeof rawSSEErrorPush === 'object' &&
@@ -887,20 +965,29 @@ export function resolveConfigFromRaw(raw, dataDir) {
             devPort = gitInfo.uiPort;
         }
     }
-    const goalParsed = parseGoalConfig(raw.goal);
-    const managedProvider = applyRequiredProviderOverrides({
-        provider: raw.provider != null && typeof raw.provider === 'object' && !Array.isArray(raw.provider)
-            ? normalizeLegacyThinkingEfforts(raw.provider)
+    const goalParsed = section('goal', (source) => parseGoalConfig(source.goal));
+    const managedProvider = section(['provider', 'defaultModel'], (source) => applyRequiredProviderOverrides({
+        provider: source.provider != null &&
+            typeof source.provider === 'object' &&
+            !Array.isArray(source.provider)
+            ? normalizeLegacyThinkingEfforts(source.provider)
             : {},
-        defaultModel: typeof raw.defaultModel === 'string' ? raw.defaultModel : undefined,
-    }, REQUIRED_PROVIDER_OVERRIDE_DEPS);
-    const minimaxModelContextLimits = parseModelContextLimits(raw.minimaxModelContextLimits);
-    const { explicitPtc, ...beta } = parseBetaConfig(raw);
+        defaultModel: typeof source.defaultModel === 'string' ? source.defaultModel : undefined,
+    }, REQUIRED_PROVIDER_OVERRIDE_DEPS));
+    const managedContext = section('minimaxModelContextLimits', (source) => {
+        const limits = parseModelContextLimits(source.minimaxModelContextLimits);
+        return {
+            limits,
+            provider: applyManagedMinimaxContextLimits(managedProvider.provider, limits),
+        };
+    }, () => ({ limits: undefined, provider: managedProvider.provider }));
+    const minimaxModelContextLimits = managedContext.limits;
+    const { explicitPtc, ...beta } = section('beta', (source) => parseBetaConfig(source));
     return {
         logLevel: typeof raw.logLevel === 'string' ? raw.logLevel : DEFAULTS.logLevel,
         devPort,
         ...managedProvider,
-        provider: applyManagedMinimaxContextLimits(managedProvider.provider, minimaxModelContextLimits),
+        provider: managedContext.provider,
         defaultModelVariant: typeof raw.defaultModelVariant === 'string' ? raw.defaultModelVariant : undefined,
         defaultModelThinking: raw.defaultModelThinking &&
             typeof raw.defaultModelThinking === 'object' &&
@@ -912,10 +999,10 @@ export function resolveConfigFromRaw(raw, dataDir) {
             Number(raw.defaultModelContextWindow) <= 2_147_483_647
             ? Number(raw.defaultModelContextWindow)
             : undefined,
-        defaultAdvisor: parseDefaultAdvisorConfig(raw.defaultAdvisor),
-        minimax_api: parseMinimaxApiConfig(raw.minimax_api),
+        ...section(['advisor', 'defaultAdvisor'], (source) => parseAdvisorConfigFields(source)),
+        minimax_api: section('minimax_api', (source) => parseMinimaxApiConfig(source.minimax_api)),
         minimaxModelContextLimits,
-        custom_provider: parseCustomProvidersConfig(raw.custom_provider),
+        custom_provider: section('custom_provider', (source) => parseCustomProvidersConfig(source.custom_provider)),
         minimaxModelSource: typeof raw.minimaxModelSource === 'string' &&
             (raw.minimaxModelSource === 'token_plan' || raw.minimaxModelSource === 'minimax_api_key')
             ? raw.minimaxModelSource
@@ -948,13 +1035,13 @@ export function resolveConfigFromRaw(raw, dataDir) {
         defaultLightModel: typeof raw.defaultLightModel === 'string' ? raw.defaultLightModel : undefined,
         skipWindowsHardSafetyChecks: raw.skipWindowsHardSafetyChecks === true,
         skipParentDeathGuard: raw.skipParentDeathGuard === true,
-        diagnostics: parseDiagnosticsConfig(raw.diagnostics),
-        ...parseStartupRecoveryFault(raw.startupRecoveryFault),
+        diagnostics: section('diagnostics', (source) => parseDiagnosticsConfig(source.diagnostics)),
+        ...section('startupRecoveryFault', (source) => parseStartupRecoveryFault(source.startupRecoveryFault)),
         permissionMode: typeof raw.permissionMode === 'string' &&
             ['default', 'bypassPermissions', 'auto', 'off'].includes(raw.permissionMode)
             ? raw.permissionMode
             : DEFAULTS.permissionMode,
-        permission: parsePermissionConfig(raw),
+        permission: section('permission', (source) => parsePermissionConfig(source)),
         sseErrorPush: {
             history: typeof sseErrorPush?.history === 'boolean'
                 ? sseErrorPush.history
@@ -963,7 +1050,7 @@ export function resolveConfigFromRaw(raw, dataDir) {
                 ? sseErrorPush.stream
                 : DEFAULTS.sseErrorPush.stream,
         },
-        notifications: parseNotificationsConfig(raw.notifications),
+        notifications: section('notifications', (source) => parseNotificationsConfig(source.notifications)),
         dataDir,
         agentsDir: path.join(dataDir, 'agents'),
         sessionsDir: path.join(dataDir, 'sessions'),
@@ -977,43 +1064,52 @@ export function resolveConfigFromRaw(raw, dataDir) {
         subAgentsDir: path.join(dataDir, 'subagents'),
         beta,
         explicitPtc,
-        agents: parseAgentsConfig(raw.agents),
-        // 构建变体在模块加载后注入，默认值随配置解析计算。
-        memory: parseMemoryConfig(raw, resolveMemoryDefaults(DEFAULTS.memory, isInternalBuild() || isInsideBuild())),
-        subagent: parseSubagentConfig(raw.subagent),
-        skillEvolve: parseSkillEvolveConfig(raw, beta),
-        sessionRotate: parseSessionRotateConfig(raw),
-        agentStop: parseAgentStopDetectorConfig(raw),
-        asr: parseAsrConfig(raw),
-        skills: parseSkillsConfig(raw),
-        askUser: parseAskUserConfig(raw, DEFAULTS.askUser),
-        dataContribution: parseDataContributionConfig(raw, DEFAULTS.dataContribution),
-        sessionTitle: parseSessionTitleConfig(raw),
-        promptSuggestion: parseExplicitEnabled(raw.promptSuggestion),
-        quotaAutoResume: parseQuotaAutoResumeConfig(raw),
-        nextStepBox: parseExplicitEnabled(raw.nextStepBox),
-        bunny: parseBunnyConfig(raw),
-        plugins: parsePluginsConfig(raw.plugins),
-        pluginRecommendation: parsePluginRecommendationConfig(raw),
-        miniAppSuggestion: parseMiniAppSuggestionConfig(raw),
-        cli: parseCliConfig(raw),
-        browser: parseBrowserConfig(raw.browser),
-        tui: parseTuiConfig(raw),
-        opencode: parseOpenCodeAdapterConfig(raw, DEFAULTS.opencode),
-        contextManagement: parseContextManagementConfig(raw),
-        runawayGuard: resolveRunawayGuardConfig(raw.runawayGuard),
-        toolResultCompaction: parseToolResultCompactionConfig(raw.toolResultCompaction),
-        requestMedia: parseRequestMediaConfig(raw.requestMedia),
-        agentRuntime: parseAgentRuntimeConfig(raw.agentRuntime),
-        logRetentionDays: parseLogRetentionDays(raw),
-        contentReview: parseContentReviewConfig(raw),
-        mcpToolSearch: parseMcpToolSearchConfig(raw),
-        review: parseReviewConfig(raw.review, DEFAULTS.review),
-        worktreeRefreshBeforeCreate: raw.worktreeRefreshBeforeCreate !== false,
-        promptConfig: resolvePromptConfig(raw.promptConfig),
+        agents: section('agents', (source) => parseAgentsConfig(source.agents)),
+        memory: section('memory', (source) => parseMemoryConfig(source, DEFAULTS.memory)),
+        subagent: section('subagent', (source) => parseSubagentConfig(source.subagent)),
+        skillEvolve: failClosed('skillEvolve', (source) => parseSkillEvolveConfig(source, beta), 
+        // Sub-gates are derived from `enabled` when parsed: close them as well.
+        (value) => ({
+            ...structuredClone(value),
+            enabled: false,
+            builtinMrEnabled: false,
+            proposal: { ...structuredClone(value.proposal), enabled: false },
+        }), () => structuredClone(DEFAULTS.skillEvolve)),
+        sessionRotate: section('sessionRotate', (source) => parseSessionRotateConfig(source)),
+        agentStop: section('agentStop', (source) => parseAgentStopDetectorConfig(source)),
+        asr: section('asr', (source) => parseAsrConfig(source)),
+        skills: section('skills', (source) => parseSkillsConfig(source)),
+        askUser: section('askUser', (source) => parseAskUserConfig(source, DEFAULTS.askUser)),
+        dataContribution: section('dataContribution', (source) => parseDataContributionConfig(source, DEFAULTS.dataContribution)),
+        sessionTitle: section('sessionTitle', (source) => parseSessionTitleConfig(source)),
+        promptSuggestion: section('promptSuggestion', (source) => parseExplicitEnabled(source.promptSuggestion)),
+        quotaAutoResume: section('quotaAutoResume', (source) => parseQuotaAutoResumeConfig(source)),
+        mergeRequests: section('mergeRequests', (source) => parseMergeRequestsConfig(source)),
+        productionParity: raw.productionParity === true,
+        nextStepBox: section('nextStepBox', (source) => parseExplicitEnabled(source.nextStepBox)),
+        bunny: section('bunny', (source) => parseBunnyConfig(source)),
+        plugins: failClosed('plugins', (source) => parsePluginsConfig(source.plugins), () => ({ forbidden: readableForbiddenPlugins(raw.plugins), onlyOfficial: true })),
+        pluginRecommendation: section('pluginRecommendation', (source) => parsePluginRecommendationConfig(source)),
+        miniAppSuggestion: section('miniAppSuggestion', (source) => parseMiniAppSuggestionConfig(source)),
+        cli: section('cli', (source) => parseCliConfig(source)),
+        browser: section('browser', (source) => parseBrowserConfig(source.browser)),
+        tui: section('tui', (source) => parseTuiConfig(source)),
+        opencode: section('opencode', (source) => parseOpenCodeAdapterConfig(source, DEFAULTS.opencode)),
+        contextManagement: section('contextManagement', (source) => parseContextManagementConfig(source, DEFAULTS.contextManagement)),
+        runawayGuard: section('runawayGuard', (source) => resolveRunawayGuardConfig(source.runawayGuard)),
+        toolResultCompaction: section('toolResultCompaction', (source) => parseToolResultCompactionConfig(source.toolResultCompaction)),
+        requestMedia: section('requestMedia', (source) => parseRequestMediaConfig(source.requestMedia)),
+        agentRuntime: section('agentRuntime', (source) => parseAgentRuntimeConfig(source.agentRuntime)),
+        logRetentionDays: section('logRetentionDays', (source) => parseLogRetentionDays(source)),
+        contentReview: section('contentReview', (source) => parseContentReviewConfig(source)),
+        mcpToolSearch: section('mcpToolSearch', (source) => parseMcpToolSearchConfig(source)),
+        review: section('review', (source) => parseReviewConfig(source.review, structuredClone(DEFAULTS.review))),
+        ...section(['worktreeAutoCleanupEnabled', 'worktreeKeepCount', 'worktreeRefreshBeforeCreate'], (source) => parseWorktreeConfig(source)),
+        promptConfig: section('promptConfig', (source) => resolvePromptConfig(source.promptConfig)),
         goal: goalParsed.config,
         goalWarnings: goalParsed.warnings,
-        sandbox: parseSandboxConfig(raw.sandbox),
+        sandbox: section('sandbox', (source) => parseSandboxConfig(source.sandbox)),
+        configIssues,
     };
 }
 // ── Beta features config parsing ────────────────────────────────
@@ -1021,180 +1117,13 @@ function parseBetaConfig(raw) {
     const obj = raw.beta != null && typeof raw.beta === 'object' && !Array.isArray(raw.beta)
         ? raw.beta
         : {};
-    const context = currentBetaResolutionContext();
+    const context = betaResolutionContextFor(raw);
     const result = {};
     for (const key of Object.keys(BETA_FEATURE_DEFS)) {
         result[key] = resolveBetaFeature(key, obj[key], context);
     }
     return Object.assign(result, parseExplicitPtc(raw));
 }
-/**
- * The build facts `parseBetaConfig` resolves every flag with. Exported so a caller holding a
- * raw (unparsed) config can resolve one flag exactly as `getConfig()` would for this process,
- * instead of rebuilding the context and drifting from it.
- */
-export function currentBetaResolutionContext() {
-    return {
-        buildEnv: getRuntimeBuildEnv(),
-        defaultBuildEnvironment: getBetaDefaultBuildEnvironment(),
-        internalBuild: isInternalBuild(),
-        insideBuild: isInsideBuild(),
-        mcodeToolsDevMode: process.env.MAVIS_DEV_MCODE_TOOLS_MODE === 'published' ? 'published' : undefined,
-    };
-}
-// ── Skill Evolve config parsing ─────────────────────────────────
-/**
- * Collect all model IDs from the provider config.
- * Returns an empty array when no models are configured.
- */
-function collectModelIds(raw) {
-    const providerRaw = raw.provider;
-    if (providerRaw == null || typeof providerRaw !== 'object' || Array.isArray(providerRaw)) {
-        return [];
-    }
-    const ids = [];
-    for (const prov of Object.values(providerRaw)) {
-        if (prov == null || typeof prov !== 'object' || Array.isArray(prov))
-            continue;
-        const { models } = prov;
-        if (models == null || typeof models !== 'object' || Array.isArray(models))
-            continue;
-        ids.push(...Object.keys(models));
-    }
-    return ids;
-}
-/**
- * Auto-derive the `skillEvolve.enabled` flag from the configured model list.
- *
- * When **every** configured model ID starts with one of the
- * `disableModelPrefixes` (case-insensitive), skill-evolve has no capable
- * model to work with, so it is disabled automatically.
- * If at least one model does NOT match, the feature is enabled.
- *
- * Edge cases: no providers / no models configured → `false`
- * (no capable model means the feature cannot operate).
- */
-function deriveSkillEvolveEnabled(raw, disableModelPrefixes) {
-    if (disableModelPrefixes.length === 0)
-        return true;
-    const modelIds = collectModelIds(raw);
-    if (modelIds.length === 0)
-        return false;
-    const lowerPrefixes = disableModelPrefixes.map((p) => p.toLowerCase());
-    return !modelIds.every((id) => lowerPrefixes.some((p) => id.toLowerCase().startsWith(p)));
-}
-function parsePositiveDays(value, fallback) {
-    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
-}
-function parseSkillEvolveConfig(raw, betaConfig) {
-    const defaults = DEFAULTS.skillEvolve;
-    const se = raw.skillEvolve;
-    const hasSection = se != null && typeof se === 'object' && !Array.isArray(se);
-    const obj = hasSection ? se : {};
-    const inSessionRaw = obj.inSession;
-    let { inSession } = defaults;
-    if (inSessionRaw != null && typeof inSessionRaw === 'object' && !Array.isArray(inSessionRaw)) {
-        const ins = inSessionRaw;
-        inSession = {
-            N: typeof ins.N === 'number' && ins.N > 0 ? ins.N : defaults.inSession.N,
-            minIntervalSeconds: typeof ins.minIntervalSeconds === 'number' && ins.minIntervalSeconds >= 0
-                ? ins.minIntervalSeconds
-                : defaults.inSession.minIntervalSeconds,
-            maxPendingPerSession: typeof ins.maxPendingPerSession === 'number' && ins.maxPendingPerSession >= 1
-                ? ins.maxPendingPerSession
-                : defaults.inSession.maxPendingPerSession,
-        };
-    }
-    const excludeRaw = obj.excludeAgents;
-    const excludeAgents = Array.isArray(excludeRaw) && excludeRaw.every((e) => typeof e === 'string')
-        ? excludeRaw
-        : defaults.excludeAgents;
-    const disableModelPrefixes = Array.isArray(obj.disableModelPrefixes) &&
-        obj.disableModelPrefixes.every((e) => typeof e === 'string')
-        ? obj.disableModelPrefixes
-        : defaults.disableModelPrefixes;
-    // `enabled` — beta gate wins first; then explicit config; then auto-derive from model list.
-    const enabled = !betaConfig.skillEvolve
-        ? false
-        : typeof obj.enabled === 'boolean'
-            ? obj.enabled
-            : deriveSkillEvolveEnabled(raw, disableModelPrefixes);
-    // `builtinMrEnabled` — beta gate wins first; then explicit config; then default.
-    // Implicitly false when the parent `enabled` is false (no point evolving built-ins
-    // when the pipeline as a whole is off).
-    const builtinMrEnabled = !enabled
-        ? false
-        : !betaConfig.skillEvolveBuiltinMr
-            ? false
-            : typeof obj.builtinMrEnabled === 'boolean'
-                ? obj.builtinMrEnabled
-                : defaults.builtinMrEnabled;
-    const sourceRepoRaw = obj.sourceRepo;
-    const sourceRepo = typeof sourceRepoRaw === 'string' && sourceRepoRaw.trim().length > 0
-        ? sourceRepoRaw.trim()
-        : defaults.sourceRepo;
-    // v3: `proposal` — beta gate + parent gate must both be true; otherwise
-    // resolved sub-config still parses but `enabled` is forced false. Other
-    // fields (eligibleAgents, minMessageCount, skipPassiveSessionEnd) are
-    // honored even when the gate is off so operators can pre-stage config.
-    const proposalRaw = obj.proposal;
-    const proposalDefaults = defaults.proposal;
-    const proposalObj = proposalRaw != null && typeof proposalRaw === 'object' && !Array.isArray(proposalRaw)
-        ? proposalRaw
-        : {};
-    const proposalEligibleAgents = Array.isArray(proposalObj.eligibleAgents) &&
-        proposalObj.eligibleAgents.every((e) => typeof e === 'string')
-        ? proposalObj.eligibleAgents
-        : proposalDefaults.eligibleAgents;
-    const proposalMinMessageCount = typeof proposalObj.minMessageCount === 'number' && proposalObj.minMessageCount >= 1
-        ? Math.floor(proposalObj.minMessageCount)
-        : proposalDefaults.minMessageCount;
-    const proposalSkipPassiveSessionEnd = typeof proposalObj.skipPassiveSessionEnd === 'boolean'
-        ? proposalObj.skipPassiveSessionEnd
-        : proposalDefaults.skipPassiveSessionEnd;
-    const proposalEnabledExplicit = typeof proposalObj.enabled === 'boolean' ? proposalObj.enabled : null;
-    const proposalEnabled = !enabled
-        ? false
-        : !betaConfig.skillProposal
-            ? false
-            : (proposalEnabledExplicit ?? true);
-    // `lifecycle` — strict invariant stale < archive (fail-fast at boot).
-    const lcRaw = obj.lifecycle;
-    const lc = lcRaw && typeof lcRaw === 'object' && !Array.isArray(lcRaw)
-        ? lcRaw
-        : {};
-    const staleThresholdDays = parsePositiveDays(lc.staleThresholdDays, defaults.lifecycle.staleThresholdDays); // prettier-ignore
-    const archiveThresholdDays = parsePositiveDays(lc.archiveThresholdDays, defaults.lifecycle.archiveThresholdDays); // prettier-ignore
-    if (!(staleThresholdDays < archiveThresholdDays)) {
-        throw new Error(`Invalid skillEvolve.lifecycle config: staleThresholdDays (${staleThresholdDays}) must be strictly less than archiveThresholdDays (${archiveThresholdDays}).`);
-    }
-    return {
-        enabled,
-        inSession,
-        signalCooldownHours: typeof obj.signalCooldownHours === 'number' && obj.signalCooldownHours > 0
-            ? obj.signalCooldownHours
-            : defaults.signalCooldownHours,
-        minConfidence: typeof obj.minConfidence === 'number' && obj.minConfidence >= 0 && obj.minConfidence <= 1
-            ? obj.minConfidence
-            : defaults.minConfidence,
-        scannerModel: typeof obj.scannerModel === 'string' ? obj.scannerModel : undefined,
-        excludeAgents,
-        disableModelPrefixes,
-        builtinMrEnabled,
-        sourceRepo,
-        proposal: {
-            enabled: proposalEnabled,
-            eligibleAgents: proposalEligibleAgents,
-            minMessageCount: proposalMinMessageCount,
-            skipPassiveSessionEnd: proposalSkipPassiveSessionEnd,
-        },
-        lifecycle: { staleThresholdDays, archiveThresholdDays },
-    };
-}
-/**
- * v3 helper: `isProposalEligibleAgent` lives in `./skill-evolve-config.ts`
- * — re-exported above with the rest of the SkillEvolve types.
- */
 // ── Session Rotate config parsing ───────────────────────────────
 function parseSessionRotateConfig(raw) {
     const defaults = DEFAULTS.sessionRotate;
@@ -1288,34 +1217,6 @@ function parseCliConfig(raw) {
         spawn: {
             enabled: typeof spawnObj.enabled === 'boolean' ? spawnObj.enabled : defaults.spawn.enabled,
         },
-    };
-}
-// ── Context Management config parsing ───────────────────────────
-function parseContextManagementConfig(raw) {
-    const defaults = DEFAULTS.contextManagement;
-    const rawCm = raw.contextManagement;
-    if (rawCm == null || typeof rawCm !== 'object' || Array.isArray(rawCm)) {
-        return {
-            disableSystemReminderModels: [...defaults.disableSystemReminderModels],
-            cuMaxScreenshotsInContext: defaults.cuMaxScreenshotsInContext,
-        };
-    }
-    const obj = rawCm;
-    const rawList = obj.disableSystemReminderModels;
-    const disableSystemReminderModels = Array.isArray(rawList) && rawList.every((e) => typeof e === 'string' && e.length > 0)
-        ? rawList
-        : [...defaults.disableSystemReminderModels];
-    const rawCuMax = obj.cuMaxScreenshotsInContext;
-    const cuMaxScreenshotsInContext = typeof rawCuMax === 'number' && Number.isFinite(rawCuMax) && rawCuMax >= 0
-        ? Math.floor(rawCuMax)
-        : defaults.cuMaxScreenshotsInContext;
-    // Semantic validation (ratio vs. token count) lives with the trigger in
-    // @mavis/context-manager; keep numbers so the runtime can warn on bad ones.
-    const compactionTriggerAt = typeof obj.compactionTriggerAt === 'number' ? obj.compactionTriggerAt : undefined;
-    return {
-        disableSystemReminderModels,
-        cuMaxScreenshotsInContext,
-        ...(compactionTriggerAt === undefined ? {} : { compactionTriggerAt }),
     };
 }
 // ── Log Retention config parsing ────────────────────────────────

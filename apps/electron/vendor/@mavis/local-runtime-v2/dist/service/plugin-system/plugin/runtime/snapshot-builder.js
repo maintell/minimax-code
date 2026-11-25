@@ -1,8 +1,45 @@
 import path from 'node:path';
+import { normalizePluginName } from '@mavis/config';
 import { McpNameRegistry, configuredMcpNameKey, pluginMcpNameKey } from '@mavis/mcp';
 import { buildPluginSkillRuntimeName, LOCAL_PLUGIN_MARKETPLACE, OFFICIAL_PLUGIN_MARKETPLACE, pluginIdKey, samePluginId, } from '@mavis/shared';
 import { hostWithholdsMiniApp } from '../package/miniapp/engines.js';
 import { hasSupportedCapability } from '../package/package-readers.js';
+/** Plugin manifest names as config deny-lists match them: trimmed, NFKC, lowercased. */
+export function normalizedPluginNames(names) {
+    return new Set((names ?? []).map(normalizePluginName));
+}
+/** The startup policy a PluginSystem applies to every snapshot it builds. */
+export function snapshotBuilderPolicy(forbiddenPluginNames, options) {
+    return {
+        forbiddenPluginNames,
+        ...(options.onlyOfficialPlugins ? { onlyOfficialPlugins: true } : {}),
+        ...(options.miniAppHostVersion ? { hostVersion: options.miniAppHostVersion } : {}),
+    };
+}
+/**
+ * Registry identity a Plugin MCP server's runtime names are allocated under. A session preview
+ * stands in for the installed Plugin it replaces, in whatever format that one was installed, so it
+ * takes that install's names: in its session the preview's `jira` is `mcp__jira__…`, the names
+ * rules for the installed server are written against. Both never meet in one view, because the
+ * session overlay drops the Plugin a preview replaces; another session keeps the installed server
+ * under the same names. A preview replacing nothing takes the names its package gets once
+ * installed (extension candidates are read as `LOCAL_MINIMAX`).
+ */
+export function pluginMcpServerNameKey(entry) {
+    const source = entry.nameSource ?? (entry.source === 'LOCAL_PREVIEW' ? PREVIEW_NAME_SOURCE : entry.source);
+    return pluginMcpNameKey(source, entry.pluginName, entry.server.name);
+}
+/** The activation that publishes a Plugin MCP server; a `LOCAL_PREVIEW` package is a preview. */
+export function pluginMcpActivationOf(entry) {
+    return {
+        pluginId: entry.pluginName,
+        tier: entry.source === 'LOCAL_PREVIEW' ? 'preview' : 'installed',
+        source: entry.source,
+        artifactDigest: entry.packageContentDigest,
+    };
+}
+/** The source the previewed package has once installed. */
+const PREVIEW_NAME_SOURCE = 'LOCAL_MINIMAX';
 export class PluginSnapshotBuilder {
     names;
     options;
@@ -24,12 +61,12 @@ export class PluginSnapshotBuilder {
                 name,
             })),
             ...state.mcpServers.map((entry) => ({
-                key: pluginMcpNameKey(entry.source, entry.pluginName, entry.server.name),
+                key: pluginMcpServerNameKey(entry),
                 name: entry.server.name,
             })),
         ]);
         state.mcpServers = state.mcpServers.flatMap((entry) => {
-            const key = pluginMcpNameKey(entry.source, entry.pluginName, entry.server.name);
+            const key = pluginMcpServerNameKey(entry);
             const runtimeServerName = allocated.names.get(key);
             if (!runtimeServerName) {
                 state.diagnostics.push({
@@ -44,26 +81,8 @@ export class PluginSnapshotBuilder {
         const frozenSkills = freeze(state.skills.map((skill) => freeze(skill)));
         const turnCapabilities = freeze({
             revision: input.revision,
-            plugins: freeze(state.enabledPlugins.map((plugin) => freeze({
-                name: plugin.name,
-                ...(plugin.version ? { version: plugin.version } : {}),
-                source: turnPluginSource(plugin.source),
-                marketplace: plugin.id.marketplace,
-                hostCapabilities: plugin.hostCapabilities,
-                ...(plugin.iconPath ? { iconUrl: localIconUrl(plugin.iconPath) } : {}),
-                ...(plugin.darkIconPath ? { darkIconUrl: localIconUrl(plugin.darkIconPath) } : {}),
-                ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
-                ...(plugin.iconPath ? { iconPath: plugin.iconPath } : {}),
-                appProviders: plugin.appProviders,
-            }))),
-            skills: freeze(frozenSkills.map((skill) => freeze({
-                pluginName: state.skillOwners.get(skill) ?? '',
-                name: buildPluginSkillRuntimeName(state.skillOwners.get(skill) ?? '', skill.name),
-                description: skill.description,
-                content: skill.content,
-                location: skill.skillFilePath,
-                sourceKind: 'desktop-plugin',
-            }))),
+            plugins: freeze(state.enabledPlugins.map(turnPlugin)),
+            skills: freeze(frozenSkills.map((skill) => turnSkill(state.skillOwners.get(skill) ?? '', skill))),
             // P4B owns live Plugin MCP tool construction. P1A freezes the per-turn
             // slot now so later tools use the same snapshot as prompt and skill reads.
             runtimeTools: freeze([]),
@@ -79,10 +98,134 @@ export class PluginSnapshotBuilder {
             enabledPlugins: freeze(state.enabledPlugins),
             skills: frozenSkills,
             mcpServers: freeze(state.mcpServers),
+            extensions: freeze(state.extensions),
             diagnostics: freeze(state.diagnostics),
             turnCapabilities,
         });
     }
+    /**
+     * The snapshot one session sees (two.md §12 会话 overlay): each `LOCAL_PREVIEW` package
+     * replaces the effective Plugin of its name in this view only, never an official one. Only the
+     * preview's Skills and MCP servers enter; their runtime tools come from the session's own MCP
+     * generation, so the base runtime tools of a replaced Plugin are dropped here.
+     */
+    overlaySession(base, previews, revision) {
+        const diagnostics = [...base.diagnostics];
+        const official = new Set(base.enabledPlugins
+            .filter((plugin) => plugin.source === 'OFFICIAL')
+            .map((plugin) => collisionKey(plugin.name)));
+        const accepted = previews.filter((entry) => {
+            if (!official.has(collisionKey(entry.plugin.name)))
+                return true;
+            diagnostics.push(freeze({ code: 'EXTENSION_NAME_RESERVED', pluginName: entry.plugin.name }));
+            return false;
+        });
+        const replaced = new Set(accepted.map((entry) => collisionKey(entry.plugin.name)));
+        const kept = (pluginName) => pluginName === undefined || !replaced.has(collisionKey(pluginName));
+        const replacedSources = new Map(base.enabledPlugins
+            .filter((plugin) => replaced.has(collisionKey(plugin.name)))
+            .map((plugin) => [collisionKey(plugin.name), plugin.source]));
+        const view = base.turnCapabilities;
+        const keptSkills = view.skills.filter((skill) => kept(skill.pluginName));
+        const keptLocations = new Set(keptSkills.map((skill) => skill.location));
+        const skillNames = new Set(keptSkills.map((skill) => normalizedSkillKey(skill.name)));
+        const enabledPlugins = base.enabledPlugins.filter((plugin) => kept(plugin.name));
+        const skills = [];
+        const turnSkills = [...keptSkills];
+        const servers = [];
+        for (const entry of accepted) {
+            const plugin = previewCapabilities(entry.plugin);
+            const capabilities = acceptRuntimeCapabilities({
+                plugin,
+                packageContentDigest: entry.contentDigest,
+                sourceKind: 'local',
+                skillNames,
+                diagnostics,
+            });
+            enabledPlugins.push(enabledProjection(plugin, { name: plugin.name, marketplace: LOCAL_PLUGIN_MARKETPLACE }));
+            skills.push(...capabilities.skills);
+            turnSkills.push(...capabilities.skills.map((skill) => turnSkill(plugin.name, skill)));
+            const nameSource = replacedSources.get(collisionKey(plugin.name));
+            servers.push(...(nameSource
+                ? capabilities.mcpServers.map((server) => freeze({ ...server, nameSource }))
+                : capabilities.mcpServers));
+        }
+        const allocated = this.names.assignServers(servers.map((entry) => ({
+            key: pluginMcpServerNameKey(entry),
+            name: entry.server.name,
+        })));
+        const previewServers = servers.flatMap((entry) => {
+            const key = pluginMcpServerNameKey(entry);
+            const runtimeServerName = allocated.names.get(key);
+            if (runtimeServerName)
+                return [freeze({ ...entry, runtimeServerName })];
+            diagnostics.push(freeze({
+                code: 'MCP_SERVER_NAME_INVALID',
+                pluginName: entry.pluginName,
+                capabilityName: entry.server.name,
+            }));
+            return [];
+        });
+        const droppedTools = new Set(view.runtimeToolBindings
+            .filter((binding) => !kept(binding.pluginName))
+            .map((binding) => binding.tool));
+        return freeze({
+            ...base,
+            revision,
+            enabledPlugins: freeze(enabledPlugins),
+            skills: freeze([
+                ...base.skills.filter((skill) => keptLocations.has(skill.skillFilePath)),
+                ...skills.map((skill) => freeze(skill)),
+            ]),
+            mcpServers: freeze([
+                ...base.mcpServers.filter((entry) => kept(entry.pluginName)),
+                ...previewServers,
+            ]),
+            extensions: freeze(base.extensions.filter((entry) => kept(entry.pluginName))),
+            diagnostics: freeze(diagnostics),
+            turnCapabilities: freeze({
+                ...view,
+                revision,
+                plugins: freeze(enabledPlugins.map(turnPlugin)),
+                skills: freeze(turnSkills),
+                runtimeTools: freeze(view.runtimeTools.filter((tool) => !droppedTools.has(tool))),
+                runtimeToolBindings: freeze(view.runtimeToolBindings.filter((binding) => kept(binding.pluginName))),
+                hostBindings: freeze((view.hostBindings ?? []).filter((item) => kept(item.pluginName))),
+                hooks: freeze((view.hooks ?? []).filter((handler) => kept(handler.pluginName))),
+                agents: freeze((view.agents ?? []).filter((agent) => kept(agent.pluginName))),
+            }),
+        });
+    }
+}
+/** A preview contributes Skills and MCP servers; hooks, agents, apps and bindings stay out. */
+function previewCapabilities(plugin) {
+    const { hooks, agents, hostBindings, extension, miniapp, ...rest } = plugin;
+    void [hooks, agents, hostBindings, extension, miniapp];
+    return { ...rest, source: 'LOCAL_PREVIEW', apps: [] };
+}
+function turnPlugin(plugin) {
+    return freeze({
+        name: plugin.name,
+        ...(plugin.version ? { version: plugin.version } : {}),
+        source: turnPluginSource(plugin.source),
+        marketplace: plugin.id.marketplace,
+        hostCapabilities: plugin.hostCapabilities,
+        ...(plugin.iconPath ? { iconUrl: localIconUrl(plugin.iconPath) } : {}),
+        ...(plugin.darkIconPath ? { darkIconUrl: localIconUrl(plugin.darkIconPath) } : {}),
+        ...(plugin.displayName ? { displayName: plugin.displayName } : {}),
+        ...(plugin.iconPath ? { iconPath: plugin.iconPath } : {}),
+        appProviders: plugin.appProviders,
+    });
+}
+function turnSkill(pluginName, skill) {
+    return freeze({
+        pluginName,
+        name: buildPluginSkillRuntimeName(pluginName, skill.name),
+        description: skill.description,
+        content: skill.content,
+        location: skill.skillFilePath,
+        sourceKind: 'desktop-plugin',
+    });
 }
 export const EMPTY_PLUGIN_SNAPSHOT = new PluginSnapshotBuilder().build({
     revision: 'plugin-snapshot-0',
@@ -119,6 +262,7 @@ function createSnapshotBuildState(reservations) {
         skillOwners: new Map(),
         mcpServers: [],
         hooks: [],
+        extensions: [],
         hostBindings: [],
         agents: [],
         pluginNames: new Set(),
@@ -147,7 +291,7 @@ function appendOfficialPackages(packages, state, options) {
     const sorted = [...packages].sort((left, right) => collisionKey(left.plugin.name).localeCompare(collisionKey(right.plugin.name)) ||
         left.contentDigest.localeCompare(right.contentDigest));
     for (const entry of sorted) {
-        if (options.forbiddenPluginNames?.has(entry.plugin.name.trim().normalize('NFKC').toLocaleLowerCase('en-US'))) {
+        if (options.forbiddenPluginNames?.has(normalizePluginName(entry.plugin.name))) {
             state.diagnostics.push({ code: 'FORBIDDEN_BY_CONFIG', pluginName: entry.plugin.name });
             continue;
         }
@@ -185,7 +329,7 @@ function appendLocalPackages(input, state, options) {
     for (const candidate of candidates) {
         if (!candidate.enabled ||
             candidate.entry.unavailableReason ||
-            options.forbiddenPluginNames?.has(candidate.entry.plugin.name.trim().normalize('NFKC').toLocaleLowerCase('en-US')))
+            isLocalPluginForbidden(candidate.entry.plugin.name, options))
             continue;
         const key = collisionKey(candidate.entry.plugin.name);
         if (!state.nameOwners.has(key))
@@ -237,9 +381,14 @@ function acceptLocalPackage(plugin, diagnostics) {
     }
     return true;
 }
+/** Local (non-official) plugins are also forbidden while only official plugins may load. */
+function isLocalPluginForbidden(name, options) {
+    return (options.onlyOfficialPlugins === true ||
+        (options.forbiddenPluginNames?.has(normalizePluginName(name)) ?? false));
+}
 function appendLocalPlugin(candidate, state, options) {
     const { entry, id } = candidate;
-    if (options.forbiddenPluginNames?.has(entry.plugin.name.trim().normalize('NFKC').toLocaleLowerCase('en-US'))) {
+    if (isLocalPluginForbidden(entry.plugin.name, options)) {
         state.localPlugins.push(freeze({
             ...localProjection(candidate, entry.plugin, undefined),
             unavailableReason: 'FORBIDDEN_BY_CONFIG',
@@ -278,6 +427,7 @@ function appendRuntimeCapabilities(plugin, accepted, state) {
         state.skillOwners.set(skill, plugin.name);
     state.mcpServers.push(...accepted.mcpServers);
     state.hooks.push(...accepted.hooks);
+    state.extensions.push(...accepted.extensions);
     state.hostBindings.push(...accepted.hostBindings);
 }
 /** The local Plugin whose capabilities the snapshot loads for its manifest name. */
@@ -326,6 +476,7 @@ function pushReaderDiagnostics(plugin, diagnostics) {
             code: diagnostic.code,
             pluginName: plugin.name,
             ...(diagnostic.name ? { capabilityName: diagnostic.name } : {}),
+            ...(diagnostic.fix ? { fix: diagnostic.fix } : {}),
         }));
     }
 }
@@ -335,6 +486,7 @@ function acceptRuntimeCapabilities(input) {
         skills,
         mcpServers: acceptPackageServers(input),
         hooks: [...(input.plugin.hooks ?? [])],
+        extensions: acceptPackageExtension(input),
         hostBindings: acceptHostBindings(input, skills),
         agents: (input.plugin.agents ?? []).map((agent) => turnPluginAgent(input, agent)),
     };
@@ -431,6 +583,20 @@ function acceptPackageSkills(input) {
     for (const key of packageSkillKeys)
         input.skillNames.add(key);
     return accepted;
+}
+function acceptPackageExtension(input) {
+    const { plugin } = input;
+    if (!plugin.extension)
+        return [];
+    return [
+        freeze({
+            pluginName: plugin.name,
+            source: plugin.source,
+            modulePath: plugin.extension.modulePath,
+            rootPath: plugin.rootPath,
+            packageContentDigest: input.packageContentDigest,
+        }),
+    ];
 }
 function acceptPackageServers(input) {
     const pluginId = input.sourceKind === 'official'

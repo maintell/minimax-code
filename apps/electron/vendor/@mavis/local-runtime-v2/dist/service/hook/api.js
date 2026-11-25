@@ -1,20 +1,13 @@
 import { HookRegistry, configureHookRegistryHost, } from './hook-engine.js';
-import { createReviewLinkRecorderRegistration, } from './review-link.js';
-import { LocalReviewLinkStore } from '../../infra/legacy-db/review-link.js';
+import { createMergeRequestRecorderRegistration, } from './merge-request-recorder.js';
 export class LocalHookService {
     registry;
-    constructor(options) {
+    constructor(options = {}) {
         if (options.metricsReporter) {
             configureHookRegistryHost({ metricsReporter: options.metricsReporter });
         }
         this.registry = new HookRegistry();
-        registerLocalBuiltinHooks(this.registry, {
-            resolveWorkspaceDir: (sessionId) => options.resolveSessionWorkspaceDir
-                ? options.resolveSessionWorkspaceDir(sessionId)
-                : options.resolveWorkspaceDir?.(sessionId),
-            store: new LocalReviewLinkStore(options.dataDir),
-            ...(options.nowMs ? { nowMs: options.nowMs } : {}),
-        });
+        registerLocalBuiltinHooks(this.registry, options.mergeRequests);
     }
     async beforeToolCall(input) {
         const toolName = input.toolContext.toolCall.name;
@@ -90,7 +83,7 @@ function readRewrittenToolResult(postOutput) {
         out.terminate = rewritten.terminate;
     return Object.keys(out).length > 0 ? out : undefined;
 }
-function registerLocalBuiltinHooks(registry, reviewLinkDeps) {
+function registerLocalBuiltinHooks(registry, mergeRequests) {
     registry.registerBuiltin({
         id: 'local-builtin-binary-read-guard',
         hookEvent: 'PreToolUse',
@@ -147,10 +140,11 @@ function registerLocalBuiltinHooks(registry, reviewLinkDeps) {
             }
         },
     });
-    // Review links — record the PR/MR a branch belongs to when the agent runs
-    // `gh pr create|view` / `glab mr create|view`, so the TUI status line can
-    // surface it.
-    registry.registerBuiltin(createReviewLinkRecorderRegistration(reviewLinkDeps));
+    // Merge requests an agent creates with "glab mr create" / "gh pr create" are
+    // linked to its Session, for the merge request panel and the TUI status line.
+    if (mergeRequests) {
+        registry.registerBuiltin(createMergeRequestRecorderRegistration(mergeRequests));
+    }
 }
 function readToolCallId(toolCall) {
     if (!toolCall || typeof toolCall !== 'object')

@@ -16,6 +16,7 @@
  *   5. mavis-tool-def.ts description 列上该 subcommand 用法
  */
 import { z } from 'zod';
+import { isDefaultAgentAvatarMarker } from '@mavis/shared/agent-avatar';
 import { CRON_FIXED_SESSION_ID, isCronDedicatedSessionTarget, isCronFixedSessionId, } from '../../shared/cron-schedule-input.js';
 // ─── reusable ──────────────────────────────────────────────────────────
 const idString = z.string().min(1, 'ID must be a non-empty string');
@@ -42,6 +43,14 @@ const pageParamSchema = z.object({
 // ─── agent ─────────────────────────────────────────────────────────────
 export const agentListSchema = pageParamSchema;
 export const agentGetSchema = z.object({ agent_name: z.string().min(1) });
+// The server remains authoritative for legacy URL allowlisting. Reject emoji
+// and invented asset IDs before RPC; the existing default library uses markers.
+const agentAvatarSchema = z
+    .string()
+    .refine((value) => value === '' ||
+    isDefaultAgentAvatarMarker(value) ||
+    (/^https?:\/\//iu.test(value.trim()) && z.string().url().safeParse(value.trim()).success), 'Use mavis-agent-avatar://default/v1/<0-9> from the built-in avatar library, or an allowed legacy image URL. Omit avatar on create to select a default portrait; emoji are not supported.')
+    .optional();
 /**
  * `agent create` —— LLM 侧把 `agent_data` 拆成扁平字段(`system_prompt` /
  * `persona`),handler 内组装成 archon-biz `agent_data` JSON 信封再传给
@@ -54,7 +63,7 @@ export const agentCreateSchema = z.object({
     system_prompt: optionalString,
     persona: optionalString,
     description: optionalString,
-    avatar: optionalString,
+    avatar: agentAvatarSchema,
 });
 /**
  * `agent update` —— 与 `agent create` 同形:LLM 看到的是扁平
@@ -67,7 +76,7 @@ export const agentUpdateSchema = z.object({
     system_prompt: optionalString,
     persona: optionalString,
     description: optionalString,
-    avatar: optionalString,
+    avatar: agentAvatarSchema,
 });
 export const agentDeleteSchema = z.object({ agent_name: z.string().min(1) });
 // ─── cron ──────────────────────────────────────────────────────────────
@@ -248,52 +257,6 @@ export const communicationMessagesSchema = z
     .refine((v) => Boolean(v.to) || Boolean(v.from), {
     message: 'communication messages requires either `to` or `from`',
 });
-// ─── drive ─────────────────────────────────────────────────────────────
-export const driveFilesListSchema = z.object({
-    parent_id: optionalString,
-    node_type: z.enum(['Folder', 'File']).optional(),
-    offset: optionalNumber,
-    limit: optionalNumber,
-});
-export const driveFilesGetSchema = z.object({ node_id: idString });
-export const driveFilesDeleteSchema = z.object({ node_id: idString });
-export const driveFilesSearchSchema = z.object({
-    keyword: optionalString,
-    category: optionalString,
-    source: z.enum(['UserUpload', 'AgentDeliverable', 'SystemGenerated']).optional(),
-    session_id: optionalString,
-    offset: optionalNumber,
-    limit: optionalNumber,
-    is_favorited: optionalBoolean,
-});
-export const driveFilesDownloadSchema = z.object({ node_id: idString });
-/**
- * drive files upload —— atomic prepare+PUT+commit。args 必须二选一:
- *   - local_path:  workspace-relative path,sandbox 内已经写好的文件
- *   - content_base64:  base64 编码的字节(< 5MB 类小文件兜底)
- */
-export const driveFilesUploadSchema = z
-    .object({
-    file_name: z.string().min(1),
-    local_path: optionalString,
-    content_base64: optionalString,
-    parent_path: optionalString,
-    source: z.enum(['UserUpload', 'AgentDeliverable', 'SystemGenerated']).optional(),
-    session_id: optionalString,
-    agent_name: optionalString,
-})
-    .refine((v) => Boolean(v.local_path) !== Boolean(v.content_base64), {
-    message: 'Provide exactly one of local_path or content_base64',
-    path: ['local_path'],
-});
-export const driveNodesMoveSchema = z.object({
-    node_id: idString,
-    new_parent_id: z.string(), // 允许空字符串 = 移到根目录
-});
-export const driveNodesRenameSchema = z.object({
-    node_id: idString,
-    new_name: z.string().min(1),
-});
 // ─── help ──────────────────────────────────────────────────────────────
 /**
  * Each `<group> help` accepts no args. Dispatcher normalizes `-h` aliases
@@ -338,19 +301,6 @@ export const COMMAND_SCHEMAS = {
     // 'communication peers': communicationPeersSchema,
     // 'communication send': communicationSendSchema,
     // 'communication messages': communicationMessagesSchema,
-    'drive files list': driveFilesListSchema,
-    'drive files get': driveFilesGetSchema,
-    'drive files delete': driveFilesDeleteSchema,
-    'drive files search': driveFilesSearchSchema,
-    'drive files download': driveFilesDownloadSchema,
-    // Disabled: 'drive files upload' is intentionally not exposed to the LLM.
-    // Why: upload path goes through OSS presigned PUT and we want to gate which
-    //   surfaces can mutate the user's drive — keep the schema/handler/upload
-    //   flow code in tree but unreachable until we re-enable it.
-    // 'drive files upload': driveFilesUploadSchema,
-    'drive nodes move': driveNodesMoveSchema,
-    'drive nodes rename': driveNodesRenameSchema,
-    'drive help': helpSchema,
 };
 export const KNOWN_COMMANDS = Object.keys(COMMAND_SCHEMAS);
 //# sourceMappingURL=schemas.js.map

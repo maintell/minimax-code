@@ -5,6 +5,10 @@ export class CliService {
     constructor(options) {
         this.options = options;
     }
+    /** Plugin Hook Session lifecycle of the runtime harness; absent without one. */
+    get pluginHookSessions() {
+        return this.options.application.pluginHookSessions;
+    }
     listSessions(req, ctx = {}) {
         return this.options.applications.session.query.listSessions(ctx, req);
     }
@@ -297,7 +301,7 @@ export class CliService {
         const worklines = this.options.worklines;
         if (!worklines)
             throw new Error('Runtime does not expose Bunny spaces.');
-        return (await worklines.list()).map(({ id, name, system }) => ({ id, name, system }));
+        return (await worklines.list()).map(({ id, name }) => ({ id, name }));
     }
     /** Open (not yet completed) assignments created by `agentName`, open-first order. */
     async listBunnyOpenAssignments(agentName, limit = 20) {
@@ -466,6 +470,14 @@ export class CliService {
     /** Undefined when this host cannot persist the PTC switch. */
     setPtcEnabled(enabled) {
         return this.options.application.configuration?.setPtcEnabled?.({ enabled });
+    }
+    /** Undefined when this host cannot read the global advisor switch. */
+    getAdvisorEnabled() {
+        return this.options.application.configuration?.getAdvisorEnabled?.();
+    }
+    /** Undefined when this host cannot persist the global advisor switch. */
+    setAdvisorEnabled(enabled) {
+        return this.options.application.configuration?.setAdvisorEnabled?.({ enabled });
     }
     listModels(input) {
         return this.requireCapability('models', 'Model').list(input);

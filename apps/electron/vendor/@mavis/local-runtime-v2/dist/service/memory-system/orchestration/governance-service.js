@@ -369,37 +369,54 @@ export class MemoryGovernanceService {
             const scopeKey = await this.resolveScopeKey(input.requestSessionId);
             if (!scopeKey)
                 return { status: 'scope-unresolved' };
-            return await this.deps.scopeMutation.withScopeMutation(scopeKey, async () => {
-                await this.deps.repository.ensureScope(scopeKey);
-                const resetRow = await this.deps.repository.resetScope({
-                    scopeKey,
-                    requestedAtMs: this.deps.nowMs(),
-                });
-                let filesDeleted = false;
-                try {
-                    await this.deps.fileStore.deleteScopeFiles(scopeKey);
-                    filesDeleted = true;
-                }
-                catch {
-                    // 清空纪元已经提交，文件清理由下一次协调唤醒重试。
-                }
-                try {
-                    // Reset 即清空：旧记忆迁移随纪元变化停止，用户资料的迁移副本一并删除。
-                    await this.deps.fileStore.deleteLegacyUserSnapshot();
-                }
-                catch {
-                    // 副本不参与召回，删除失败不影响 Reset 结果。
-                }
-                return {
-                    status: 'reset',
-                    scopeKey: resetRow.scopeKey,
-                    resetEpoch: resetRow.resetEpoch,
-                    filesDeleted,
-                };
-            }, { requestWakeOnComplete: true });
+            return await this.resetScopeByKey(scopeKey, {
+                deleteLegacySnapshot: true,
+                requestWakeOnComplete: true,
+            });
         }
         catch {
             return { status: 'unavailable', reason: 'store-unavailable' };
+        }
+    }
+    /**
+     * 在作用域互斥区内 Reset 指定作用域：建行、推进纪元并清空状态，再删除作用域文件。存储失败时抛错，
+     * 由调用方决定如何报告。用户发起的 Reset 与静默引导共用这一段，差别都在参数上：
+     * - `deleteLegacySnapshot`：同时删除旧记忆迁移用的用户资料副本。用户 Reset 传 true；静默引导随后
+     *   要迁移旧记忆，传 false。
+     * - `requestWakeOnComplete`：提交后申请一轮维护协调。静默引导本身在协调轮次中执行，传 false。
+     */
+    async resetScopeByKey(scopeKey, options) {
+        return this.deps.scopeMutation.withScopeMutation(scopeKey, async () => {
+            await this.deps.repository.ensureScope(scopeKey);
+            const resetRow = await this.deps.repository.resetScope({
+                scopeKey,
+                requestedAtMs: this.deps.nowMs(),
+            });
+            let filesDeleted = false;
+            try {
+                await this.deps.fileStore.deleteScopeFiles(scopeKey);
+                filesDeleted = true;
+            }
+            catch {
+                // 清空纪元已经提交，文件清理由下一次协调唤醒重试。
+            }
+            if (options.deleteLegacySnapshot)
+                await this.deleteLegacyUserSnapshot();
+            return {
+                status: 'reset',
+                scopeKey: resetRow.scopeKey,
+                resetEpoch: resetRow.resetEpoch,
+                filesDeleted,
+            };
+        }, { requestWakeOnComplete: options.requestWakeOnComplete });
+    }
+    /** Reset 即清空：旧记忆迁移随纪元变化停止，用户资料的迁移副本一并删除。 */
+    async deleteLegacyUserSnapshot() {
+        try {
+            await this.deps.fileStore.deleteLegacyUserSnapshot();
+        }
+        catch {
+            // 副本不参与召回，删除失败不影响 Reset 结果。
         }
     }
     async excludeSession(input) {

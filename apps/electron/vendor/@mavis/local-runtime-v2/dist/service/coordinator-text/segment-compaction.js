@@ -10,7 +10,7 @@
  * conversation's cached system prompt and tools, with the control text after them. The header
  * and notes open the new segment's cached prefix.
  */
-import { SEGMENT_SUMMARY_HEADINGS, SYSTEM_SPACE_GOAL } from './contracts.js';
+import { SEGMENT_SUMMARY_HEADINGS } from './contracts.js';
 import { bunnyHandoffBlock } from './initialize.js';
 // The checkpoint protocol and control message (turn-system/compaction/segment/checkpoint-request.ts
 // sends them, algorithm/output-parser.ts reads the two blocks back).
@@ -36,11 +36,11 @@ export const SEGMENT_PROTOCOL = `You are creating a Bunny segment checkpoint.
 - 纠正、约束、决定不写在摘要里。新的纠正、约束、Bunny 问了用户还没回答的问题写进 <${SEGMENT_LEDGER_BLOCK}>。
 - 进行中的事、下一步和等待中的事照样写进摘要，账本里已有相关条目也要写：账本不代替摘要。
 - 交接头里有“异常说明”一节时，把其中还没了结的事（用户的哪些内容没能用上、是否已经告诉用户）写进“等待中的事”；新的交接说明不写异常说明，已经了结的不再提。
-- context_gap 只写给控制消息里列出的空间：已经说定、还没写进那个空间 context.md 的决定，scope 写那个空间的 ID。控制消息没有列出空间时不要写 context_gap——没有 context.md 可写，这条条目就无处关闭。对话里前后矛盾、需要核实的事写进摘要和“检索线索”，不写成 context_gap。
+- context_gap 只写给控制消息里列出的事项：已经说定、还没写进那个事项 context.md 的决定，scope 写那个事项的 ID。控制消息没有列出事项时不要写 context_gap——没有 context.md 可写，这条条目就无处关闭。对话里前后矛盾、需要核实的事写进摘要和“检索线索”，不写成 context_gap。
 - 用户说过的事实（数值、日期、名称、计划、偏好）后来变过的，写现在的值，同时写上原来的值，以及什么时候、为什么变的。
 - 任务只写任务 ID 和一句话；任务状态以交接头里的状态快照为准，不要自己推断。
 - 助手提过的方案，用户没说采用或已经做了的，不要写进“刚完成的事”。
-- 放不进摘要的细节写进“检索线索”：每条写一个主题和 2–4 个关键词（文件名、数字、人名、空间名），以后用 conversation_search 查找原文。
+- 放不进摘要的细节写进“检索线索”：每条写一个主题和 2–4 个关键词（文件名、数字、人名、事项名），以后用 conversation_search 查找原文。
 - 全文不超过控制消息里给出的篇幅上限；写不下时先保证前面几段完整，把细节交给“检索线索”。
 - 引用某条消息时用消息索引里的编号 N（写“消息 N”），**只写在“检索线索”一段**：宿主会把编号换成消息 ID，一个 ID 要花掉约 40 个 token，铺在正文里会挤掉仍有效的事项。正文其余各段只写事实，不写编号。旧交接说明里已经是消息 ID 的引用原样保留。
 
@@ -63,7 +63,7 @@ export const SEGMENT_PROTOCOL = `You are creating a Bunny segment checkpoint.
 {"op":"add","kind":"correction","scope":"global","text":"优先用用户原话","replaces":"被否定的旧做法（只用于 correction，可省略）","source":N}
 {"op":"add","kind":"constraint","scope":"global","text":"...","source":N}
 {"op":"add","kind":"open_question","scope":"global","text":"...","source":N}
-{"op":"add","kind":"context_gap","scope":"space:<控制消息里列出的空间 ID>","text":"...","source":N}
+{"op":"add","kind":"context_gap","scope":"space:<控制消息里列出的事项 ID>","text":"...","source":N}
 {"op":"update","id":"<现行条目 ID>","text":"新的说法","source":N}
 {"op":"close","id":"<现行条目 ID>","reason":"done 或 answered","note":"answered 时写用户的回答","source":N}
 </${SEGMENT_LEDGER_BLOCK}>
@@ -98,7 +98,7 @@ export function buildSegmentControlText(input) {
         '已写入、还没进交接头的账本条目（不要再新增它们）：',
         ...ledgerLines(input.writtenNotInHeader),
         '',
-        'context_gap 的 scope 只能用下面这些空间的 ID（没有就不要写 context_gap）：',
+        'context_gap 的 scope 只能用下面这些事项的 ID（没有就不要写 context_gap）：',
         ...(input.spaces.length > 0
             ? input.spaces.map((space) => `- space:${space.spaceId} name=${oneLine(space.name, 120)}`)
             : [SEGMENT_NONE]),
@@ -155,7 +155,7 @@ const HANDOFF_PREAMBLE = '这是主对话分段后的交接头，写给接着工
 const RETRIEVAL_HINT = '更早的原话和细节没有放进这里，用 conversation_search 查找，需要整段原文时用 conversation_read 读取。';
 export const HANDOFF_SUMMARY_HEADING = '## 交接摘要';
 const HANDOFF_LEDGER_HEADING = '## 账本现行条目';
-const HANDOFF_SPACES_HEADING = '## 空间要点';
+const HANDOFF_SPACES_HEADING = '## 事项要点';
 const HANDOFF_RETRIEVAL_HEADING = '## 检索提示';
 const HANDOFF_TIME_HEADING = '## 时间线索';
 const HANDOFF_STATUS_HEADING = '## 任务状态快照';
@@ -215,7 +215,7 @@ export function handoffStatusHeading(cutoff) {
     return `${HANDOFF_STATUS_HEADING}（截至 ${cutoff}）`;
 }
 export const HANDOFF_NO_OPEN_TASKS = '（没有未结任务）';
-export const HANDOFF_NO_OPEN_SPACES = '（没有有未结任务的空间）';
+export const HANDOFF_NO_OPEN_SPACES = '（没有有未结任务的事项）';
 /** The ledger could not render its section this time. */
 export const HANDOFF_LEDGER_UNREAD = '（这次没读到账本，用 working_state list 读现行条目。）';
 /**
@@ -223,7 +223,7 @@ export const HANDOFF_LEDGER_UNREAD = '（这次没读到账本，用 working_sta
  * this time (emergency rebuild spec 7.3); the ledger's is `HANDOFF_LEDGER_UNREAD`.
  */
 export const HANDOFF_STATUS_UNREAD = `${HANDOFF_STATUS_HEADING}\n（这次没读到任务状态，下一轮的状态更新会列出全部任务。）`;
-export const HANDOFF_SPACES_UNREAD = '（这次没读到空间要点，需要时用 mavis space context read 读对应空间。）';
+export const HANDOFF_SPACES_UNREAD = '（这次没读到事项要点，需要时用 bunny_task_space_context_read 读对应事项。）';
 export const HANDOFF_TIME_UNREAD = '（这次没读到时间线索。）';
 /** The summary section of a segment that carries no earlier summary (an emergency rebuild's). */
 export const HANDOFF_NO_SUMMARY = '（没有交接摘要）';
@@ -233,7 +233,7 @@ export const HANDOFF_RESET_NO_SUMMARY = '（上下文已由用户重置，没有
 export const HANDOFF_RESET_UNREAD = {
     ledger: '（账本暂时读不出，用 working_state list 读现行条目。）',
     status: `${HANDOFF_STATUS_HEADING}\n（任务状态暂时读不出，下一轮的状态更新会列出全部任务。）`,
-    spaces: '（空间要点暂时读不出，需要时用 mavis space context read 读对应空间。）',
+    spaces: '（事项要点暂时读不出，需要时用 bunny_task_space_context_read 读对应事项。）',
     time: '（时间线索暂时读不出。）',
 };
 /**
@@ -264,12 +264,10 @@ export function handoffSpaceHead(space) {
     ].join('\n');
 }
 function handoffSpaceGoal(space) {
-    if (space.system)
-        return SYSTEM_SPACE_GOAL;
     return space.goal.trim() ? oneLine(space.goal, 200) : '没有目标';
 }
 export function handoffOtherSpaces(names) {
-    return `其他空间：${names.join('、')}`;
+    return `其他事项：${names.join('、')}`;
 }
 // Retained notes (turn-system/compaction/segment/algorithm/retention.ts).
 export const RETAINED_USER_MESSAGE = '用户消息';

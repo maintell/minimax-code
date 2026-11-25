@@ -30,8 +30,12 @@ import { PermissionEngine, registerDefaultCheckers, HttpCloudGatewayClient, mode
 import { LocalPermissionStoreUnhealthyError, } from '../rules/rules.js';
 import { logger } from '../../../infra/logging/logger.js';
 import { readLocalPermissionMode } from '../request-contracts.js';
+import { emitLlmCheckMetric } from '../approval/permission-metrics.js';
 import { applyAskGate } from './ask-gate.js';
 import { evaluateLocalPermissionCheck } from './checkers.js';
+import { expandMavisWholeToolRules } from './mavis-rule-expansion.js';
+import { registerMavisSplitToolCheckers } from './mavis-split-tool-checker.js';
+import { CLASSIFIER_SOURCES, emitDecisionMetrics, engineDecisionSource, fastAllowKind, permissionReasonLogFields, tagDecision, } from './decision-attribution.js';
 import { evaluateNativeDeleteSafety, evaluatePosixTrashSafety, evaluateWindowsHardSafety, needsDeleteRewrite, runtimeCheckerShell, } from './runtime-safety.js';
 import { classifyDenySource, formatTimeoutSuffixSeconds, isOrdinaryFallbackAsk, mapClassifierRecommendation, resolveBoundaryDenial, resolveLocalPolicyAsk, serializeToolInput, } from './verdict-mapping.js';
 function readPermissionPolicyOwner(value) {
@@ -42,57 +46,6 @@ function readPermissionPolicyOwner(value) {
 /** A Hook recheck keeps its validated plan's setting; otherwise read the current opt-in. */
 function readNativeDelete(params, config) {
     return params.nativeDeleteSnapshot ?? config.permission?.nativeDelete === true;
-}
-/**
- * Convert a structured decision reason into diagnostic fields. Bash
- * subcommands retain their command and safety detail so operators can explain
- * an allow/ask/deny without consulting messages.jsonl. A matched rule keeps its
- * content so the log names the exact rule. Filesystem reasons still omit the
- * tool's own paths and free-form descriptions.
- */
-function permissionReasonLogFields(reason, includeSafetyDetail = false) {
-    const reasonCode = {
-        rule: 'persisted_rule',
-        safetyCheck: 'safety_check',
-        workingDirectory: 'working_directory_boundary',
-        internalWhitelist: 'internal_whitelist',
-        sessionOwnedReadablePath: 'session_owned_readable_path',
-        trustedExactWrite: 'trusted_exact_write',
-        tempDirectory: 'temp_directory',
-        sandbox: 'sandbox',
-        mode: 'permission_mode',
-        pathValidation: 'path_validation',
-        dangerousRemoval: 'dangerous_removal',
-        subcommandResults: 'subcommand_results',
-        rmRewrite: 'recoverable_delete_rewrite',
-        recoverableDeleteRewrite: 'recoverable_delete_rewrite',
-    };
-    const fields = { reason_code: reasonCode[reason.type] };
-    if (reason.type === 'rule') {
-        fields.rule_source = reason.rule.source;
-        fields.rule_behavior = reason.rule.ruleBehavior;
-        fields.rule_tool_name = reason.rule.ruleValue.toolName;
-        if (reason.rule.ruleValue.ruleContent)
-            fields.rule_content = reason.rule.ruleValue.ruleContent;
-    }
-    else if (reason.type === 'mode') {
-        fields.reason_mode = reason.mode;
-    }
-    else if (reason.type === 'safetyCheck') {
-        if (includeSafetyDetail)
-            fields.reason_detail = reason.description;
-        if (reason.category)
-            fields.reason_category = reason.category;
-    }
-    else if (reason.type === 'subcommandResults') {
-        fields.subcommand_results = [...reason.reasons].map(([command, result]) => ({
-            command,
-            behavior: result.behavior,
-            reason_type: result.reason.type,
-            ...permissionReasonLogFields(result.reason, true),
-        }));
-    }
-    return fields;
 }
 function readCommand(input) {
     if (typeof input.command === 'string')
@@ -125,6 +78,7 @@ export class LocalPermissionFacade {
             deps.cloudGateway ?? new HttpCloudGatewayClient({ timeoutMs: this.cloudGatewayTimeoutMs });
         this.engine = new PermissionEngine();
         registerDefaultCheckers(this.engine);
+        registerMavisSplitToolCheckers(this.engine);
     }
     /** Host-owned Session shell binding; never derived from tool or HTTP input. */
     bindShellResolver(resolve) {
@@ -150,7 +104,7 @@ export class LocalPermissionFacade {
      * the raw verdict through {@link applyAskGate} so the
      * `bypassPermissions` ("始终允许") invariant — _no card ever
      * surfaces in this mode_ — is enforced in one place rather than
-     * scattered across the 22 sites that can produce `behavior: 'ask'`.
+     * scattered across every site that can produce `behavior: 'ask'`.
      *
      * The mode is snapshotted ONCE at this entrypoint and threaded into
      * the raw pipeline and the gate. `configGetter()` is a live view of
@@ -193,7 +147,17 @@ export class LocalPermissionFacade {
             raw_rule_count: verdict.ruleContents?.length ?? 0,
             ...(finalVerdict.denySource ? { deny_source: finalVerdict.denySource } : {}),
         }, 'permission.decision');
-        return finalVerdict;
+        emitDecisionMetrics(this.deps.metricsClient, {
+            toolName: params.toolName,
+            mode: rawMode,
+            rawVerdict: verdict,
+            finalVerdict,
+            platform: this.deps.platform,
+        });
+        // The card metric labels its mode with this same effective mode.
+        return finalVerdict.behavior === 'ask'
+            ? { ...finalVerdict, permissionMode: rawMode }
+            : finalVerdict;
     }
     /** Bash always carries a plan so execution keeps the shell this decision authorized. */
     async addExecutionPlan(params, verdict, mode, nativeDelete) {
@@ -270,11 +234,11 @@ export class LocalPermissionFacade {
             params.trustedShellFamily) {
             return undefined;
         }
-        return {
+        return tagDecision({
             behavior: 'deny',
             denySource: 'safety-immune',
             reason: 'AGENT_SHELL_UNAVAILABLE: no session Shell is bound. Continue with non-shell tools and retry after Shell availability is restored.',
-        };
+        }, 'boundary_deny');
     }
     runtimeSafetyDeps() {
         return {
@@ -301,23 +265,23 @@ export class LocalPermissionFacade {
         const deps = this.runtimeSafetyDeps();
         let runtimeSafety = await evaluateWindowsHardSafety(deps, request);
         if (runtimeSafety.denial)
-            return runtimeSafety.denial;
+            return tagDecision(runtimeSafety.denial, 'boundary_deny');
         const posixTrashSafety = nativeDelete
             ? undefined
             : evaluatePosixTrashSafety(this.deps.configGetter, platform, request.command);
         if (posixTrashSafety)
-            return posixTrashSafety;
+            return tagDecision(posixTrashSafety, 'boundary_deny');
         if (nativeDelete) {
             runtimeSafety = await evaluateNativeDeleteSafety(deps, request, runtimeSafety);
             if (runtimeSafety.denial)
-                return runtimeSafety.denial;
+                return tagDecision(runtimeSafety.denial, 'boundary_deny');
         }
         // Off mode skips permission review, but recoverable deletion still needs the engine rewrite.
         if (rawMode === 'off' && !needsDeleteRewrite(request)) {
-            return {
+            return tagDecision({
                 behavior: 'allow',
                 reason: 'Allowed: permission mode is off; permission review was skipped.',
-            };
+            }, 'mode_off');
         }
         return this.checkPolicy(params, snapshot, runtimeSafety);
     }
@@ -337,7 +301,7 @@ export class LocalPermissionFacade {
         // Snapshot rules + build the ToolPermissionContext.
         const loaded = await this.loadRules(params, snapshot);
         if ('behavior' in loaded)
-            return loaded;
+            return tagDecision(loaded, 'store_unhealthy');
         const { rules } = loaded;
         const workingDirectory = windowsHardSafety.workingDirectory ??
             (await this.resolveWorkingDirectory(params.sessionId, params.agentName));
@@ -356,13 +320,13 @@ export class LocalPermissionFacade {
         //     engine run first and demote allow → ask so the cloud gateway or
         //     the user can clear it (routes to the LLM gate, per bash-fast-allow).
         //
-        //   - ask           → curl-pipe-shell, shell substitution, slow
-        //     unbounded scan, recursive rm, workspace-escape. Same upgrade
-        //     allow → ask logic as before; ASK was never bypass-immune.
+        // The local check never returns an ask; ordinary approval prompts
+        // (pipe to shell, substitutions, unbounded scans, …) come from the engine.
         const localHardCheck = evaluateLocalPermissionCheck({
             toolName: params.toolName,
             input: params.input,
             workspaceDir: workingDirectory,
+            additionalWorkspaceDirs: params.trustedAdditionalWorkingPaths,
             platform,
             skipWindowsHardSafetyChecks: this.skipsWindowsHardSafety(platform),
             ...runtimeCheckerShell(this.deps.shellFamily, params, nativeDelete),
@@ -374,8 +338,9 @@ export class LocalPermissionFacade {
             rules,
             localeHint,
         });
-        if (boundaryDenial)
-            return boundaryDenial;
+        if (boundaryDenial) {
+            return tagDecision(boundaryDenial, boundaryDenial.denySource === 'rule' ? 'rule_deny' : 'boundary_deny');
+        }
         // Run the deterministic engine. Output carries:
         //   - behavior (allow / ask / deny)
         //   - reason (structured DecisionReason — rendered with reason-format)
@@ -384,6 +349,7 @@ export class LocalPermissionFacade {
         //   - skipAutoClassifier (defensive net — keep ask out of LLM)
         const decision = this.engine.checkPermission(params.toolName, params.input, ctx, {
             policyOwner,
+            ...(params.trustedMcpRuleSubject ? { mcpRuleSubject: params.trustedMcpRuleSubject } : {}),
             onCheckerDecision: (trace) => {
                 logger.info({
                     ...(params.sessionId ? { session_id: params.sessionId } : {}),
@@ -417,11 +383,11 @@ export class LocalPermissionFacade {
             skip_auto_classifier: decision.skipAutoClassifier === true,
         }, `permission.${policyOwner}.decision`);
         if (loaded.unhealthyStoreReason && decision.behavior !== 'deny') {
-            return {
+            return tagDecision({
                 behavior: 'ask',
                 reason: loaded.unhealthyStoreReason,
                 rewrittenInput: decision.rewrittenInput,
-            };
+            }, 'store_unhealthy');
         }
         return this.resolveEngineDecision({
             params,
@@ -449,28 +415,22 @@ export class LocalPermissionFacade {
         // despite the user clicking "Always allow".
         const policyAsk = resolveLocalPolicyAsk({ askPolicy, localHardCheck, decision, rules, params });
         if (policyAsk)
-            return policyAsk;
-        // bypassPermissions ('never') no longer needs an `allow → ask`
-        // upgrade for local hard-check ASKs. The ask-gate
-        // ({@link applyAskGate}) now sits at the public entrypoint and
-        // downgrades any ASK verdict back to ALLOW when
-        // `mode === 'bypassPermissions'`. Honouring the local checker's
-        // ASK here would only be visible through `checkPermissionRaw`
-        // (tests, telemetry); it stays a no-op for the production path.
+            return tagDecision(policyAsk, 'local_policy');
         // ALLOW / DENY — return as-is, render reason from structured DecisionReason.
+        const source = engineDecisionSource(decision);
         if (decision.behavior === 'allow') {
-            return {
+            return tagDecision({
                 behavior: 'allow',
                 reason: formatDecisionReason(decision.reason, 'allow', localeHint),
                 rewrittenInput: decision.rewrittenInput,
-            };
+            }, source, fastAllowKind(decision.reason));
         }
         if (decision.behavior === 'deny') {
-            return {
+            return tagDecision({
                 behavior: 'deny',
                 reason: formatDecisionReason(decision.reason, 'deny', localeHint),
                 denySource: classifyDenySource(decision.reason),
-            };
+            }, source);
         }
         // ASK — fold with askPolicy.
         const baseAsk = {
@@ -481,6 +441,7 @@ export class LocalPermissionFacade {
             rewrittenInput: decision.rewrittenInput,
             ...(isOrdinaryFallbackAsk(decision.reason) ? { hookAutoApprovalEligible: true } : {}),
         };
+        tagDecision(baseAsk, source);
         // 'never' (始终允许 / bypassPermissions): the raw pipeline still
         // returns ASK so the engine's intent is visible to telemetry /
         // tests via `checkPermissionRaw`; the public-entry ask-gate then
@@ -491,14 +452,15 @@ export class LocalPermissionFacade {
             return baseAsk;
         }
         if (askPolicy === 'deny') {
-            return {
+            return tagDecision({
                 behavior: 'deny',
                 reason: `Denied by dontAsk permission mode: ${baseAsk.reason}`,
                 denySource: 'rule',
-            };
+            }, 'mode_dont_ask');
         }
-        // 'on-request' (询问 / default): emit ask immediately.
-        if (askPolicy === 'on-request') {
+        // 'on-request' (询问 / default): emit ask immediately. A call without a turn has no
+        // classifier input, so its auto-mode ask stays an ask for the caller to refuse.
+        if (askPolicy === 'on-request' || params.trustedWithoutTurn) {
             return baseAsk;
         }
         return this.classifyDecision({
@@ -513,13 +475,16 @@ export class LocalPermissionFacade {
     async loadRules(params, snapshot) {
         try {
             return {
-                rules: [
+                // Both sources go through the same widening: a whole-tool `mavis` rule the
+                // user saved before the composite tool was split up still decides the
+                // tools that command became, and a Plugin Hook rule does too.
+                rules: expandMavisWholeToolRules([
                     ...(await this.deps.ruleStore.listRules({
                         agentName: params.agentName,
                         sessionId: params.sessionId,
                     })),
                     ...snapshot.pluginContext.rules,
-                ],
+                ]),
             };
         }
         catch (error) {
@@ -552,7 +517,10 @@ export class LocalPermissionFacade {
             nativeDelete: snapshot.nativeDelete,
             rules,
             workingDirectory,
-            allowedWorkingPaths: [...snapshot.pluginContext.directories],
+            allowedWorkingPaths: [
+                ...snapshot.pluginContext.directories,
+                ...(params.trustedAdditionalWorkingPaths ?? []),
+            ],
             sandboxAllowPaths: this.resolveSandboxAllowPaths(params.toolName, workingDirectory, params.agentName),
             trustedExactWritePaths: params.trustedExactWritePaths,
             sessionOwnedReadablePaths: params.sessionOwnedReadablePaths,
@@ -644,13 +612,13 @@ export class LocalPermissionFacade {
             });
         }
         catch {
-            this.emitLlmCheckMetrics('error', classifyStartedAt);
+            emitLlmCheckMetric(this.deps.metricsClient, 'error', 'exception', classifyStartedAt);
             logClassifierDecision('error', 'ask');
-            return mapClassifierRecommendation(decision, 'ask', formatAutoClassifierReason('timeout', formatTimeoutSuffixSeconds(this.cloudGatewayTimeoutMs), localeHint), policyOwner);
+            return tagDecision(mapClassifierRecommendation(decision, 'ask', formatAutoClassifierReason('timeout', formatTimeoutSuffixSeconds(this.cloudGatewayTimeoutMs), localeHint), policyOwner), 'classifier_error');
         }
-        this.emitLlmCheckMetrics(gatewayVerdict.kind, classifyStartedAt);
+        emitLlmCheckMetric(this.deps.metricsClient, gatewayVerdict.kind, gatewayVerdict.kind === 'timeout' ? (gatewayVerdict.failureReason ?? 'timeout') : 'none', classifyStartedAt);
         logClassifierDecision(gatewayVerdict.kind, gatewayVerdict.kind === 'allow' ? 'allow' : 'ask');
-        return this.mapCloudDecision({ decision, gatewayVerdict, localeHint, policyOwner });
+        return tagDecision(this.mapCloudDecision({ decision, gatewayVerdict, localeHint, policyOwner }), CLASSIFIER_SOURCES[gatewayVerdict.kind] ?? 'classifier_error');
     }
     mapCloudDecision(input) {
         const { decision, gatewayVerdict, localeHint, policyOwner } = input;
@@ -787,14 +755,6 @@ export class LocalPermissionFacade {
             agentId: input.agentName,
             sessionId: input.sessionId,
         });
-    }
-    /** `verdict` = CloudClassifyVerdict.kind or 'error' for an unexpected throw. */
-    emitLlmCheckMetrics(verdict, startedAtMs) {
-        const metrics = this.deps.metricsClient;
-        if (!metrics)
-            return;
-        metrics.histogram('permission_llm_check_duration_ms', Date.now() - startedAtMs);
-        metrics.counter('permission_llm_check_total', 1, { verdict });
     }
     async resolveWorkingDirectory(sessionId, agentName) {
         let resolvedAgent = agentName;

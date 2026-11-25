@@ -33,13 +33,13 @@ function readSystemMemory() {
     // Outside Electron only Node's view is available; it reports free pages only.
     return { totalBytes: os.totalmem(), availableBytes: os.freemem() };
 }
-export function deviceHiddenTabCap(totalBytes) {
-    const gib = totalBytes / 1024 ** 3;
-    if (gib <= 8)
-        return 3;
-    if (gib <= 16)
-        return 6;
-    return 12;
+/**
+ * Live background pages kept while memory is healthy, on any machine: Codex
+ * keeps the same 32 per window. Only memory pressure lowers it.
+ */
+export let HIDDEN_TAB_LIMIT = 32;
+export function deviceHiddenTabCap(_totalBytes) {
+    return HIDDEN_TAB_LIMIT;
 }
 export function classifyBrowserMemoryPressure(sample) {
     const ratio = sample.totalBytes > 0 ? sample.availableBytes / sample.totalBytes : 0;
@@ -119,7 +119,3 @@ export class EmbeddedBrowserAdaptiveBudget {
     }
 }
 
-export function memoryWeightedLruValue(lastUsedAt, estimatedWorkingSetKiB) {
-    const memoryAgeBonusMs = Math.min(30 * 60 * 1000, Math.max(0, estimatedWorkingSetKiB) * 5);
-    return lastUsedAt - memoryAgeBonusMs;
-}

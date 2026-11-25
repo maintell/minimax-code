@@ -7,19 +7,20 @@
  * 词表不能反过来住在 dispatcher 里。
  *
  * 新增子命令需要同时更新：
- *   1. 本文件 `LOCAL_MAVIS_COMMANDS`（所有 Agent 可见）或 `BUNNY_MAVIS_COMMANDS`（只有
- *      协调者可见，其余 Agent 调用时按未知命令拒绝）
+ *   1. 本文件 `LOCAL_MAVIS_COMMANDS`
  *   2. `local-mavis.ts` 的 `LOCAL_MAVIS_COMMAND_SCHEMAS` 和 `HANDLERS`
- *   3. `builtin-defs.ts` 里 `LocalMavisToolDef`（或协调者的 `LocalMavisCoordinatorToolDef`）
- *      `schema.properties.command.description` 的命令列表
- *   4. PTC 回合的去向：`PTC_MAVIS_CHILD_TOOLS` 加一项并在 `local-mavis-ptc.ts` 写说明，
- *      或留在顶层（`PTC_MAVIS_DIRECT_COMMANDS`，同时改顶层说明）
+ *   3. PTC 回合的去向：`PTC_MAVIS_CHILD_TOOLS` 加一项并在 `local-mavis-ptc.ts` 写说明
  *
- * `local-mavis.ts` 的类型约束会在 1 和 2 不同步时直接编译失败；4 漏掉时
+ * `local-mavis.ts` 的类型约束会在 1 和 2 不同步时直接编译失败；3 漏掉时
  * `local-mavis-ptc.ts` 的单测失败。
+ *
+ * 复合 `mavis` 工具已经不在任何 Agent 的清单里，它只是这些命令的执行器。
+ * 协调者（Bunny）自己的空间与任务模型命令不再是 `mavis` 子命令，它们是
+ * `local-bunny-space-tools.ts` 里的独立工具，本文件只保留它们的说明词表。
  */
 import { normalizeMavisCommand } from '../shared/mavis-operation-classifier.js';
-import { BUNNY_MAVIS_SUMMARY, BUNNY_SHARED_MAVIS_COMMANDS, } from './local-mavis-coordinator-text.js';
+import { isRegisteredPtcMavisChildToolName, ptcMavisRunCodeCall, } from '../shared/ptc-mavis-child.js';
+export { ptcMavisRunCodeCall };
 export const LOCAL_MAVIS_COMMANDS = [
     'agent list',
     'agent get',
@@ -42,10 +43,9 @@ export const LOCAL_MAVIS_COMMANDS = [
     'mcp help',
 ];
 /**
- * Commands of the task-space coordinator (Bunny) only. They appear only in the
- * coordinator's mavis definition; for every other Agent they are unknown
- * commands, so an ordinary Agent's mavis tool stays exactly what it was before
- * Bunny.
+ * The task-space coordinator's (Bunny's) own operations. Each one is a
+ * top-level tool of its own (`local-bunny-space-tools.ts`), listed for the
+ * coordinator alone; no other Agent has them.
  */
 export const BUNNY_MAVIS_COMMANDS = [
     'space list',
@@ -54,42 +54,37 @@ export const BUNNY_MAVIS_COMMANDS = [
     'space update',
     'space context read',
     'space context write',
-    'project list',
     'task model list',
     'task model set',
 ];
 /**
- * What each coordinator command does and takes: the one source of the lines in
- * the coordinator's mavis definition and of its `session help` entries.
+ * What each coordinator operation does and takes: the one source of the tool
+ * descriptions in `local-bunny-space-tools.ts`.
  */
 export const BUNNY_MAVIS_COMMAND_DOCS = {
     'space list': {
         args: [],
-        summary: '列出任务空间：ID、名称、目标、关联项目、进行中任务数。无参数。没有 space help 命令。',
+        summary: '列出事项：ID、名称、目标、关联项目、进行中任务数。无参数。',
     },
     'space get': {
         args: ['space_id'],
-        summary: '一个任务空间的详情：目标、关联项目、空间目录、context.md 的 summary、进行中的任务、最近的资产。space_id（必填）。',
+        summary: '一个事项的详情：目标、关联项目、事项目录、事项简报（context.md）的 summary、进行中的任务、最近的资产。space_id（必填）。',
     },
     'space create': {
         args: ['name', 'goal?', 'projects? (string[])'],
-        summary: '新建任务空间，返回 { space }。name（必填）、goal、projects。只在用户回复（消息或问卷回答）的这一轮里有效；系统事件唤醒的一轮调用返回 BUNNY_SPACE_CREATE_NEEDS_USER。',
+        summary: '新建事项，返回 { space }。name（必填）、goal、projects。任何一轮都能调用，任务回传、定时这类系统事件唤醒的一轮也可以。',
     },
     'space update': {
         args: ['space_id', 'name?', 'goal?', 'projects? (string[])'],
-        summary: '修改任务空间的名称、目标、关联项目，只改这三项。space_id（必填）、name、goal（同步写进 context.md 的 <goal>）、projects。instructions、decisions、next_steps 已取消：约定、已定事项、下一步改用 space context write。',
+        summary: '修改事项的名称、目标、关联项目，只改这三项。space_id（必填）、name、goal（同步写进 context.md 的 <goal>）、projects。instructions、decisions、next_steps 已取消：约定、已定事项、下一步改用 bunny_task_space_context_write。',
     },
     'space context read': {
         args: ['space_id'],
-        summary: '读任务空间的 context.md，返回 { goal, summary, revision, directory }。goal 是空间目标，summary 是空间现状（约定 / 已定事项 / 进展 / 待定问题 / 下一步）。space_id（必填）。',
+        summary: '读事项简报 context.md，返回 { goal, summary, revision, directory }。goal 是事项目标，summary 是简报正文（最新进展 / 推进建议 / 约定 / 已定事项 / 进展 / 待定问题 / 下一步）。space_id（必填）。',
     },
     'space context write': {
         args: ['space_id', 'summary', 'sections', 'revision', 'end_turn'],
-        summary: '改写 context.md 的 <summary>（<goal> 只能用 space update 改）。space_id、revision（必填，取自最近一次 read）；summary（整段新的 <summary>，不含标签）和 sections（[{heading, content}]，只改这几节：heading 是标题整行，按整行匹配，一节到下一个同级或更高级标题为止；content 为空删掉这一节；找不到的标题加在末尾）只给一个。end_turn=true 时写成功后立即结束这一轮。版本不一致返回 SPACE_CONTEXT_CONFLICT：重读、合并用户改动后再写。summary 有变化时返回空间里没关闭的任务 openTasks。',
-    },
-    'project list': {
-        args: [],
-        summary: '列出用户在 MCode 里的全部项目：名称、路径、最近活跃时间。无参数。',
+        summary: '改写 context.md 的 <summary>（<goal> 只能用 bunny_task_space_update 改）。space_id、revision（必填，取自最近一次 bunny_task_space_context_read 的完整 12 位 revision，不要用状态块里的版本前缀）；summary（整段新的 <summary>，不含标签）和 sections（[{heading, content}]，只改这几节：heading 是标题整行，按整行匹配，一节到下一个同级或更高级标题为止，传入的一节整段替换原节；content 为空删掉这一节；找不到的标题加在末尾；“## 最新进展”“## 推进建议”两节例外，写入后总在开头，按这个顺序）只给一个。end_turn=true 时写成功后立即结束这一轮。版本不一致返回 SPACE_CONTEXT_CONFLICT，这次没有写入：错误里同时给出你传的 revision、当前 revision，以及你要改的内容现在的样子（写 sections 时是 current_sections 里这几节，写 summary 时是 current_summary 整段）。把里面的改动并进你要写的内容，用当前 revision 再写一次，不用重读。summary 有变化时返回事项里没关闭的任务 openTasks。',
     },
     'task model list': {
         args: [],
@@ -100,104 +95,6 @@ export const BUNNY_MAVIS_COMMAND_DOCS = {
         summary: '把设置里的任务模型改成用户选的或填的模型，返回回读确认后的 { model, confirmed }。只在用户选定后调用。model（必填）：用户选的模型名或在“其他”里填的内容，原样传。只接受和可选模型的名称、模型 ID 或 provider/model 完全一致的写法；对不上返回 BUNNY_TASK_MODEL_NOT_FOUND，同名模型有多个返回 BUNNY_TASK_MODEL_AMBIGUOUS，读不到可选模型返回 BUNNY_TASK_MODEL_CATALOG_UNAVAILABLE，这三种都不保存。',
     },
 };
-/**
- * Every command the coordinator's mavis lists and runs: its own space, project and task
- * model commands plus the read-only session reads. A whitelist, so a shared command added
- * to `LOCAL_MAVIS_COMMANDS` later stays out of the coordinator until it is named here.
- */
-export const COORDINATOR_LISTED_MAVIS_COMMANDS = [
-    ...BUNNY_MAVIS_COMMANDS,
-    ...BUNNY_SHARED_MAVIS_COMMANDS,
-];
-const COORDINATOR_LISTED = new Set(COORDINATOR_LISTED_MAVIS_COMMANDS);
-/** False for every command the coordinator's mavis withholds. */
-export function isCoordinatorListedMavisCommand(command) {
-    return COORDINATOR_LISTED.has(command);
-}
-const COMMAND_LIST_HEADER = 'Subcommand in "<group> <action>" form:';
-/**
- * A `<command> — <summary>` list as the coordinator's mavis shows it: the header, its own
- * commands, then one line per shared command it lists and no line for the rest.
- */
-export function coordinatorMavisCommandList(list) {
-    const lines = list.split('\n');
-    if (lines[0] !== COMMAND_LIST_HEADER)
-        throw new Error('mavis command list has no subcommand header');
-    return [
-        COMMAND_LIST_HEADER,
-        ...BUNNY_MAVIS_COMMANDS.map((command) => `${command} — ${BUNNY_MAVIS_COMMAND_DOCS[command].summary}`),
-        ...lines.slice(1).filter((line) => isCoordinatorListedMavisCommand(line.split(' — ')[0] ?? '')),
-    ].join('\n');
-}
-/** Paragraphs about a command group the coordinator's mavis withholds entirely. */
-export const COORDINATOR_DROPPED_PARAGRAPHS = [
-    'agent — local desktop agent roster',
-    'mcp — current-profile MCP server settings',
-];
-/** Description lines that name a command the coordinator's mavis withholds. */
-export const COORDINATOR_DROPPED_LINE_PREFIXES = [
-    '  Use session send to deliver a message into an existing unarchived local session.',
-    '  Before sending to a session on another device (source ssh, rc or cloud),',
-    '  When the user asks for a new, separate or fresh session, find session_create with tool_search',
-];
-/** Every shared mavis description opens with this; the coordinator replaces the line. */
-export const SHARED_SUMMARY_PREFIX = 'Manage MiniMax Code desktop ';
-/** A description without the named paragraphs: each header, its body and the blank line that ends it. */
-function withoutParagraphs(description, headers) {
-    const lines = description.split('\n');
-    const kept = [];
-    for (let index = 0; index < lines.length; index += 1) {
-        const line = lines[index] ?? '';
-        if (!headers.includes(line)) {
-            kept.push(line);
-            continue;
-        }
-        while (index + 1 < lines.length && (lines[index + 1] ?? '').trim() !== '')
-            index += 1;
-        if (index + 1 < lines.length)
-            index += 1;
-    }
-    return kept.join('\n');
-}
-/**
- * A mavis description as the coordinator reads it: its own summary line, no agent or mcp
- * paragraph, and no line for a command it withholds. Each removal is asserted to match
- * exactly once, so a reworded shared description fails here instead of drifting.
- */
-export function coordinatorMavisDescription(description) {
-    const lines = description.split('\n');
-    if (!lines[0]?.startsWith(SHARED_SUMMARY_PREFIX))
-        throw new Error('mavis description has no shared summary line');
-    // The PTC top-level description has no mcp paragraph of its own, so a dropped paragraph
-    // may be absent; what must never happen is the same header twice.
-    for (const header of COORDINATOR_DROPPED_PARAGRAPHS)
-        if (lines.filter((line) => line === header).length > 1)
-            throw new Error(`mavis description repeats the paragraph ${JSON.stringify(header)}`);
-    for (const prefix of COORDINATOR_DROPPED_LINE_PREFIXES)
-        if (lines.filter((line) => line.startsWith(prefix)).length !== 1)
-            throw new Error(`mavis description has no single line starting ${JSON.stringify(prefix)}`);
-    const kept = withoutParagraphs(lines
-        .filter((line) => !COORDINATOR_DROPPED_LINE_PREFIXES.some((p) => line.startsWith(p)))
-        .join('\n'), COORDINATOR_DROPPED_PARAGRAPHS).split('\n');
-    kept[0] = BUNNY_MAVIS_SUMMARY;
-    return kept.join('\n');
-}
-/** The PTC top-level paragraph naming the run_code tools that stand for mavis commands. */
-export const PTC_RUN_CODE_PARAGRAPH_PREFIX = 'Listing, reading, updating, archiving, interrupting and deleting agents and sessions';
-/** The run_code tools a coordinator's PTC Turn actually lists: the read-only session reads. */
-export const COORDINATOR_PTC_RUN_CODE_LINE = 'Reading conversations is a set of run_code tools in this turn: ' +
-    `${ptcMavisRunCodeCall('mavis_session_list', 'args')}, ` +
-    `${ptcMavisRunCodeCall('mavis_session_get', 'args')} and ` +
-    `${ptcMavisRunCodeCall('mavis_session_messages', 'args')}.`;
-/** The coordinator's PTC top-level mavis description: its own run_code line as well. */
-export function coordinatorPtcMavisDescription(description) {
-    const lines = coordinatorMavisDescription(description).split('\n');
-    const index = lines.findIndex((line) => line.startsWith(PTC_RUN_CODE_PARAGRAPH_PREFIX));
-    if (index === -1)
-        throw new Error('PTC mavis description has no run_code tools paragraph');
-    lines[index] = COORDINATOR_PTC_RUN_CODE_LINE;
-    return lines.join('\n');
-}
 /** Internal command vocabulary reused by the standalone Cron adapters. */
 export const LOCAL_CRON_COMMANDS = [
     'cron list',
@@ -213,17 +110,24 @@ export const LOCAL_CRON_COMMANDS = [
     'cron help',
 ];
 /**
- * On a PTC Turn every Desktop mavis command except these becomes a run_code
- * tool of its own (`PTC_MAVIS_CHILD_TOOLS`). These two start or continue other
- * work: agent create makes a new Agent with its root Session, session send
- * triggers or continues another Session's Turn. Such spawn and continue calls
- * stay top-level: when v8 kept task and task_append inside run_code only,
- * evals delegated clearly less and never continued a delegated Session, with
- * no score gain, and v9 put them back. session delete is not a command; the
- * mavis tool answers it with a refusal, which is harmless at the top level.
- * The coordinator's space and project commands also stay top-level: they have
- * no run_code tool, so a PTC Turn calls them through the top-level mavis
- * exactly as other Turns do.
+ * The Desktop mavis commands no `mavis_*` run_code tool is built for
+ * (`PTC_MAVIS_CHILD_TOOLS` holds the rest). The table answers
+ * `isPtcMavisDirectCommand`, which no production caller reads any more: the
+ * composite `mavis` tool left every Agent's catalog and is only the executor
+ * behind the namespaced tools, so there is no top-level `mavis` left for a
+ * command to stay on. It is kept as the record of where each name went.
+ *
+ * - `agent create` and `session send` are owned by the namespaced tools
+ *   `agent_create` (namespace `agent`) and `session_send` (namespace
+ *   `session.dispatch`). On a PTC Turn `agent_create` is a run_code child and
+ *   `session_send` is a top-level tool of its own
+ *   (`PTC_TOP_LEVEL_NAMESPACED_TOOL_NAMES`); neither is reached through a
+ *   top-level `mavis`. Both keep their Skill gate.
+ * - `session delete` is not a mavis command at all; the executor answers it
+ *   with a refusal.
+ * - The coordinator's space and task-model commands are standalone top-level
+ *   tools (`local-bunny-space-tools.ts`) listed for the coordinator alone, not
+ *   mavis subcommands, so naming them here decides nothing.
  */
 const PTC_MAVIS_DIRECT_COMMANDS = new Set([
     'agent create',
@@ -260,9 +164,14 @@ export function ptcMavisChildToolName(command) {
     const normalized = normalizeMavisCommand(command);
     return PTC_MAVIS_CHILD_TOOLS.find((entry) => entry.command === normalized)?.name;
 }
-/** True for the names of the mavis_* run_code tools; metrics fold them into `mavis`. */
+/**
+ * True for the names of the mavis_* run_code tools; metrics fold them into
+ * `mavis`. The Desktop list is static; a Host with its own split (cloud)
+ * registers its names when the catalog builds that Turn's mavis_* tools.
+ */
 export function isPtcMavisChildToolName(name) {
-    return PTC_MAVIS_CHILD_TOOLS.some((entry) => entry.name === name);
+    return (PTC_MAVIS_CHILD_TOOLS.some((entry) => entry.name === name) ||
+        isRegisteredPtcMavisChildToolName(name));
 }
 /** Desktop mavis commands a PTC Turn runs only through their mavis_* run_code tool. */
 export function isPtcMavisProgrammaticCommand(command) {
@@ -271,10 +180,6 @@ export function isPtcMavisProgrammaticCommand(command) {
 /** Desktop mavis commands that stay on the top-level mavis tool of a PTC Turn. */
 export function isPtcMavisDirectCommand(command) {
     return (typeof command === 'string' && PTC_MAVIS_DIRECT_COMMANDS.has(normalizeMavisCommand(command)));
-}
-/** The call a model writes inside run_code for a flattened command. */
-export function ptcMavisRunCodeCall(toolName, args = '{ ... }') {
-    return `await tools.${toolName}(${args})`;
 }
 /**
  * The run_code tool of `command` when this Turn's run_code lists it (the
@@ -314,11 +219,8 @@ export function ptcMavisHelpOutput(ctx, output) {
     return changed ? { ...output, response: { ...response, commands } } : output;
 }
 /** How to archive a Session, in the form this Turn accepts. */
-export function localMavisArchiveCall(ctx) {
-    const tool = ptcMavisRunCodeTool(ctx, 'session update');
-    return tool
-        ? `${ptcMavisRunCodeCall(tool, '{ session_id, archived: true }')} inside run_code`
-        : 'session update (archived: true)';
+export function localMavisArchiveCall(_ctx) {
+    return 'session_update (archived: true)';
 }
 const LOCAL_MAVIS_MUTATION_COMMANDS = new Set([
     'agent create',
@@ -336,21 +238,34 @@ const LOCAL_MAVIS_MUTATION_COMMANDS = new Set([
     'mcp create',
     'mcp update',
     'mcp delete',
+    // The coordinator's own tool now, but the rule is the same: a cut response
+    // never replays a write that already landed.
+    'space context write',
 ]);
 /**
  * Recovery line of a truncated mavis response; a mutation is never replayed.
  * `windowed` is set only for the coordinator, the one caller that reads a long
  * `session messages` page in windows by offset.
+ *
+ * `callerToolName` is the namespaced tool the call arrived through, when it did:
+ * the model called `session_messages`, not `mavis`, so the line names that tool
+ * again. Inside run_code it is reached as `tools.<name>`.
  */
-export function mavisRecoveryInstruction(command, runCodeTool, windowed = false) {
+export function mavisRecoveryInstruction(command, runCodeTool, windowed = false, callerToolName) {
     if (LOCAL_MAVIS_MUTATION_COMMANDS.has(command)) {
         return (`do not repeat the mutation command ${JSON.stringify(command)} automatically; ` +
             'inspect current state with the corresponding get/list command');
     }
-    // A PTC Turn runs this command as its mavis_* run_code tool, the only form it accepts there.
-    const again = runCodeTool
-        ? `tools.${runCodeTool} again inside run_code`
-        : `mavis again with command=${JSON.stringify(command)}`;
+    // A namespaced caller is the tool the model reached for, on either surface.
+    // Otherwise a PTC Turn runs this command as its mavis_* run_code tool, the
+    // only form it accepts there.
+    const again = callerToolName
+        ? runCodeTool
+            ? `tools.${callerToolName} again inside run_code`
+            : `${callerToolName} again`
+        : runCodeTool
+            ? `tools.${runCodeTool} again inside run_code`
+            : `mavis again with command=${JSON.stringify(command)}`;
     const narrower = `call ${again} and narrower args ` +
         '(prefer a smaller limit, tighter search/filter, pagination cursor, or a specific get command); ' +
         'preserve the same logical query';

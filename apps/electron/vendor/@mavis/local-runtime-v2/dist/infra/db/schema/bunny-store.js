@@ -63,10 +63,17 @@ export const bunnyAssignmentTasks = sqliteTable('local_runtime_assignment_tasks'
     doneWhen: text('done_when_json', { mode: 'json' }).$type(),
     /** The user's own words that led to the task (R4.1). */
     userWords: text('user_words'),
+    /**
+     * The IM chat the task was dispatched from: report-back replies go back there.
+     * Address fields only; WeChat context tokens are never stored.
+     */
+    originChannel: text('origin_channel_json', { mode: 'json' }).$type(),
     requestId: text('request_id'),
     requestAssignerSessionId: text('request_assigner_session_id'),
     pendingStartContent: text('pending_start_content'),
     pendingStartQueuedAtMs: integer('pending_start_queued_at_ms'),
+    /** A queued task's files, as a JSON array of local paths; null when it has none. */
+    pendingStartAttachments: text('pending_start_attachments_json', { mode: 'json' }).$type(),
     completionState: text('completion_state'),
     completionBy: text('completion_by'),
     completionAtMs: integer('completion_at_ms'),
@@ -242,6 +249,17 @@ export const bunnyTaskTelemetry = sqliteTable('local_runtime_bunny_task_telemetr
     occurredAtMs: integer('occurred_at_ms').notNull(),
     params: text('params_json', { mode: 'json' }).$type().notNull(),
 });
+/**
+ * The IM chat a Bunny schedule (cron task or self-reminder) was created from: its
+ * runs reply there. Address fields only; WeChat context tokens are never stored.
+ */
+export const bunnyScheduleOrigins = sqliteTable('local_runtime_bunny_schedule_origins', {
+    cronId: text('cron_id').primaryKey().notNull(),
+    originChannel: text('origin_channel_json', { mode: 'json' })
+        .$type()
+        .notNull(),
+    recordedAtMs: integer('recorded_at_ms').notNull(),
+});
 const BUNNY_STORE_TABLES = [
     bunnyTaskTelemetry,
     bunnySpaces,
@@ -255,6 +273,7 @@ const BUNNY_STORE_TABLES = [
     bunnyDeliveryBaseline,
     bunnyArtifactLibrary,
     bunnyMediaDescriptions,
+    bunnyScheduleOrigins,
 ];
 /** 启动时的轻量 schema 检查用：每张表应有的列。 */
 export const BUNNY_STORE_TABLE_METADATA = BUNNY_STORE_TABLES.map((table) => {

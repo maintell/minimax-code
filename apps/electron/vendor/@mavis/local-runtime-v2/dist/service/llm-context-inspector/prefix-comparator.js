@@ -59,6 +59,9 @@ function parseRequestBody(apiId, requestJson) {
             case 'openai-responses':
             case 'openai-codex-responses':
                 return projectResponsesContext(parsed);
+            case 'google-generative-ai':
+            case 'google-vertex':
+                return projectGeminiContext(parsed);
             default:
                 return undefined;
         }
@@ -89,6 +92,19 @@ function projectResponsesContext(parsed) {
             { name: 'instructions', value: parsed.instructions },
         ],
         sequence: { name: 'input', value: parsed.input },
+    };
+}
+/** Gemini reads tools and the system instruction ahead of the conversation contents. */
+function projectGeminiContext(parsed) {
+    if (!Array.isArray(parsed.contents))
+        return undefined;
+    return {
+        root: parsed,
+        stable: [
+            { name: 'tools', value: parsed.tools },
+            { name: 'systemInstruction', value: parsed.systemInstruction },
+        ],
+        sequence: { name: 'contents', value: parsed.contents },
     };
 }
 function compareContextContent(currentContext, baselineContext, baselineCallId) {

@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
-import { generateDefaultWorktreeBranch } from '../../workspace/index.js';
+import { addWorktreeWithNewBranch, generateDefaultWorktreeBranch, resolveExistingWorktreeRepository, } from '../../workspace/index.js';
 import { excludeManagedWorktrees } from '../../../infra/git/worktree-exclude.js';
 const execFile = promisify(execFileCallback);
 export class LocalRunLocationError extends Error {
@@ -32,13 +32,13 @@ export function readLocalRunLocationInput(value) {
         ...readOptionalString(record, 'newWorktreeBase'),
     };
 }
-export async function applyLocalRunLocation(input, workspaceDir, nowMs) {
+export async function applyLocalRunLocation(input, workspaceDir, nowMs, options = {}) {
     const createdAt = nowMs();
     if (input.mode === 'current')
         return applyCurrentLocation(input, workspaceDir, createdAt);
     if (input.mode === 'new-worktree')
         return applyNewWorktree(input, workspaceDir, createdAt);
-    return applyExistingWorktree(input, workspaceDir, createdAt);
+    return applyExistingWorktree(input, workspaceDir, createdAt, options.workspaceDirImplicit === true);
 }
 async function applyCurrentLocation(input, workspaceDir, createdAt) {
     if (input.branch) {
@@ -62,10 +62,12 @@ async function applyNewWorktree(input, workspaceDir, createdAt) {
         assertSafeBaseRef(input.newWorktreeBase);
     const worktreeParentDir = await resolveSafeWorktreeParent(workspaceDir);
     const targetDir = join(worktreeParentDir, branch.replace(/\//g, '-'));
-    const addArgs = ['worktree', 'add', '-b', branch, targetDir];
-    if (input.newWorktreeBase)
-        addArgs.push(input.newWorktreeBase);
-    const result = await git(addArgs, workspaceDir);
+    const result = await addWorktreeWithNewBranch({
+        repoDir: workspaceDir,
+        branch,
+        targetDir,
+        ...(input.newWorktreeBase ? { base: input.newWorktreeBase } : {}),
+    });
     if (result.code !== 0) {
         throw new LocalRunLocationError(`git worktree add failed: ${result.stderr || result.stdout}`, 'RUN_LOCATION_WORKTREE_ADD_FAILED');
     }
@@ -77,7 +79,7 @@ async function applyNewWorktree(input, workspaceDir, createdAt) {
         createdAt,
     };
 }
-async function applyExistingWorktree(input, workspaceDir, createdAt) {
+async function applyExistingWorktree(input, fallbackWorkspaceDir, createdAt, workspaceDirImplicit) {
     if (!input.worktreeDir) {
         throw new LocalRunLocationError('runLocation.mode="existing-worktree" requires `worktreeDir`', 'RUN_LOCATION_WORKTREE_DIR_REQUIRED');
     }
@@ -87,6 +89,7 @@ async function applyExistingWorktree(input, workspaceDir, createdAt) {
     if (!existsSync(input.worktreeDir)) {
         throw new LocalRunLocationError(`Worktree directory does not exist: ${input.worktreeDir}`, 'RUN_LOCATION_WORKTREE_NOT_FOUND');
     }
+    const workspaceDir = await requireWorktreeRepository(input.worktreeDir, fallbackWorkspaceDir, workspaceDirImplicit);
     if (input.branch) {
         await assertSafeBranchName(input.branch, input.worktreeDir);
         const checkout = await git(['checkout', input.branch], input.worktreeDir);
@@ -101,6 +104,12 @@ async function applyExistingWorktree(input, workspaceDir, createdAt) {
         parentRepoDir: workspaceDir,
         createdAt,
     };
+}
+async function requireWorktreeRepository(worktreeDir, workspaceDir, workspaceDirImplicit) {
+    const result = await resolveExistingWorktreeRepository(worktreeDir, workspaceDir, workspaceDirImplicit);
+    if (result.kind === 'resolved')
+        return result.repoDir;
+    throw new LocalRunLocationError(result.message, 'RUN_LOCATION_WORKTREE_NOT_IN_REPOSITORY');
 }
 async function resolveSafeWorktreeParent(workspaceDir) {
     const workspaceReal = await realpath(workspaceDir);

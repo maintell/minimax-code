@@ -1,3 +1,5 @@
+import { dispatchAttachments, unreadableDispatchAttachments, } from '../../../infra/conversation/dispatch-attachments.js';
+import { missingTaskAttachments } from '../../coordinator-text/index.js';
 import { EXECUTING_ASSIGNMENT_STATES, MAX_ACTIVE_ASSIGNMENTS, WAITING_ASSIGNMENT_STATES, } from '../contracts.js';
 /**
  * User-wide admission of assigned tasks: how many of the user's slots are in
@@ -41,7 +43,17 @@ export class AssignmentQueue {
     turnStarted(sessionId) {
         this.terminal.delete(sessionId);
     }
-    async submit(session, content, caller) {
+    /**
+     * Starts the task's round carrying the files at `attachmentPaths` into its own Session.
+     *
+     * This takes paths rather than built attachments on purpose. `dispatchAttachments` is the
+     * only thing that turns a path into an attachment, and it never emits an `assetId`:
+     * registration reuses an asset whose id and path already resolve, and asset reads are
+     * filtered by Session, so an inherited id would leave the task pointing at an asset it
+     * cannot read. Taking paths makes that mistake impossible here rather than merely
+     * discouraged.
+     */
+    async submit(session, content, caller, attachmentPaths = []) {
         this.admitted.add(session.sessionId);
         this.terminal.delete(session.sessionId);
         try {
@@ -49,7 +61,11 @@ export class AssignmentQueue {
                 sessionId: session.sessionId,
                 source: 'communication',
                 allowQueue: true,
-                message: { content, attachments: [], origin: await this.deps.origin(caller) },
+                message: {
+                    content,
+                    attachments: dispatchAttachments(attachmentPaths),
+                    origin: await this.deps.origin(caller),
+                },
             });
         }
         catch (error) {
@@ -112,12 +128,16 @@ export class AssignmentQueue {
             return;
         if (await this.isFull())
             return;
-        const spaceId = this.options.worklines.sessionSpace(id) ?? 'default';
+        const spaceId = this.options.worklines.sessionSpace(id);
         const caller = await this.deps.require(assignment.assignerWasRoot
             ? await this.options.agents.currentRoot(assignment.assignerAgentName)
             : assignment.assignerSessionId);
-        await this.submit(current, assignment.pendingStart.content, caller);
-        await this.options.tasks.clearPendingStart(id, { spaceId });
+        // The files were worked out at dispatch; one removed while the task waited is named in the
+        // first message rather than silently dropped.
+        const { content, attachments = [] } = assignment.pendingStart;
+        const missing = await unreadableDispatchAttachments(attachments);
+        await this.submit(current, content + missingTaskAttachments(missing), caller, attachments.filter((path) => !missing.includes(path)));
+        await this.options.tasks.clearPendingStart(id, spaceId ? { spaceId } : {});
         this.deps.mark(id);
     }
     async failPending(id, error) {

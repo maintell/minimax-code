@@ -133,7 +133,7 @@ let CloudTaskTool = (() => {
         get runtime() {
             return this.options?.runtime ?? {};
         }
-        async execute(ctx, rawInput, signal) {
+        async execute(ctx, rawInput, signal, onUpdate) {
             if (signal?.aborted)
                 throw new Error('Operation aborted');
             const input = rawInput.run_in_background === undefined
@@ -180,12 +180,14 @@ let CloudTaskTool = (() => {
                 return taskError(input, 'background_not_enabled', 'Background task execution is not enabled', { requested_sub_session_id: requestedSubSessionId, sub_turn_id: subTurnId });
             }
             let resolved;
+            let agentDisplayName;
             let subSessionId = requestedSubSessionId;
             // Only a coordinator admission yields an occupancy snapshot; the gate-off
             // resolver path admits nothing and leaves this undefined.
             let childTaskConcurrency;
             let reportBackgroundSetupFailure;
             const childSetupDetails = (childSessionId) => ({
+                ...(agentDisplayName ? { agent_display_name: agentDisplayName } : {}),
                 sub_session_id: childSessionId,
                 requested_sub_session_id: requestedSubSessionId,
                 sub_turn_id: subTurnId,
@@ -263,6 +265,9 @@ let CloudTaskTool = (() => {
                         return childReporterUnavailable(requestedSubSessionId);
                     return reportSetupFailure(childReporter, requestedSubSessionId, SUBAGENT_CHILD_CREATE_FAILED, 'Sub-agent child creation failed', 'create_subagent_child');
                 }
+                agentDisplayName = response.sub_session_id
+                    ? response.agent_config?.display_name?.trim() || undefined
+                    : undefined;
                 const statusCode = response.base_resp?.status_code ?? 0;
                 const statusMessage = response.base_resp?.status_msg?.trim() ?? '';
                 const stableErrorCode = stableCoordinatorErrorCode(statusMessage);
@@ -359,8 +364,26 @@ let CloudTaskTool = (() => {
                 }
                 return taskError(input, 'unknown_type', `Unknown subagent type: ${target.value}`);
             }
+            // Freeze the resolved identity with this execution. History/share viewers
+            // may not have the original owner's Agent roster when they render receipts.
+            const targetDetails = taskTargetDetails(input, agentDisplayName);
+            // The foreground task result is intentionally held until the child turn
+            // finishes, but a persisted child session is already addressable at this point.
+            // Publish that handle as a partial tool result so the parent UI can open
+            // the running child instead of waiting for the terminal receipt.
+            if (resolved.persistent === true && input.run_in_background !== true) {
+                onUpdate?.({
+                    content: [{ type: 'text', text: `Started task for ${target.value}.` }],
+                    details: {
+                        ...targetDetails,
+                        status: 'started',
+                        sub_session_id: subSessionId,
+                        sub_turn_id: subTurnId,
+                    },
+                });
+            }
             if (input.run_in_background === true) {
-                return this.executeInBackground(ctx, input, resolved, subSessionId, subTurnId, signal, reportBackgroundSetupFailure, childTaskConcurrency);
+                return this.executeInBackground(ctx, input, resolved, targetDetails, subSessionId, subTurnId, signal, reportBackgroundSetupFailure, childTaskConcurrency);
             }
             const run = await this.runSubagentTurn(ctx, input, resolved, subSessionId, subTurnId, signal);
             const finalText = run.finalText;
@@ -376,7 +399,7 @@ let CloudTaskTool = (() => {
                     text,
                     content: [{ type: 'text', text }],
                     details: {
-                        ...taskTargetDetails(input),
+                        ...targetDetails,
                         sub_session_id: subSessionId,
                         sub_turn_id: subTurnId,
                         // Preserve PiTurnRunner terminal class (DOC-2 §6 T02). `?? 'failed'`
@@ -397,7 +420,7 @@ let CloudTaskTool = (() => {
                 text,
                 content: [{ type: 'text', text }],
                 details: {
-                    ...taskTargetDetails(input),
+                    ...targetDetails,
                     sub_session_id: subSessionId,
                     sub_turn_id: subTurnId,
                     event_count: eventCount,
@@ -412,7 +435,7 @@ let CloudTaskTool = (() => {
                 ...(usage ? { totalTokens: usage.total_tokens } : {}),
             });
         }
-        async executeInBackground(ctx, input, resolved, subSessionId, subTurnId, signal, reportSetupFailure, childTaskConcurrency) {
+        async executeInBackground(ctx, input, resolved, targetDetails, subSessionId, subTurnId, signal, reportSetupFailure, childTaskConcurrency) {
             // Per-user rollout gate (symmetric with cloud-bash executeInBackground).
             // archon-server assembler ships AgentConfig.background_task_enabled after the
             // Apollo whitelist+rollout decision; when not allowed (false / undefined for
@@ -435,7 +458,7 @@ let CloudTaskTool = (() => {
                     text,
                     content: [{ type: 'text', text }],
                     details: {
-                        subagent_type: input.subagent_type,
+                        ...targetDetails,
                         sub_session_id: subSessionId,
                         sub_turn_id: subTurnId,
                         status: 'background_not_enabled',
@@ -452,7 +475,7 @@ let CloudTaskTool = (() => {
                     text,
                     content: [{ type: 'text', text }],
                     details: {
-                        subagent_type: input.subagent_type,
+                        ...targetDetails,
                         sub_session_id: subSessionId,
                         sub_turn_id: subTurnId,
                         status: 'background_not_enabled',
@@ -492,7 +515,7 @@ let CloudTaskTool = (() => {
                     return reportSetupFailure(SUBAGENT_EXECUTION_FAILED, 'Child sub-agent execution failed', 'background_start');
                 }
                 logger.error(`[background-task] failed stage=background_start code=${SUBAGENT_EXECUTION_FAILED} parent_session_id=${ctx.sessionId} parent_turn_id=${ctx.turnId} tool_call_id=${ctx.toolCallId} sub_session_id=${subSessionId} sub_turn_id=${subTurnId}`);
-                return taskError(input, SUBAGENT_EXECUTION_FAILED, `${SUBAGENT_EXECUTION_FAILED}: Child sub-agent execution failed`, { sub_session_id: subSessionId, sub_turn_id: subTurnId });
+                return taskError(input, SUBAGENT_EXECUTION_FAILED, `${SUBAGENT_EXECUTION_FAILED}: Child sub-agent execution failed`, { ...targetDetails, sub_session_id: subSessionId, sub_turn_id: subTurnId });
             }
             const taskId = started.task.taskId;
             const outputRef = stringifyJson({
@@ -516,15 +539,15 @@ let CloudTaskTool = (() => {
                 mode: 'background',
                 result: 'background_started',
             });
-            // Same receipt shape as the Desktop task tool. Without a valid snapshot
-            // (older archon_server, gate-off path) the receipt stays byte-identical.
+            // Same receipt shape as the Desktop task tool. Older coordinators and
+            // gate-off execution omit the optional occupancy snapshot.
             const text = `<task_background${childTaskConcurrencyAttributes(childTaskConcurrency)}>\nBackground task ${taskId} started.\n</task_background>`;
             const result = {
                 tool_name: CloudTaskToolDef.name,
                 text,
                 content: [{ type: 'text', text }],
                 details: {
-                    ...taskTargetDetails(input),
+                    ...targetDetails,
                     task_id: taskId,
                     sub_session_id: subSessionId,
                     sub_turn_id: subTurnId,
@@ -1465,10 +1488,11 @@ function resolveTaskTarget(input) {
     const value = input.subagent_type ?? '';
     return value.trim() ? { kind: 'subagent_type', value } : undefined;
 }
-function taskTargetDetails(input) {
+function taskTargetDetails(input, displayName) {
     return {
         ...(input.agent_name !== undefined ? { agent_name: input.agent_name } : {}),
         ...(input.subagent_type !== undefined ? { subagent_type: input.subagent_type } : {}),
+        ...(displayName?.trim() ? { agent_display_name: displayName.trim() } : {}),
     };
 }
 function taskError(input, code, message, details = {}) {

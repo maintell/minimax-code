@@ -73,6 +73,34 @@ export function utilityBootstrapStageRank(stage) {
  * failure into a slower bootstrap-timeout recovery).
  */
 export let MAX_RUNTIME_INIT_FAILURE_DETAIL_LENGTH = 2048;
+export function isNetworkProbeOrigin(value) {
+    return typeof value === 'string' && value.length <= 512 && /^https?:\/\/[^\s/?#@]+$/.test(value);
+}
+const BROWSER_BROKER_LIFECYCLE_TYPES = {
+    turn_end: true,
+    program_start: true,
+    program_end: true,
+};
+export function isBrowserBrokerLifecycleMessage(value) {
+    if (!isRecord(value) || value.type !== 'browser-lifecycle')
+        return false;
+    if (!hasMessageKeys(value, ['type', 'event']))
+        return false;
+    const event = value.event;
+    if (!isRecord(event) || Array.isArray(event))
+        return false;
+    if (!hasMessageKeys(event, ['type', 'sessionId', 'turnId'], ['ephemeral']))
+        return false;
+    return (typeof event.type === 'string' &&
+        BROWSER_BROKER_LIFECYCLE_TYPES[event.type] === true &&
+        typeof event.sessionId === 'string' &&
+        event.sessionId.length > 0 &&
+        event.sessionId.length <= 512 &&
+        typeof event.turnId === 'string' &&
+        event.turnId.length > 0 &&
+        event.turnId.length <= 512 &&
+        (event.ephemeral === undefined || event.ephemeral === true));
+}
 export let BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH = 600;
 export let DIAGNOSTICS_BROKER_METHODS = ['uploadDiagnosticBundle'];
 function isRecord(value) {
@@ -120,56 +148,117 @@ export function isRuntimeInitOwnerConflictMarker(value) {
         return false;
     return value.holderPid === undefined || isPositiveSafeInteger(value.holderPid);
 }
+const MAX_CLONE_VIOLATION_PATH_LENGTH = 200;
+const SAFE_CLONE_PATH_KEY = /^[A-Za-z_$][A-Za-z0-9_$-]{0,63}$/u;
+function cloneViolationPath(segments) {
+    let path = '';
+    for (const segment of segments) {
+        if (typeof segment === 'number')
+            path += `[${segment}]`;
+        else if (SAFE_CLONE_PATH_KEY.test(segment))
+            path += path ? `.${segment}` : segment;
+        else
+            path += '[key]';
+    }
+    if (!path)
+        return '(root)';
+    if (path.length <= MAX_CLONE_VIOLATION_PATH_LENGTH)
+        return path;
+    // Keep the start (which result field) and the end (where it broke).
+    const tail = 60;
+    return `${path.slice(0, MAX_CLONE_VIOLATION_PATH_LENGTH - tail - 1)}…${path.slice(-tail)}`;
+}
 /**
  * Broker payloads intentionally use a JSON-like subset of structured clone.
  * This excludes accessors, custom prototypes, cycles and executable values,
  * while retaining every value shape used by Browser and diagnostics results.
+ * Returns the first rule the value breaks, or undefined when it is valid.
+ * Depth counts from the value itself (0); a primitive inside an object at
+ * depth d sits at d + 1, and anything deeper than {@link MAX_CLONE_DEPTH} fails.
  */
-export function isStrictStructuredCloneValue(value) {
+export function strictStructuredCloneViolation(value) {
     const ancestors = new Set();
+    const path = [];
     let nodes = 0;
     const visit = (candidate, depth) => {
         nodes += 1;
-        if (nodes > MAX_CLONE_NODES || depth > MAX_CLONE_DEPTH)
-            return false;
+        if (nodes > MAX_CLONE_NODES)
+            return 'nodes';
+        if (depth > MAX_CLONE_DEPTH)
+            return 'depth';
         if (candidate === null || candidate === undefined)
-            return true;
-        if (typeof candidate === 'string')
-            return candidate.length <= MAX_CLONE_STRING_LENGTH;
+            return undefined;
+        if (typeof candidate === 'string') {
+            return candidate.length <= MAX_CLONE_STRING_LENGTH ? undefined : 'string_length';
+        }
         if (typeof candidate === 'boolean')
-            return true;
-        if (typeof candidate === 'number')
-            return Number.isFinite(candidate);
+            return undefined;
+        if (typeof candidate === 'number') {
+            return Number.isFinite(candidate) ? undefined : 'non_finite_number';
+        }
         if (typeof candidate !== 'object')
-            return false;
+            return 'type';
         if (ancestors.has(candidate))
-            return false;
+            return 'cycle';
         if (Array.isArray(candidate)) {
             ancestors.add(candidate);
-            const valid = candidate.every((item) => visit(item, depth + 1));
+            for (let index = 0; index < candidate.length; index += 1) {
+                path.push(index);
+                const rule = visit(candidate[index], depth + 1);
+                if (rule)
+                    return rule;
+                path.pop();
+            }
             ancestors.delete(candidate);
-            return valid;
+            return undefined;
         }
         const prototype = Object.getPrototypeOf(candidate);
         if (prototype !== Object.prototype && prototype !== null)
-            return false;
+            return 'prototype';
         const descriptors = Object.getOwnPropertyDescriptors(candidate);
         ancestors.add(candidate);
-        for (const descriptor of Object.values(descriptors)) {
-            if (!('value' in descriptor) || !visit(descriptor.value, depth + 1)) {
-                ancestors.delete(candidate);
-                return false;
-            }
+        for (const [key, descriptor] of Object.entries(descriptors)) {
+            path.push(key);
+            if (!('value' in descriptor))
+                return 'accessor';
+            const rule = visit(descriptor.value, depth + 1);
+            if (rule)
+                return rule;
+            path.pop();
         }
         ancestors.delete(candidate);
-        return true;
+        return undefined;
     };
     try {
-        return visit(value, 0);
+        const rule = visit(value, 0);
+        return rule ? { rule, path: cloneViolationPath(path) } : undefined;
     }
     catch {
-        return false;
+        // A Proxy trap or similar threw while the value was read.
+        return { rule: 'type', path: cloneViolationPath(path) };
     }
+}
+export function isStrictStructuredCloneValue(value) {
+    return strictStructuredCloneViolation(value) === undefined;
+}
+const STRICT_STRUCTURED_CLONE_RULE_TEXT = {
+    depth: `result nesting exceeds ${MAX_CLONE_DEPTH} levels`,
+    nodes: `result has more than ${MAX_CLONE_NODES} values`,
+    string_length: `result has a string longer than ${MAX_CLONE_STRING_LENGTH} characters`,
+    non_finite_number: 'result has a non-finite number (NaN or Infinity)',
+    prototype: 'result has a non-plain object',
+    cycle: 'result has a circular reference',
+    accessor: 'result has an accessor property',
+    type: 'result has an unsupported value type',
+};
+/**
+ * The `detail` of an `invalid_result` Browser broker error: which broker limit
+ * the result broke and where, plus how to read the page in smaller parts. It
+ * is a complete `reason Next: next` message, so the Utility client shows it
+ * instead of the bare fixed message. Only rule text and key/index paths.
+ */
+export function browserInvalidResultDetail(violation) {
+    return `${BROWSER_ERROR_MESSAGES.invalid_result}: ${STRICT_STRUCTURED_CLONE_RULE_TEXT[violation.rule]} at ${violation.path}. Next: Read a smaller part of the page instead of repeating this call: query kind "text" or "rows" with a selector, or query kind "semantic" with more specific text.`;
 }
 export function isStrictStructuredCloneRecord(value) {
     return isRecord(value) && !Array.isArray(value) && isStrictStructuredCloneValue(value);
@@ -397,6 +486,8 @@ export function isUtilityStatusMessage(value) {
             return isWorkspaceIndexingObservationMessage(value);
         case 'runtime-power-demand':
             return hasMessageKeys(value, ['type', 'active']) && typeof value.active === 'boolean';
+        case 'runtime-network-fallback-unhealthy':
+            return hasMessageKeys(value, ['type', 'origin']) && isNetworkProbeOrigin(value.origin);
         case 'runtime-database-migration':
             return (hasMessageKeys(value, ['type', 'event']) && isDatabaseMigrationObservation(value.event));
         case 'runtime-bootstrap-progress':
@@ -450,6 +541,8 @@ export let BROWSER_BROKER_ACTIONS = [
     'paste',
     'verify_text',
     'inspect_editable_targets',
+    /** One page op of a Browser program (internal, never a model action). */
+    'program_op',
 ];
 const BROWSER_ACTIONS = new Set(BROWSER_BROKER_ACTIONS);
 export function isBrowserBrokerAction(value) {
@@ -464,9 +557,11 @@ export function isBrowserBrokerRequestMessage(value) {
         return false;
     if (!isRecord(value.context) || Array.isArray(value.context))
         return false;
-    if (!hasMessageKeys(value.context, ['sessionId', 'turnId'], ['toolCallId', 'browserAssets'])) {
+    if (!hasMessageKeys(value.context, ['sessionId', 'turnId'], ['toolCallId', 'browserAssets', 'ephemeral'])) {
         return false;
     }
+    if (value.context.ephemeral !== undefined && value.context.ephemeral !== true)
+        return false;
     if (typeof value.context.sessionId !== 'string' || value.context.sessionId.length === 0) {
         return false;
     }
@@ -522,39 +617,46 @@ export let BROWSER_ERROR_MESSAGES = {
     background_render_operation_timeout: 'Background Browser action timed out',
     background_render_queue_timeout: 'Background Browser render queue wait timed out',
     browser_unavailable: 'Browser broker is unavailable',
-    current_tab_occupied: 'CURRENT_TAB_OCCUPIED: Current Browser tab already has a loaded page; retry with open_tab, or set replaceCurrentTab=true only when the user explicitly asked to reuse the current tab',
+    browser_user_takeover: 'BROWSER_USER_TAKEOVER: The user has taken over the browser. Stop browser actions for this turn. In your reply, tell the user in plain words which step you stopped at and what they can do next, then end the turn; do not call ask_user to ask whether to continue (its answer does not return control). Do not retry or reacquire control in this turn; you can continue after the user sends a new message.',
+    current_tab_occupied: 'CURRENT_TAB_OCCUPIED: This tab is a Mini App; navigate cannot replace its page. For a page inside the app, click its links or use the miniapp open action with a path; for any other web page, use open_tab { url }.',
     duplicate_request: 'Duplicate Browser broker request',
     frame_coordinates_unavailable: 'FRAME_COORDINATES_UNAVAILABLE: Browser cannot safely address this frame by viewport coordinates; inspect the current page and choose a main-frame target',
+    // Error triples (`CODE: reason Next: next`, Browser Core browser-errors.ts).
+    invalid_element_ref: 'INVALID_ELEMENT_REF: The element ref was not issued by this Browser session. Next: Copy a ref exactly from the latest inspect or query output; inspect again if none fits.',
     invalid_request: 'Invalid Browser broker request',
     invalid_result: 'Invalid Browser broker result',
     browser_page_unavailable: 'BROWSER_PAGE_UNAVAILABLE: Open or inspect an HTTP(S) page in the current Browser tab before using run_script',
     miniapp_capacity_busy: 'MINIAPP_CAPACITY_BUSY: The device has reached its running Mini App limit. Ask which app the user wants to stop before retrying open_tab.',
     miniapp_busy: 'MINIAPP_BUSY: Another Mini App operation is in progress. Wait before retrying open_tab.',
     miniapp_unavailable: 'MINIAPP_UNAVAILABLE: Check the Mini App lifecycle status before retrying open_tab.',
-    miniapp_tab_asleep: 'MINIAPP_TAB_ASLEEP: The selected Mini App tab is asleep to save memory; reopen it with the miniapp tool before using Browser on it',
+    miniapp_tab_asleep: 'MINIAPP_TAB_ASLEEP: The selected Mini App tab is asleep to save memory; reopen it with open_tab { miniAppId } before using Browser on it',
     snapshot_continuation_mismatch: 'SNAPSHOT_CONTINUATION_MISMATCH: Continue with the exact nextOffset returned by Browser',
     snapshot_kind_mismatch: 'SNAPSHOT_KIND_MISMATCH: Continue the observation with its original Browser action',
     stale_element_ref: 'STALE_ELEMENT_REF: Browser target expired; inspect the current page again',
     stale_snapshot: 'STALE_SNAPSHOT: Browser observation expired; inspect the current page again',
+    subagent_tab_not_retainable: "SUBAGENT_TAB_NOT_RETAINABLE: A sub-Agent's pages close when it ends and cannot be kept; report back so the main Agent opens the page for the user",
+    tab_not_controlled: 'TAB_NOT_CONTROLLED: No tab is under Agent control for this action. Call list_tabs, then select_tab an existing tab or open_tab a new one before page-changing actions.',
+    unverified_write_retry: 'UNVERIFIED_WRITE_RETRY: This write repeats an earlier write on the same target whose result was uncertain, and the page has not been read since; it did not run. Next: Read the page first (inspect, query or screenshot) and check whether the earlier action took effect; to repeat it on purpose, call the action again with input.confirmRetry: true.',
 };
+const BROWSER_ERROR_CODES = new Set(Object.keys(BROWSER_ERROR_MESSAGES));
 export function isBrowserBrokerErrorMessage(value) {
     return (isRecord(value) &&
         value.type === 'browser-error' &&
         hasMessageKeys(value, ['type', 'requestId', 'code', 'message'], ['label', 'timeoutMs', 'detail']) &&
         isSafeBrokerRequestId(value.requestId) &&
         typeof value.code === 'string' &&
-        Object.prototype.hasOwnProperty.call(BROWSER_ERROR_MESSAGES, value.code) &&
+        BROWSER_ERROR_CODES.has(value.code) &&
         value.message === BROWSER_ERROR_MESSAGES[value.code] &&
-        (value.detail === undefined ||
-            (typeof value.detail === 'string' &&
-                value.detail.length > 0 &&
-                value.detail.length <= BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH)) &&
         (value.label === undefined ||
             (typeof value.label === 'string' && value.label.length > 0 && value.label.length <= 200)) &&
         (value.timeoutMs === undefined ||
             (typeof value.timeoutMs === 'number' &&
                 Number.isFinite(value.timeoutMs) &&
-                value.timeoutMs > 0)));
+                value.timeoutMs > 0)) &&
+        (value.detail === undefined ||
+            (typeof value.detail === 'string' &&
+                value.detail.length > 0 &&
+                value.detail.length <= BROWSER_BROKER_ERROR_DETAIL_MAX_LENGTH)));
 }
 export function isDiagnosticsBrokerRequestMessage(value) {
     return (isRecord(value) &&

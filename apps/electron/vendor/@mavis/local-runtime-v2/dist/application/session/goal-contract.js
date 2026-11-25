@@ -22,6 +22,7 @@
  *    unrestricted.
  */
 import { validateThreadGoalObjective, } from '@mavis/goal';
+import { isLegacyAssetNodeId } from '@mavis/shared/drive-assets';
 import { GOAL_VERIFIER_SESSION_FORBIDDEN, globalEffectiveLimits, globalOwnLimits, globalUsageRecovery, } from '../../service/goal/index.js';
 const VALID_STATUSES = new Set([
     'active',
@@ -73,8 +74,14 @@ export function goalStateToGoalState(state, effectiveLimits) {
                 attachmentType: resource.type,
                 fileName: resource.fileName,
                 mimeType: resource.mimeType,
+                ...(resource.sizeBytes !== undefined ? { sizeBytes: resource.sizeBytes } : {}),
             },
-            local: { assetId: resource.assetId, filePath: resource.filePath },
+            local: {
+                assetId: resource.assetId,
+                filePath: resource.filePath,
+                ...(resource.driveNodeId ? { driveNodeId: resource.driveNodeId } : {}),
+                ...(resource.drivePath ? { drivePath: resource.drivePath } : {}),
+            },
         })),
         status: state.status,
         createdAt: state.createdAt,
@@ -364,6 +371,9 @@ function mapObjectiveResources(inputs) {
     });
 }
 function toKickoffAttachment(input) {
+    const reference = toAssetReferenceAttachment(input);
+    if (reference)
+        return reference;
     const dataUrl = trimmedOrUndefined(input.local?.dataUrl);
     const assetId = trimmedOrUndefined(input.local?.assetId);
     const sourcePath = kickoffSourcePath(input.local, assetId, dataUrl);
@@ -377,6 +387,42 @@ function toKickoffAttachment(input) {
         ...(dataUrl ? { dataUrl } : {}),
         ...(assetId ? { assetId } : {}),
     };
+}
+/**
+ * A native asset library item is a reference only: no local copy is persisted
+ * and any source the caller still sends is ignored; the agent downloads the
+ * item when it needs the contents. A legacy `cs_` item stays an ordinary
+ * attachment.
+ */
+function toAssetReferenceAttachment(input) {
+    // Remote Control carries the node as a cloud identity.
+    const driveNodeId = trimmedOrUndefined(input.local?.driveNodeId) ?? trimmedOrUndefined(input.cloud?.driveNodeId);
+    if (!driveNodeId || isLegacyAssetNodeId(driveNodeId))
+        return undefined;
+    const drivePath = trimmedOrUndefined(input.local?.drivePath);
+    const meta = input.meta ?? {};
+    const mimeType = trimmedOrUndefined(meta.mimeType) ?? '';
+    const type = assetReferenceType(meta.attachmentType, mimeType);
+    return {
+        type,
+        filePath: '',
+        fileName: trimmedOrUndefined(meta.fileName) ?? drivePath?.split('/').pop() ?? '',
+        mimeType: type === 'folder' ? '' : mimeType,
+        driveNodeId,
+        ...(drivePath ? { drivePath } : {}),
+        ...assetReferenceSize(type, meta.sizeBytes),
+    };
+}
+/** Folders never carry a size. */
+function assetReferenceSize(type, sizeBytes) {
+    if (type === 'folder' || !Number.isSafeInteger(sizeBytes) || (sizeBytes ?? -1) < 0)
+        return {};
+    return { sizeBytes };
+}
+function assetReferenceType(attachmentType, mimeType) {
+    if (attachmentType === 'folder')
+        return 'folder';
+    return attachmentType === 'image' || mimeType.startsWith('image/') ? 'image' : 'file';
 }
 /**
  * `filePath` is also used as a display-oriented placeholder by clipboard and

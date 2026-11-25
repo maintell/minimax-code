@@ -1,3 +1,4 @@
+import { sanitizeScreenCapturePayload } from "./screen-capture";
 import { readFileSync, existsSync, renameSync, unlinkSync, statSync, writeFileSync, mkdirSync, appendFileSync } from "node:fs";
 import { sanitizeBrowserTelemetryPayload } from "./browser-telemetry-sanitizer";
 import path from "node:path";
@@ -99,6 +100,7 @@ const UTILITY_RUNTIME_REASON_CODES = new Set([
     'memory_pressure',
     'runtime_unresponsive',
     'oom',
+    'network_service_lost',
     // Supervisor gave up on an already-ready runtime (crash-loop breaker).
     'crash_loop',
     'unknown',
@@ -229,6 +231,9 @@ function sanitizeHotUpdatePayload(payload) {
     return sanitized;
 }
 function sanitizeGenericProbePayload(eventName, payload) {
+    if (eventName === 'screen_capture_start' || eventName === 'screen_capture_result') {
+        return { ...safeCommonMetadata(payload), ...sanitizeScreenCapturePayload(eventName, payload) };
+    }
     if (eventName === 'workspace_indexing.state') {
         return { ...safeCommonMetadata(payload), ...sanitizeWorkspaceIndexingPayload(payload) };
     }

@@ -2,7 +2,7 @@ export { createComputerUsePortClient, createUnavailableComputerUseClient, comput
 export { abortAllComputerUse, isComputerUseEnabled, registerComputerUseAbortController, setComputerUseEnabled, snapshotComputerUseState, } from './state.js';
 export { buildComputerUseRuntimeTools, COMPUTER_USE_TOOL_NAMES } from './tools.js';
 export { createComputerUseTurnToolSafetyGuard, } from './policy.js';
-export { initializeComputerUseProductCapabilities, createComputerUsePluginCallbacks, deactivateComputerUsePlugin, isComputerUseReadyForQueuedTurn, restoreRuntimeComputerUsePreferences, } from './initialize.js';
+export { COMPUTER_USE_PLUGIN_ID, initializeComputerUseProductCapabilities, createComputerUsePluginCallbacks, deactivateComputerUsePlugin, isComputerUseReadyForQueuedTurn, restoreRuntimeComputerUsePreferences, } from './initialize.js';
 export { createComputerUsePreferenceStore } from './preferences.repository.js';
 export { createComputerUseDefaultPreference, ComputerUsePreferenceError, } from './default-preference.js';
 //# sourceMappingURL=index.js.map

@@ -20,14 +20,45 @@ export function applyEdit(current, oldString, newString, replaceAll) {
     const content = current.split(oldString).join(newString);
     return { content, replacements: replaceAll ? matches : 1 };
 }
+/**
+ * Whitespace separates search keywords. Agents routinely send several keywords in one
+ * query, which almost never appear verbatim as one substring, so each keyword is matched
+ * on its own.
+ */
+export function parseSearchTerms(query) {
+    return [...new Set(query.toLowerCase().split(/\s+/).filter(Boolean))];
+}
+/** Number of distinct terms (already lowercased) that occur in `text`, case-insensitively. */
+export function countMatchedTerms(text, terms) {
+    const lower = text.toLowerCase();
+    return terms.reduce((count, term) => (lower.includes(term) ? count + 1 : count), 0);
+}
+/**
+ * Highest score first; equal scores keep input order. Re-ranks matches merged from several
+ * memory sources, whose per-source order alone says nothing about the combined order.
+ */
+export function rankByScore(items, score) {
+    return items
+        .map((item) => ({ item, score: score(item) }))
+        .sort((a, b) => b.score - a.score)
+        .map(({ item }) => item);
+}
+/** Lines matching any keyword, most matched keywords first, file order within a tie. */
 export function searchLines(content, query) {
-    const lower = query.toLowerCase();
-    if (!lower)
+    const terms = parseSearchTerms(query);
+    if (terms.length === 0)
         return [];
     const lines = content.split(/\r?\n/);
-    return lines.flatMap((line, index) => line.toLowerCase().includes(lower)
-        ? [{ lineNumber: index + 1, line, context: lines.slice(Math.max(0, index - 1), index + 2) }]
-        : []);
+    return lines
+        .flatMap((line, index) => {
+        const score = countMatchedTerms(line, terms);
+        if (score === 0)
+            return [];
+        const context = lines.slice(Math.max(0, index - 1), index + 2);
+        return [{ score, result: { lineNumber: index + 1, line, context } }];
+    })
+        .sort((a, b) => b.score - a.score)
+        .map(({ result }) => result);
 }
 const TOPIC_HEADER_RE = /^---\ndescription: ([\s\S]*?)\n---\n\n/;
 export function parseTopic(content) {

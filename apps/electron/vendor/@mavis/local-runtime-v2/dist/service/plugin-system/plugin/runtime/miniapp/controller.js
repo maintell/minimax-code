@@ -42,6 +42,10 @@ export class PluginMiniAppPublicationController {
     bindMemory(coordinator) {
         this.memoryValue = coordinator;
     }
+    /** `EXTENSION_NAME_RESERVED` for the name of an installed official Plugin. */
+    assertPreviewNameAvailable(pluginName) {
+        return this.nameReservation.assertPreviewAvailable(pluginName);
+    }
     get participant() {
         return this.participantValue;
     }

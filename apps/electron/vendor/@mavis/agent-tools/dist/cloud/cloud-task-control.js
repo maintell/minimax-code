@@ -67,7 +67,7 @@ import { shellStorageFailure, withStorageFailure } from './storage-failure.js';
  * CloudTaskToolDef (single source of truth for the shared fields) minus the
  * `run_in_background` property.
  */
-const GATED_SYNC_TASK_DESCRIPTION = `Launch a cloud sub-agent to handle complex, multistep tasks autonomously.
+export const GATED_SYNC_TASK_DESCRIPTION = `Launch a cloud sub-agent to handle complex, multistep tasks autonomously.
 
 Use this for broad research, parallelizable investigation, or delegated implementation. Do not use it for targeted file reads, grep-style code searches, or work that is simpler to do directly.
 

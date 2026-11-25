@@ -70,6 +70,7 @@ export function exposeElement(element, viewport, frameRef) {
             key.slice(0, MAX_EXPOSED_ATTRIBUTE_KEY_LENGTH),
             value.slice(0, MAX_EXPOSED_ATTRIBUTE_VALUE_LENGTH),
         ])),
+        ...element.formState,
         ...(element.frameId && frameRef ? { frame: frameRef } : {}),
         ...(element.parentRegionPath
             ? {

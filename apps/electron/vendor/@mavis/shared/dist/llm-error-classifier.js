@@ -21,6 +21,7 @@
  * retry decisions, protocol codes and retry events never carry it. Only the
  * failure metrics read it, through {@link toLLMFailureErrorKind}.
  */
+import { byokProviderErrorDetail } from './byok-error-attribution.js';
 import { classifyLocalResourceError, } from './local-resource-errors.js';
 import { USER_SEND_RESTRICTED_ERROR_CODE } from './platform-error-codes.js';
 export const LLM_ERROR_REASONS = [
@@ -61,39 +62,28 @@ export function isLLMTransportRetryReason(reason) {
  *   reports `invalid_prompt` as the error code, and gateways that flatten the body into prose keep
  *   the usage-policy sentence. Resending the identical prompt is rejected again, so this must not
  *   be retried either.
+ * - Reseller proxies in front of a Messages-API provider decline on their own usage-policy check
+ *   and report `content_policy_rejected`, wrapping it in prose such as `<model> refused this
+ *   request (safety filter: …)` or `blocked by <vendor>'s usage policy check`. The decline depends
+ *   on the prompt alone, so switching models does not get past it and retrying is pointless. Prose
+ *   that only says a request was refused stays unclassified; a policy marker has to accompany it.
  */
 const PROVIDER_REFUSAL_MESSAGE_RES = [
     /\bstop_reason:\s*refusal\b/i,
     /\bflagged as potentially violating our usage policy\b/i,
     /["'](?:code|type)["']\s*:\s*["'](?:invalid_prompt|content_policy_violation)["']/i,
     /^(?:(?:\[Error\]|Error:)\s*)?(?:[45]\d\d[: ]\s*)?(?:invalid_prompt|content_policy_violation)(?:\s*:|\s*$)/i,
+    /\bcontent_policy_rejected\b/i,
+    /\brefused this request\b[\s\S]{0,200}?\b(?:safety|policy|moderation|content[_ ]?filter)\b/i,
+    /\bblocked by\b[\s\S]{0,80}?\busage policy\b/i,
 ];
 /** True when an LLM error message reports a provider safety refusal; it must not be retried. */
 export function isLLMProviderRefusalMessage(message) {
     if (typeof message !== 'string')
         return false;
-    const detail = providerErrorDetail(message);
+    // BYOK attribution names a user-chosen provider id, which is not an error signal.
+    const detail = byokProviderErrorDetail(message);
     return (detail !== undefined && PROVIDER_REFUSAL_MESSAGE_RES.some((pattern) => pattern.test(detail)));
-}
-/** BYOK attribution contains user-chosen provider IDs, which are not error signals. */
-function providerErrorDetail(message) {
-    let detail = message.trim();
-    const prefix = 'BYOK upstream error:';
-    if (detail.startsWith(prefix)) {
-        // Error extraction may truncate the envelope after its first message field.
-        // Decode complete string fields without requiring the trailing JSON to survive.
-        const encodedDetail = detail.match(/"errorDetail"\s*:\s*("(?:[^"\\]|\\.)*")/u)?.[1] ??
-            detail.match(/"message"\s*:\s*("(?:[^"\\]|\\.)*")/u)?.[1];
-        if (!encodedDetail)
-            return undefined;
-        try {
-            detail = JSON.parse(encodedDetail);
-        }
-        catch {
-            return undefined;
-        }
-    }
-    return (detail.match(/^BYOK provider .+? upstream error:\s*([\s\S]*)$/u)?.[1] ?? detail).trim();
 }
 /**
  * pi-ai's Messages stream completeness guard for a provider stream that ended
@@ -152,13 +142,38 @@ const CHROMIUM_TIMEOUT_MESSAGE_RE = /\bnet::ERR_(?:TIMED_OUT|CONNECTION_TIMED_OU
 // failures: those can also describe cancellation or application errors. The
 // Messages `without message_start` / `before message_stop` guards keep their
 // own (unclassified) handling, like `without stop_reason` above.
-const STREAM_DISCONNECT_MESSAGE_RE = /\b(?:UND_ERR_SOCKET|ERR_STREAM_PREMATURE_CLOSE|socket hang up)\b|\bstream ended without any message events\b|\bStream ended without finish_reason\b|\bWebSocket stream closed before response\.completed\b/i;
+const STREAM_DISCONNECT_MESSAGE_RE = /\b(?:UND_ERR_SOCKET|ERR_STREAM_PREMATURE_CLOSE|socket hang up)\b|\bstream ended without any message events\b|\bStream ended without (?:a finish reason|finish_reason)\b|\bWebSocket stream closed before response\.completed\b/i;
 /**
  * Provider rejected the request for carrying too many images, e.g.
- * `Too many images in request: 31 > 30` (#425). Re-sending the same history
+ * `Too many images in request: 31 > 30` (#425) or Hunyuan's
+ * `InvalidParameter.ImageCountLimitExceededError`. Re-sending the same history
  * always fails again, so this is never a transient condition.
  */
-const LLM_IMAGE_LIMIT_MESSAGE_RE = /\btoo many images\b|\b(?:max|maximum) (?:number of |of \d+ )?images\b|\bnumber of images\b[^.]{0,40}\bexceed|\bimages? (?:count |limit )?exceed(?:s|ed)?\b|\bat most \d+ images?\b/i;
+const LLM_IMAGE_LIMIT_MESSAGE_RE = /\btoo many images\b|\b(?:max|maximum) (?:number of |of \d+ )?images\b|\bnumber of images\b[^.]{0,40}\bexceed|\bimages? (?:count |limit )?exceed(?:s|ed)?\b|\bat most \d+ images?\b|\bImageCountLimitExceeded/i;
+/**
+ * MiniMax's rejection of one image or video block it cannot or will not take
+ * (`invalid params` / `invalid param`, code 2013), in the gateway's own words:
+ * - its decoder failed and it names nothing: `invalid params, 400 (2013)` for a
+ *   video (a sample table pointing past the file, no video track, no
+ *   keyframe), `invalid params, 410 (2013)` for an image with a 2px edge;
+ * - the bytes are not readable media: `invalid param: invalid video content: run
+ *   ffprobe: exit status 1 (2013)`, `invalid image content: decode image config:
+ *   ... (2013)`;
+ * - the format is not allowed: `invalid param: video format ".webm" not allowed
+ *   (2013)`, `image format ".bmp" not allowed (2013)`;
+ * - the block breaks a rule: `invalid params, messages[0]'s content[0] video's
+ *   duration is bigger than 1800 seconds, please check your input (2013)`,
+ *   `... image's aspect ratio exceeds 200:1 ...`.
+ * The same media is rejected on every resend; the request goes through without
+ * it. Context overflow (`context window exceeds limit (2013)`) names no media and
+ * a media count limit is read by {@link parseLLMMediaCountLimitMessage}.
+ */
+const LLM_MEDIA_CONTENT_REJECTION_MESSAGE_RES = [
+    /\binvalid params?,\s*\d{3}\s*\(2013\)/i,
+    /\binvalid params?\b[^()]{0,300}?\b(?:video|image)(?:'s|s)?\b[^()]{0,300}?\(2013\)/i,
+];
+/** MiniMax: `invalid params, the num of video is larger than the limit:  20 (2013)`. */
+const LLM_MEDIA_COUNT_LIMIT_MESSAGE_RE = /\bthe num of (video|image)s? is larger than the limit:\s*(\d+)/i;
 /** Common provider error type for a request the provider will never accept as sent. */
 const LLM_INVALID_REQUEST_MESSAGE_RE = /\binvalid_request_error\b/i;
 /**
@@ -172,25 +187,70 @@ const LLM_INVALID_ARGUMENT_MESSAGE_RE = /\binvalid_argument\b|\bthere is an issu
  * (`request_too_large`, "Request Entity Too Large", "Payload Too Large"), the
  * local pre-send check (`Request body too large: N bytes exceeds client limit`),
  * gateway rewrites (AWSB's "Input is too long."), a 413 a gateway reports inside
- * another status, and per-image size or dimension limits. The same request is
- * rejected again on every resend; fewer or smaller images may fit.
+ * another status, a body length limit (http-body's `length limit exceeded`;
+ * axum answers `Failed to buffer the request body: length limit exceeded` with a
+ * 400 when the limit error reaches it wrapped), each provider's own body, field
+ * or attachment limit below, and per-image size or dimension limits. The same
+ * request is rejected again on every resend; fewer or smaller images may fit.
  */
 const LLM_REQUEST_TOO_LARGE_MESSAGE_RES = [
-    /\brequest_too_large\b|\bREQUEST_BODY_TOO_LARGE\b/i,
+    // OpenRouter reports the same limits as `payload_too_large` / `image_too_large`.
+    /\brequest_too_large\b|\bREQUEST_BODY_TOO_LARGE\b|\bpayload_too_large\b|\bimage_too_large\b/i,
     /\brequest entity too large\b|\bpayload too large\b/i,
     /\binput is too long\b/i,
     /\b(?:request|body)(?: body)? (?:is )?too large\b/i,
     /\bexceeds? (?:the )?max(?:imum)? (?:allowed )?(?:request |body |payload )?size\b/i,
+    /\blength limit exceeded\b/i,
+    // Gemini API / Vertex AI: `Request payload size exceeds the limit: 20971520 bytes.`
+    /\brequest payload size exceeds the limit\b/i,
+    // Tencent Cloud API (Hunyuan): `RequestSizeLimitExceeded`, `Your current request size exceed max 10485760B`.
+    /\bRequestSizeLimitExceeded\b|\brequest size exceeds? max\b/i,
+    // Kimi: `total message size 5943865 exceeds limit 2097152`.
+    /\btotal message size \d+ exceeds limit\b/i,
+    // OpenAI per-field limit on message content (not the `user` field):
+    // `Invalid 'messages[1].content': string too long. Expected a string with maximum length ...`.
+    /\binvalid '(?:messages|input)\b[^']*': string too long\b/i,
     /\b413\b/,
     /\bimages? (?:exceeds?|is too large|too large)\b/i,
     /\bimage dimensions? exceeds?\b/i,
+    // DashScope (Qwen-VL): `Exceeded limit on max bytes per data-uri item : 10485760`, `Multimodal file size is too large`.
+    /\bexceeded limit on max bytes per data-uri item\b|\bmultimodal file size is too large\b/i,
+    // Azure OpenAI: `The image size must be greater than zero and cannot exceed 20971520 bytes.`;
+    // OpenAI: `You uploaded an unsupported image. Please make sure your image is below 20 MB in size`.
+    /\bimage size must be greater than zero and cannot exceed\b|\bimage is below \d+ ?MB\b/i,
+    // Messages API: `A maximum of 100 PDF pages may be provided.`
+    /\bmaximum of \d+ PDF pages\b/i,
 ];
 /**
- * The prompt is over the model context window. Kept to unambiguous provider
- * shapes; MiniMax reports it as `invalid params, context window exceeds limit
- * (2013)`, so the bare 2013 code (a generic invalid-params code) is not used.
+ * The prompt is over the model context window, in each provider's wording.
+ * Kept to unambiguous shapes: bare provider codes (MiniMax 2013, Zhipu 1261 and
+ * 1210) are generic invalid-params codes and are not read on their own.
  */
-const LLM_CONTEXT_OVERFLOW_MESSAGE_RE = /\bprompt is too long\b|\bcontext window exceeds limit\b|\bexceeds the context window\b|\bmaximum context length\b|\binput is too long for requested model\b|\bcontext[_ ]length[_ ]exceeded\b|\bmodel_context_window_exceeded\b/i;
+const LLM_CONTEXT_OVERFLOW_MESSAGE_RES = [
+    // Messages API: `prompt is too long: N tokens > M maximum`, `input length and `max_tokens` exceed context limit: ...`.
+    /\bprompt is too long\b|\bexceeds? (?:the )?context limit\b/i,
+    // MiniMax: `invalid params, context window exceeds limit (2013)`.
+    /\bcontext window exceeds limit\b/i,
+    // OpenAI: `Your input exceeds the context window of this model`, `Input tokens exceed the configured limit of 272000 tokens`.
+    /\bexceeds the context window\b|\binput tokens exceed the configured limit\b/i,
+    // OpenAI / DeepSeek / OpenRouter: `This model's maximum context length is N tokens`.
+    /\bmaximum context length\b|\bmodel'?s maximum context limit\b/i,
+    // Bedrock: `Input is too long for requested model.`; Bedrock Mantle: `prompt tokens (N) exceed model maximum (M)`.
+    /\binput is too long for requested model\b|\bprompt tokens \(\d+\) exceed model maximum\b/i,
+    /\bcontext[_ ]length[_ ]exceeded\b|\bmodel_context_window_exceeded\b/i,
+    // Gemini API: `The input token count (N) exceeds the maximum number of tokens allowed (M).`;
+    // Vertex AI: `Unable to submit request because the input token count is N but model only supports up to M.`
+    /\bexceeds the maximum number of tokens allowed\b|\binput token count is \d+ but model only supports up to\b/i,
+    // Kimi: `Your request exceeded model token limit: N`, `k3-256k supports only 256K context.`, `model max length exceeded`.
+    /\bexceeded model token limit\b|\bsupports only \d+k context\b|\bmodel max length exceeded\b/i,
+    // Zhipu / Z.AI: `Prompt exceeds max length` and `Prompt 超长` (1261), Coding Plan
+    // `tokens in request more than max tokens allowed` (1210).
+    /\bprompt exceeds max(?:imum)? length\b|prompt\s*超长|\btokens in request more than max tokens allowed\b/i,
+    // DashScope (Qwen): `Range of input length should be [1, N]`, `Total message token length exceed model limit`.
+    /\brange of input length should be\b|\btotal message token length exceeds? model limit\b/i,
+    // Together: `is longer than the model's context length`; llama.cpp: `exceeds the available context size`.
+    /\bis longer than the model'?s context length\b|\bexceeds the available context size\b/i,
+];
 const LLM_USAGE_LIMIT_UPSTREAM_STATUS_CODES = [2056, 2067];
 const LLM_USAGE_LIMIT_UPSTREAM_STATUS_CODE_SET = new Set(LLM_USAGE_LIMIT_UPSTREAM_STATUS_CODES);
 const LLM_USAGE_LIMIT_UPSTREAM_STATUS_CODE_RE = /\b(?:2056|2067)\b/u;
@@ -300,7 +360,7 @@ export function normalizeLLMError(input) {
                 signals.add('invalid_argument');
             if (isLLMRequestTooLargeMessage(boundedVisible))
                 signals.add('request_too_large');
-            if (LLM_CONTEXT_OVERFLOW_MESSAGE_RE.test(boundedVisible))
+            if (isLLMContextOverflowMessage(boundedVisible))
                 signals.add('context_overflow');
         }
         applyNumericSignals(facts, signals);
@@ -318,6 +378,37 @@ export function isLLMImageLimitMessage(message) {
     return typeof message === 'string' && LLM_IMAGE_LIMIT_MESSAGE_RE.test(message);
 }
 /**
+ * True when MiniMax rejected an image or video block the request carries for
+ * its content, format or a per-block rule (see
+ * {@link LLM_MEDIA_CONTENT_REJECTION_MESSAGE_RES}). Only the wording is read:
+ * a caller acts on it only for a request that carries media. A request over a
+ * size limit (`invalid params, 413 (2013)`) is not a rejection of one block:
+ * {@link isLLMRequestTooLargeMessage} reads it.
+ */
+export function isLLMMediaContentRejectionMessage(message) {
+    if (typeof message !== 'string' || !message)
+        return false;
+    if (LLM_MEDIA_COUNT_LIMIT_MESSAGE_RE.test(message))
+        return false;
+    if (isLLMContextOverflowMessage(message))
+        return false;
+    if (isLLMRequestTooLargeMessage(message))
+        return false;
+    return LLM_MEDIA_CONTENT_REJECTION_MESSAGE_RES.some((pattern) => pattern.test(message));
+}
+/** The media count MiniMax said one request may carry, when it rejected one for carrying more. */
+export function parseLLMMediaCountLimitMessage(message) {
+    if (typeof message !== 'string')
+        return undefined;
+    const match = LLM_MEDIA_COUNT_LIMIT_MESSAGE_RE.exec(message);
+    if (!match?.[1] || !match[2])
+        return undefined;
+    const limit = Number(match[2]);
+    if (!Number.isSafeInteger(limit) || limit < 0)
+        return undefined;
+    return { media: match[1].toLowerCase() === 'image' ? 'image' : 'video', limit };
+}
+/**
  * True when an LLM error message reports a request over a size limit. Retry
  * classification and request media recovery both read it, so a rejection is
  * either recovered at once or not treated as a size rejection at all.
@@ -328,6 +419,15 @@ export function isLLMRequestTooLargeMessage(message) {
         return false;
     return (typeof message === 'string' &&
         LLM_REQUEST_TOO_LARGE_MESSAGE_RES.some((pattern) => pattern.test(message)));
+}
+/**
+ * True when an LLM error message reports a prompt over the model context
+ * window. Request media recovery and the checkpoint candidate ladder read it
+ * next to Pi's `isContextOverflow`, whose patterns miss several providers.
+ */
+export function isLLMContextOverflowMessage(message) {
+    return (typeof message === 'string' &&
+        LLM_CONTEXT_OVERFLOW_MESSAGE_RES.some((pattern) => pattern.test(message)));
 }
 /**
  * Classify a flattened error message (no structured HTTP status available, as
@@ -772,7 +872,7 @@ function applyMessageSignals(message, facts, signals) {
         signals.add('invalid_argument');
     if (isLLMRequestTooLargeMessage(message))
         signals.add('request_too_large');
-    if (LLM_CONTEXT_OVERFLOW_MESSAGE_RE.test(message))
+    if (isLLMContextOverflowMessage(message))
         signals.add('context_overflow');
     const hasStructuredError = facts.existingProtocolCode !== undefined || effectiveHttpStatus(facts) !== undefined;
     if (!hasStructuredError && /\b(content.?filter|content.?policy|safety|blocked)\b/i.test(message))

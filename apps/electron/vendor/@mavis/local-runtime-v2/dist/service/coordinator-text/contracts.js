@@ -87,6 +87,4 @@ export const SEGMENT_SUMMARY_HEADINGS = [
     '等待中的事',
     '检索线索',
 ];
-/** The goal line of the system's own space, in the state block and in the handoff header. */
-export const SYSTEM_SPACE_GOAL = '系统自带，没有目标';
 //# sourceMappingURL=contracts.js.map

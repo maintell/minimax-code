@@ -1,6 +1,7 @@
 import { PiTurnRunner } from '@mavis/agent-core/pi-turn-runner';
 import { getRuntimeBuildEnv } from '@mavis/config';
 import { BpeTokenEstimator } from '@mavis/context-manager';
+import { ContextUsageTurnTracker, createContextUsageRuntime, withContextUsageEventWriter, } from '@mavis/harness';
 import { createDesktopErrorReporter, createLLMFailureReportHook, } from '../../../infra/error-reporting/index.js';
 import { createLocalTurnEventReporting } from '../file-changes/event-reporter.js';
 import { combineAbortSignals } from './abort-signals.js';
@@ -11,8 +12,6 @@ import { LocalOutputSafetyEventWriter } from '../safety/output-safety-writer.js'
 import { OUTPUT_REVISION_INSTRUCTION, OUTPUT_SAFETY_MAX_REGENERATIONS, } from '../safety/output-safety-policy.js';
 import { PI_TURN_RUNNER_LOGGER, withLlmResponseIdentifierLogging, } from './reporting/pi-turn-observability.js';
 import { runLocalRuntimeEvalTurn } from './reporting/host-eval.js';
-import { ContextUsageTurnTracker, withContextUsageEventWriter, } from '../context-usage/context-usage-turn-tracker.js';
-import { createContextUsageRuntime } from './context-usage-runtime.js';
 export { deriveLocalRuntimeTurnOutcome, } from './reporting/turn-outcome.js';
 const TOOL_CONTEXT_SIZE_ESTIMATOR = new BpeTokenEstimator();
 export class LocalRuntimeHost {

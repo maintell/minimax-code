@@ -1,6 +1,7 @@
 import { matchesMcpServerRuntimeName } from './mcp-runtime-name.js';
 import { hasWholeToolRule, isBypassMode, isInteractiveTool, } from './context.js';
 import { extractToolInputContent, matchesContentAskRule } from './content-ask-rule.js';
+import { decideMcpAllow, findMcpSubjectRule } from './mcp-rule-subject.js';
 /**
  * Production policy reducer used when Core owns the final decision. Existing
  * tool checkers keep their local ToolCheckResult interface; this reducer owns
@@ -8,7 +9,10 @@ import { extractToolInputContent, matchesContentAskRule } from './content-ask-ru
  */
 export function reducePermissionDecision(input) {
     const { toolName, context, checkerResult } = input;
-    const denyRule = hasWholeToolRule(context, toolName, 'deny') ?? findMcpServerRule(toolName, context, 'deny');
+    const subject = input.mcpRuleSubject;
+    const denyRule = hasWholeToolRule(context, toolName, 'deny') ??
+        findMcpServerRule(toolName, context, 'deny') ??
+        findMcpSubjectRule(subject, context, 'deny');
     if (denyRule)
         return { behavior: 'deny', reason: { type: 'rule', rule: denyRule } };
     // A tool/content checker deny is an explicit deny for this invocation. It
@@ -29,7 +33,7 @@ export function reducePermissionDecision(input) {
             rewrittenInput: checkerResult?.rewrittenInput,
         };
     }
-    const mcpAskRule = findMcpServerRule(toolName, context, 'ask');
+    const mcpAskRule = findMcpServerRule(toolName, context, 'ask') ?? findMcpSubjectRule(subject, context, 'ask');
     if (mcpAskRule) {
         return {
             behavior: 'ask',
@@ -100,13 +104,11 @@ export function reducePermissionDecision(input) {
             rewrittenInput: checkerResult?.rewrittenInput,
         };
     }
-    const allowRule = hasWholeToolRule(context, toolName, 'allow') ?? findMcpServerRule(toolName, context, 'allow');
-    if (allowRule) {
-        return {
-            behavior: 'allow',
-            reason: { type: 'rule', rule: allowRule },
-            rewrittenInput: checkerResult?.rewrittenInput,
-        };
+    const subjectAllow = decideMcpAllow(subject, context, (scope) => hasWholeToolRule(scope, toolName, 'allow') ?? findMcpServerRule(toolName, scope, 'allow'));
+    if (subjectAllow) {
+        return subjectAllow.behavior === 'allow'
+            ? { ...subjectAllow, rewrittenInput: checkerResult?.rewrittenInput }
+            : { ...subjectAllow, ruleContents: resolveRuleContents(toolName, input.input) };
     }
     if (checkerResult?.behavior === 'allow') {
         return {

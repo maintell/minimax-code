@@ -3,7 +3,7 @@ import { isAssignedByBunny } from '../../session-system/index.js';
 import { createProtectedRootDecisions } from '../../permission/index.js';
 import { PERMISSION_UNKNOWN_OWNER } from '../../coordinator-text/index.js';
 import { assignmentProtectedRoots, isProtectedSpacePath, } from './protected-paths.js';
-import { assignmentPermissionInput, isDefaultWorkspaceAssignment, isProjectApprovedAssignmentTool, withoutExecutionPlan, } from './tool-input.js';
+import { isDefaultWorkspaceAssignment, isProjectApprovedAssignmentTool, } from './tool-input.js';
 /**
  * Bunny's permission decisions on top of the ordinary MCode policy.
  *
@@ -29,13 +29,13 @@ function createOwnedAssignmentDecisions(readers, decisions, bunnyPermissionMode)
             const owner = session ? await readOwner(readers, session) : { owned: false };
             if (!owner.owned && !owner.unknown)
                 return decisions.check(request);
-            const owned = await readOwnership(readers, owner.owned ? session : undefined, assignmentPermissionInput(request), bunnyPermissionMode);
+            const owned = await readOwnership(readers, owner.owned ? session : undefined, request, bunnyPermissionMode);
             const unknownOwner = owner.unknown === true || owned.unknownOwner;
             const decision = await decisions.check(owned.input);
             // Bunny's own dispatch is never blocked; every other call keeps the
             // ordinary policy's answer untouched.
             const dispatch = await dispatchAllowance(request, { ...owned, unknownOwner }, decision, readers.localPermissionMode);
-            return ownedDecision(request, dispatch ?? decision, { ...owned, unknownOwner });
+            return ownedDecision(dispatch ?? decision, { ...owned, unknownOwner });
         },
     };
 }
@@ -96,17 +96,18 @@ async function readMode(read) {
     }
 }
 /** The ordinary policy's answer for a coordinator-owned Session, adjusted for its ownership. */
-function ownedDecision(request, decision, owned) {
-    const sameTool = owned.input.toolName === request.toolName;
+function ownedDecision(decision, owned) {
     if (owned.unknownOwner && decision.behavior === 'allow')
         return {
             behavior: 'ask',
             reason: PERMISSION_UNKNOWN_OWNER,
-            ...(sameTool && decision.executionPlan ? { executionPlan: decision.executionPlan } : {}),
+            ...(decision.executionPlan ? { executionPlan: decision.executionPlan } : {}),
         };
     if (owned.defaultAssignment && decision.behavior !== 'deny')
         return { behavior: 'allow', reason: 'Default workspace assignment' };
-    return sameTool ? decision : withoutExecutionPlan(decision);
+    // The decision was built for this very call: nothing rewrites an assignment
+    // tool's input into a `mavis` command any more, so its plan still matches.
+    return decision;
 }
 /**
  * Whether the Session is coordinator-owned. Only a Session with a parent reads
@@ -141,8 +142,7 @@ async function readOwnership({ sessions, tasks, resolveAssignmentProject }, sess
     const assignment = session
         ? await unless(() => tasks.get(session.sessionId), undefined)
         : undefined;
-    const defaultAssignment = mapped.toolName === 'mavis' &&
-        (await unless(() => isDefaultWorkspaceAssignment({ sessions, tasks, resolveProject: resolveAssignmentProject }, mapped.sessionId, mapped.toolInput), false));
+    const defaultAssignment = await unless(() => isDefaultWorkspaceAssignment({ sessions, tasks, resolveProject: resolveAssignmentProject }, mapped.sessionId, mapped.toolName, mapped.toolInput), false);
     const input = session
         ? await unless(() => withBunnyMode(session, assignment, mapped, bunnyPermissionMode), mapped)
         : mapped;

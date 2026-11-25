@@ -1,6 +1,8 @@
 import { MiniAppLaunchpadController } from './mini-app-launchpad.controller.js';
 import { BunnyController, } from './bunny.controller.js';
 import { AgentShellController } from './agent-shell.controller.js';
+import { MergeRequestController } from './merge-request.controller.js';
+import { MergeRequestControllerBase } from '../generated/merge-request-controller-base.gen.js';
 import { BackgroundTaskController } from './background-task.controller.js';
 import { SkillEvolveController, } from './skill-evolve.controller.js';
 import { SandboxControllerBase } from '../generated/sandbox-controller-base.gen.js';
@@ -21,6 +23,7 @@ import { createHookController } from './hook.controller.js';
 import { createModelProviderController, modelProviderController, } from './model-provider.controller.js';
 import { createPermissionController, permissionController } from './permission.controller.js';
 import { PinController } from './pin.controller.js';
+import { createPluginExtensionController, } from './plugin-extension.controller.js';
 import { PreferenceController, } from './preference.controller.js';
 import { PluginController, pluginController, } from './plugin.controller.js';
 import { ProjectController } from './project.controller.js';
@@ -63,9 +66,13 @@ export function createControllers(services) {
         agentShell: services.agentShell
             ? new AgentShellController(services.agentShell)
             : new AgentShellControllerBase(),
+        mergeRequest: services.mergeRequest && services.mergeRequestActions
+            ? new MergeRequestController(services.mergeRequest, services.mergeRequestActions)
+            : new MergeRequestControllerBase(),
         canvas: new CanvasController(services.canvas),
         events: createEventsController(services.globalEvents ?? CLOSED_GLOBAL_EVENTS),
         plugin: createPluginAdapter(services),
+        pluginExtension: createPluginExtensionController(services.pluginExtension),
         share: shareController,
         mcp: createMcpController(services.mcp, services.mcpRuntime, services.mcpAuth),
         hook: createHookController(services.hookConfig),
@@ -164,6 +171,7 @@ function createWorkspaceFileAdapter(services) {
             : {}),
         ...(services.workspace?.git ? { workspaceGit: services.workspace.git } : {}),
         ...(services.workspace?.file ? { workspaceFile: services.workspace.file } : {}),
+        ...(services.worktreeCleanup ? { worktreeCleanup: services.worktreeCleanup } : {}),
         ...(services.workspace?.localActions
             ? { workspaceLocalActions: services.workspace.localActions }
             : {}),

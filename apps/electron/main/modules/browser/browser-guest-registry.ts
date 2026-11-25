@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isAgentPointerActive, setAgentPointerListener } from "./webview-guest-input.js";
+import { detachDebuggerBeforeDestroy } from "./debugger-teardown.js";
 const ATTACH_TIMEOUT_MS = 10000;
 const LAYOUT_TIMEOUT_MS = 3000;
 export let WEBVIEW_HOST_CHANNELS = {
@@ -10,6 +11,7 @@ export let WEBVIEW_HOST_CHANNELS = {
     nativeReady: 'browser-webview:native-ready',
     interaction: 'browser-webview:interaction',
     agentPointer: 'browser-webview:agent-pointer',
+    takeOver: 'browser-webview:take-over',
 };
 function unavailable(reason) {
     return new Error(`BROWSER_WEBVIEW_UNAVAILABLE: ${reason}`);
@@ -180,6 +182,8 @@ export class BrowserGuestRegistry {
             clearTimeout(record.timer);
             record.guest = guest;
             this.guestOwners.set(guest, window);
+            // The page itself may run window.close(); its debugger must detach first.
+            detachDebuggerBeforeDestroy(guest);
             guest.once('destroyed', () => {
                 this.guestOwners.delete(guest);
                 this.remove(host, record, unavailable('guest destroyed'));
@@ -416,6 +420,33 @@ export class BrowserGuestRegistry {
                 finish(true);
             }
         });
+    }
+    /**
+     * Covers the guest with the host's control surface while the Agent controls
+     * it (or removes it). Published without a layout acknowledgement.
+     */
+    setAgentControlled(guest, controlled) {
+        for (const host of this.hosts.values()) {
+            for (const record of host.views.values()) {
+                if (record.guest !== guest)
+                    continue;
+                if ((record.descriptor.agentControlled === true) === controlled)
+                    return;
+                if (controlled)
+                    record.descriptor.agentControlled = true;
+                else
+                    delete record.descriptor.agentControlled;
+                record.descriptor.revision += 1;
+                this.publish(host);
+                return;
+            }
+        }
+    }
+    /** The guest a host document's view id names, or null for a foreign or stale id. */
+    guestForView(contents, id) {
+        if (typeof id !== 'string')
+            return null;
+        return this.hosts.get(contents)?.views.get(id)?.guest ?? null;
     }
     /** Tells the guest's host document that Agent pointer input is about to press. */
     announceAgentPointer(guest) {

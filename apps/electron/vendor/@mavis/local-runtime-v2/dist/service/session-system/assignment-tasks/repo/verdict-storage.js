@@ -4,11 +4,13 @@ export function verdictFactsOf(assignment) {
     const reviewTask = assignment?.reviewTask;
     const verdict = assignment?.verdict;
     const verdictClaim = assignment?.verdictClaim;
+    const verdictGateReleased = assignment?.verdictGateReleased;
     const reviewOf = assignment?.reviewOf;
     return {
         ...(reviewTask ? { reviewTask: { ...reviewTask } } : {}),
         ...(verdict ? { verdict } : {}),
         ...(verdictClaim ? { verdictClaim: { ...verdictClaim } } : {}),
+        ...(verdictGateReleased ? { verdictGateReleased: { ...verdictGateReleased } } : {}),
         ...(reviewOf ? { reviewOf: { ...reviewOf } } : {}),
     };
 }
@@ -17,6 +19,7 @@ export function readVerdictFacts(value) {
     const reviewTask = Reflect.get(value, 'reviewTask');
     const verdict = Reflect.get(value, 'verdict');
     const verdictClaim = Reflect.get(value, 'verdictClaim');
+    const verdictGateReleased = Reflect.get(value, 'verdictGateReleased');
     const reviewOf = Reflect.get(value, 'reviewOf');
     return {
         ...(reviewTask === undefined ? {} : { reviewTask: readReviewTask(reviewTask) }),
@@ -24,6 +27,9 @@ export function readVerdictFacts(value) {
             ? {}
             : { verdict: readVerdict(verdict, 'task.details_set.verdict') }),
         ...(verdictClaim === undefined ? {} : { verdictClaim: readVerdictClaim(verdictClaim) }),
+        ...(verdictGateReleased === undefined
+            ? {}
+            : { verdictGateReleased: readGateRelease(verdictGateReleased) }),
         ...(reviewOf === undefined ? {} : { reviewOf: readReviewOf(reviewOf) }),
     };
 }
@@ -54,6 +60,15 @@ function readVerdictClaim(value) {
         revision < 1)
         throw new Error('task.details_set.verdictClaim is malformed');
     return { by, at, revision };
+}
+/** A released gate; the review it belonged to and when it was released are both required. */
+function readGateRelease(value) {
+    const field = (key) => typeof value === 'object' && value !== null ? Reflect.get(value, key) : undefined;
+    const reviewTaskId = field('reviewTaskId');
+    const at = field('at');
+    if (typeof reviewTaskId !== 'string' || !reviewTaskId || typeof at !== 'number')
+        throw new Error('task.details_set.verdictGateReleased is malformed');
+    return { reviewTaskId, at };
 }
 /** What a review task was asked to check; the Session is required, the report optional. */
 function readReviewOf(value) {

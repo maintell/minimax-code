@@ -1,4 +1,4 @@
-import { composeStreamFn, withLLMRetry, } from '@mavis/agent-core/pi-turn-runner';
+import { composeStreamFn, parseContentReviewError, withLLMRetry, } from '@mavis/agent-core/pi-turn-runner';
 import { defineRuntimeTool, isToolSteerInterruption, } from '@mavis/agent-core/tools';
 import { createDefaultTokenEstimator } from '@mavis/context-manager';
 import { ADVISOR_CALL_TIMEOUT_MS } from '@mavis/shared/advisor-call';
@@ -34,7 +34,8 @@ const TRUNCATED_NOTE = "\n\n[The advice was cut off at the advisor model's outpu
 const OVERFLOW_TEXT = "The conversation exceeds the advisor model's context window, so no advice was returned this time. Continue with your own judgement.";
 const UNAVAILABLE_TEXT = 'The advisor model selected for this session is currently unavailable. Continue with your own judgement.';
 const CANCELLED_TEXT = 'Cancelled.';
-const WITHHELD_TEXT = 'The advice was withheld by content review. Continue with your own judgement.';
+// 主模型会把这句转述给用户，所以不提打回的原因。
+const WITHHELD_TEXT = 'The advisor could not answer this request. Continue with your own judgement.';
 const TIMED_OUT_TEXT = 'The advisor did not answer in time, so this consultation was stopped. Continue with your own judgement.';
 const STEERED_TEXT = 'The user sent a new message, so this advisor consultation was interrupted. Read the new message and decide whether to consult the advisor again.';
 const MAX_REASON_LENGTH = 200;
@@ -119,15 +120,8 @@ async function consultAdvisor(dependencies, ctx, material, signal) {
         return abortedSettlement(signal);
     if (!resolved)
         return { outcome: 'model_unavailable', text: UNAVAILABLE_TEXT };
-    const disposition = await reviewTurnInput(dependencies, resolved.llm, material.userInput);
-    if (signal?.aborted)
-        return abortedSettlement(signal);
-    if (disposition.kind !== 'proceed')
-        return { outcome: 'withheld', text: WITHHELD_TEXT };
-    // Review guidance joins the system prompt, as it does for a managed main model's request.
-    const systemPrompt = disposition.guidance
-        ? `${ADVISOR_SYSTEM_PROMPT}\n\n${disposition.guidance}`
-        : ADVISOR_SYSTEM_PROMPT;
+    // 托管顾问模型的请求和主模型一样经网关审核，客户端不在本地送审输入或建议。
+    const systemPrompt = ADVISOR_SYSTEM_PROMPT;
     const transcript = serializeAdvisorTranscript(material, {
         supportsImages: resolved.llm.model.input.includes('image'),
         budget: transcriptBudget(resolved.llm.model, systemPrompt),
@@ -169,43 +163,11 @@ async function adviseOn(request, content) {
         if (isExplicitInputTooLargeError(error)) {
             return { outcome: 'context_overflow', text: OVERFLOW_TEXT };
         }
+        if (parseContentReviewError(error))
+            return { outcome: 'withheld', text: WITHHELD_TEXT };
         return { outcome: 'provider_error', text: providerFailureText(shortReason(error)) };
     }
-    const settlement = settleFinal(final, resolved.llm.model, signal);
-    return { ...(await reviewSettlement(dependencies, resolved.llm, settlement)), final };
-}
-/**
- * The Turn's user input, reviewed before a model the product reviews receives it: the same text
- * and scene as a managed main model's input review. A review failure blocks too.
- */
-async function reviewTurnInput(dependencies, llm, userInput) {
-    const review = dependencies.reviewInput;
-    if (!review || !userInput?.trim())
-        return { kind: 'proceed' };
-    try {
-        return await review({ llm, text: userInput });
-    }
-    catch {
-        return { kind: 'block' };
-    }
-}
-/**
- * Advice the product reviews reaches neither the main model nor the user when review blocks it.
- * A review failure blocks too, like the main output's review.
- */
-async function reviewSettlement(dependencies, llm, settlement) {
-    const review = dependencies.withholdsAdvice;
-    if (!review || (settlement.outcome !== 'advice' && settlement.outcome !== 'truncated')) {
-        return settlement;
-    }
-    let blocked;
-    try {
-        blocked = await review({ llm, text: settlement.text });
-    }
-    catch {
-        blocked = true;
-    }
-    return blocked ? { outcome: 'withheld', text: WITHHELD_TEXT } : settlement;
+    return { ...settleFinal(final, resolved.llm.model, signal), final };
 }
 /** Same stream composition, retry policy and timeouts as the main model's requests. */
 async function requestAdvice(input) {
@@ -243,6 +205,9 @@ function settleFinal(final, model, signal) {
     }
     if (signal?.aborted)
         return abortedSettlement(signal);
+    // 网关打回了这次顾问请求（输入或建议没放行）：建议不交给主模型，也不带打回的细节。
+    if (parseContentReviewError(final))
+        return { outcome: 'withheld', text: WITHHELD_TEXT };
     if (final.stopReason === 'error' || final.stopReason === 'aborted') {
         return {
             outcome: 'provider_error',

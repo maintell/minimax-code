@@ -11,7 +11,7 @@
  * edit.
  */
 import { normalizeToLF, stripBom } from '@earendil-works/pi-coding-agent/tools';
-import { readFile as fsReadFile } from './physical-fs.js';
+import { physicalToolFs } from './physical-fs.js';
 export class ReplaceAllError extends Error {
     code;
     constructor(message, code) {
@@ -34,13 +34,13 @@ export class ReplaceAllError extends Error {
  * whole normalized file and restores the original BOM and line endings
  * when it writes.
  */
-export async function buildReplaceAllEdit(absolutePath, oldString, newString) {
+export async function buildReplaceAllEdit(absolutePath, oldString, newString, fs = physicalToolFs) {
     if (oldString === '') {
         throw new ReplaceAllError(`replace_all: old_string must be non-empty (path=${absolutePath}).`, 'OLD_STRING_EMPTY');
     }
     let rawContent;
     try {
-        const buffer = await fsReadFile(absolutePath);
+        const buffer = await fs.readFile(absolutePath);
         rawContent = buffer.toString('utf-8');
     }
     catch (err) {

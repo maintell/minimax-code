@@ -54,7 +54,7 @@ let LocalTaskTool = (() => {
         constructor(adapter) {
             this.adapter = adapter;
         }
-        async execute(ctx, input, signal) {
+        async execute(ctx, input, signal, onUpdate) {
             if (signal?.aborted)
                 throw new Error('Operation aborted');
             if (input.run_in_background === true && ctx.canConsumeBackgroundTaskOutput !== true) {
@@ -85,6 +85,7 @@ let LocalTaskTool = (() => {
                         content: [{ type: 'text', text }],
                         details: {
                             agent_name: input.agent_name,
+                            ...(started.agentDisplayName ? { agent_display_name: started.agentDisplayName } : {}),
                             status: started.status,
                             ...(started.taskId ? { task_id: started.taskId } : {}),
                             ...(started.subSessionId ? { sub_session_id: started.subSessionId } : {}),
@@ -101,6 +102,7 @@ let LocalTaskTool = (() => {
                     content: [{ type: 'text', text }],
                     details: {
                         agent_name: input.agent_name,
+                        ...(started.agentDisplayName ? { agent_display_name: started.agentDisplayName } : {}),
                         status: 'started',
                         task_id: started.taskId,
                         ...(started.subSessionId ? { sub_session_id: started.subSessionId } : {}),
@@ -122,7 +124,18 @@ let LocalTaskTool = (() => {
                     })
                     : result;
             }
-            const run = await this.adapter.runForeground(ctx, input, signal);
+            const run = await this.adapter.runForeground(ctx, input, signal, (child) => {
+                onUpdate?.({
+                    content: [{ type: 'text', text: `Started task for ${input.agent_name}.` }],
+                    details: {
+                        agent_name: input.agent_name,
+                        ...(child.agentDisplayName ? { agent_display_name: child.agentDisplayName } : {}),
+                        status: 'started',
+                        sub_session_id: child.subSessionId,
+                        sub_turn_id: child.subTurnId,
+                    },
+                });
+            });
             if (run.status !== 'succeeded') {
                 const errorMessage = run.errorMessage ?? 'Agent task failed';
                 const text = `<task_error${taskIdAttribute(run.taskId)}${sessionIdAttribute(run.subSessionId)}${errorCodeAttribute(run.errorCode)}>\n${formatLocalTaskParentReport({
@@ -135,6 +148,7 @@ let LocalTaskTool = (() => {
                     content: [{ type: 'text', text }],
                     details: {
                         agent_name: input.agent_name,
+                        ...(run.agentDisplayName ? { agent_display_name: run.agentDisplayName } : {}),
                         status: run.status,
                         ...(run.taskId ? { task_id: run.taskId } : {}),
                         ...(run.subSessionId ? { sub_session_id: run.subSessionId } : {}),
@@ -158,6 +172,7 @@ let LocalTaskTool = (() => {
                 content: [{ type: 'text', text }],
                 details: {
                     agent_name: input.agent_name,
+                    ...(run.agentDisplayName ? { agent_display_name: run.agentDisplayName } : {}),
                     status: 'succeeded',
                     ...(run.taskId ? { task_id: run.taskId } : {}),
                     ...(run.subSessionId ? { sub_session_id: run.subSessionId } : {}),

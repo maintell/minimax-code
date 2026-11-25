@@ -57,7 +57,7 @@ export function getComputerUsePermissionStatus() {
  * the user to System Settings. A pure settings deep-link cannot add the app to
  * the list by itself.
  */
-async function primeScreenRecordingTccRecord() {
+export async function primeScreenRecordingTccRecord() {
     await desktopCapturer.getSources({
         types: ['screen'],
         thumbnailSize: PERMISSION_PROBE_THUMBNAIL_SIZE,

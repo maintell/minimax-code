@@ -181,6 +181,11 @@ export let IPC_CHANNELS = {
     STORAGE_SYNC_DAEMON_AUTH: 'storage:sync-daemon-auth',
     // 外部链接
     OPEN_EXTERNAL: 'open-external',
+    OPEN_URL_IN_BROWSER: 'open-url-in-browser',
+    // mcode-browser 插件的 Chrome 扩展（设置 → 浏览器 → 浏览器扩展）
+    MCODE_BROWSER_EXTENSION_STATUS: 'mcode-browser:extension-status',
+    MCODE_BROWSER_REVEAL_MANUAL_EXTENSION: 'mcode-browser:reveal-manual-extension',
+    MCODE_BROWSER_OPEN_CHROME_EXTENSIONS: 'mcode-browser:open-chrome-extensions',
     // 系统
     SYSTEM_OPEN_LOG_FILE: 'system:open-log-file',
     SYSTEM_GET_LOG_FILE_PATH: 'system:get-log-file-path',
@@ -256,6 +261,16 @@ export let IPC_CHANNELS = {
     EMBEDDED_BROWSER_LIST_LOCAL_SERVERS: 'embedded-browser:list-local-servers',
     EMBEDDED_BROWSER_CAPTURE_FRAME: 'embedded-browser:capture-frame',
     EMBEDDED_BROWSER_AGENT_ACTION: 'embedded-browser:agent-action',
+    /** Renderer -> Main: the user takes over the tab the Agent controls. */
+    EMBEDDED_BROWSER_TAKE_OVER: 'embedded-browser:take-over',
+    /** Renderer -> Main: theme, typography and copy of the in-page takeover pill. */
+    EMBEDDED_BROWSER_SET_TAKEOVER_PILL_APPEARANCE: 'embedded-browser:set-takeover-pill-appearance',
+    EMBEDDED_BROWSER_CONSUME_PENDING_REVEAL: 'embedded-browser:consume-pending-reveal',
+    EMBEDDED_BROWSER_DESCRIBE_TABS: 'embedded-browser:describe-tabs',
+    /** Main -> Renderer: Agent control mode or controlled tab changed for a session. */
+    EMBEDDED_BROWSER_CONTROL_CHANGED: 'embedded-browser:control-changed',
+    /** Main -> Renderer: user input on the Agent-controlled tab was blocked. */
+    EMBEDDED_BROWSER_INPUT_BLOCKED: 'embedded-browser:input-blocked',
     /** renderer → main: find text in a Browser tab page (shared Cmd/Ctrl+F bar). */
     EMBEDDED_BROWSER_FIND_IN_PAGE: 'embedded-browser:find-in-page',
     EMBEDDED_BROWSER_STOP_FIND_IN_PAGE: 'embedded-browser:stop-find-in-page',
@@ -267,6 +282,8 @@ export let IPC_CHANNELS = {
     // Plugin-owned Mini App surfaces
     MINIAPP_LIST: 'miniapp:list',
     MINIAPP_OPEN: 'miniapp:open',
+    // Renderer -> Main: presents a tab a file open made without presenting (`present: false`).
+    MINIAPP_PRESENT: 'miniapp:present',
     MINIAPP_WIDGET: 'miniapp:widget',
     MINIAPP_PREVIEW: 'miniapp:preview',
     MINIAPP_PREVIEW_CACHE: 'miniapp:preview-cache',
@@ -294,6 +311,9 @@ export let IPC_CHANNELS = {
     MINIAPP_HOST_OPEN_REQUEST: 'miniapp:host-open-request',
     MINIAPP_HOST_OPEN_REPLY: 'miniapp:host-open-reply',
     MINIAPP_HOST_OPEN_CANCEL: 'miniapp:host-open-cancel',
+    MINIAPP_FILES_SUBSCRIBE: 'miniapp:files-subscribe',
+    MINIAPP_FILES_UNSUBSCRIBE: 'miniapp:files-unsubscribe',
+    MINIAPP_FILES_EVENT: 'miniapp:files-event',
     MINIAPP_COMPOSER_REQUEST: 'miniapp:composer-request',
     MINIAPP_COMPOSER_REPLY: 'miniapp:composer-reply',
     MINIAPP_TOOL_PERMISSION_REQUEST: 'miniapp:tool-permission-request',
@@ -347,6 +367,7 @@ export let IPC_CHANNELS = {
     // Deep Link
     DEEPLINK_RECEIVED: 'deeplink:received',
     DEEPLINK_TAKE_WORKSPACE_OPEN: 'deeplink:take-workspace-open',
+    DEEPLINK_TAKE_PLUGIN_TRY: 'deeplink:take-plugin-try',
     // file tools
     FILE_READ: 'file:read',
     FILE_STAGE_ATTACHMENT: 'file:stage-attachment',
@@ -366,6 +387,10 @@ export let IPC_CHANNELS = {
     FILE_UPLOAD: 'file:upload',
     FILE_CHMOD: 'file:chmod',
     // sidebar terminal (interactive PTY) — see docs/design/sidebar-terminal-panel.md
+    TERMINAL_INLINE_START: 'terminal:inline-start',
+    TERMINAL_INLINE_READ: 'terminal:inline-read',
+    TERMINAL_SECRET_INPUT: 'terminal:secret-input',
+    TERMINAL_INLINE_DISPOSE_SESSION: 'terminal:inline-dispose-session',
     TERMINAL_CREATE: 'terminal:create',
     TERMINAL_LIST: 'terminal:list',
     TERMINAL_ATTACH: 'terminal:attach',
@@ -407,6 +432,10 @@ export let IPC_CHANNELS = {
     DOCUMENT_PREVIEW_PPTX_CORE_PORT: 'document-preview:pptx-core-port',
     PREVIEW_CLIPBOARD_WRITE: 'preview-clipboard:write',
     PREVIEW_CLIPBOARD_WRITE_FILES: 'preview-clipboard:write-files',
+    // Manual Space upload (channel names are historical)
+    MCODE_TOOLS_ASSETS_STATUS: 'mcode-tools-assets:status',
+    MCODE_TOOLS_ASSETS_UPLOAD: 'mcode-tools-assets:upload',
+    MCODE_TOOLS_ASSETS_STAT: 'mcode-tools-assets:stat',
     // PPT Preview WebContentsView (qlmanage HTML overlay)
     PPT_PREVIEW_CREATE: 'ppt-preview:create',
     PPT_PREVIEW_LOAD: 'ppt-preview:load',
@@ -488,7 +517,9 @@ export let IPC_CHANNELS = {
     MAIN_WINDOW_SELECT_CHAT: 'main-window:select-chat',
     // Screenshot
     SCREENSHOT_START: 'screenshot:start',
+    SCREENSHOT_MANAGE_STORAGE: 'screenshot:manage-storage',
     SCREENSHOT_CAPTURE_PAGE_REGION: 'screenshot:capture-page-region',
+    SCREENSHOT_OPEN_PERMISSION_SETTINGS: 'screenshot:open-permission-settings',
     // Tracking recorder (Electron local/test/staging/internal preview only)
     TRACKING_RECORDER_REGISTER_SCREENSHOT: 'tracking-recorder:register-screenshot',
     TRACKING_RECORDER_READ_SCREENSHOT: 'tracking-recorder:read-screenshot',

@@ -224,6 +224,33 @@ export function createDesktopServiceClient(options) {
         removePluginMarketplace(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.removePluginMarketplace, req, callOptions);
         },
+        listExtensionEntries(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listExtensionEntries, req, callOptions);
+        },
+        renderExtension(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.renderExtension, req, callOptions);
+        },
+        pressExtension(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.pressExtension, req, callOptions);
+        },
+        inputExtension(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.inputExtension, req, callOptions);
+        },
+        selectExtension(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.selectExtension, req, callOptions);
+        },
+        ackExtensionApplied(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.ackExtensionApplied, req, callOptions);
+        },
+        reportExtensionFallback(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.reportExtensionFallback, req, callOptions);
+        },
+        answerExtensionQuery(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.answerExtensionQuery, req, callOptions);
+        },
+        closeExtensionPane(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.closeExtensionPane, req, callOptions);
+        },
         packShareWork(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.packShareWork, req, callOptions);
         },
@@ -953,6 +980,15 @@ export function createDesktopServiceClient(options) {
         recordSessionFileSync(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.recordSessionFileSync, req, callOptions);
         },
+        querySessionFileSyncSources(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.querySessionFileSyncSources, req, callOptions);
+        },
+        invalidateSessionFileSyncSources(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.invalidateSessionFileSyncSources, req, callOptions);
+        },
+        bindSessionFileSyncOwner(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.bindSessionFileSyncOwner, req, callOptions);
+        },
         deliverCron(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.deliverCron, req, callOptions);
         },
@@ -1226,6 +1262,9 @@ export function createDesktopServiceClient(options) {
         removeManagedWorkspaceGitWorktreesBatch(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.removeManagedWorkspaceGitWorktreesBatch, req, callOptions);
         },
+        restoreSessionWorktree(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.restoreSessionWorktree, req, callOptions);
+        },
         listFsDirs(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listFsDirs, req, callOptions);
         },
@@ -1237,6 +1276,66 @@ export function createDesktopServiceClient(options) {
         },
         updateReviewPreferences(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.updateReviewPreferences, req, callOptions);
+        },
+        listSessionMergeRequests(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.listSessionMergeRequests, req, callOptions);
+        },
+        batchGetSessionMergeRequestBadges(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.batchGetSessionMergeRequestBadges, req, callOptions);
+        },
+        getMergeRequestJobLog(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getMergeRequestJobLog, req, callOptions);
+        },
+        linkSessionMergeRequest(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.linkSessionMergeRequest, req, callOptions);
+        },
+        unlinkSessionMergeRequest(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.unlinkSessionMergeRequest, req, callOptions);
+        },
+        getCodeHostingStatus(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getCodeHostingStatus, req, callOptions);
+        },
+        getMergeRequestChanges(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getMergeRequestChanges, req, callOptions);
+        },
+        getMergeRequestMergeOptions(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getMergeRequestMergeOptions, req, callOptions);
+        },
+        mergeMergeRequest(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.mergeMergeRequest, req, callOptions);
+        },
+        getMergeRequestCleanupPlan(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getMergeRequestCleanupPlan, req, callOptions);
+        },
+        cleanupMergeRequestWorktree(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.cleanupMergeRequestWorktree, req, callOptions);
+        },
+        retryMergeRequestPipeline(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.retryMergeRequestPipeline, req, callOptions);
+        },
+        replyMergeRequestDiscussion(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.replyMergeRequestDiscussion, req, callOptions);
+        },
+        resolveMergeRequestDiscussion(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.resolveMergeRequestDiscussion, req, callOptions);
+        },
+        addMergeRequestComment(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.addMergeRequestComment, req, callOptions);
+        },
+        updateMergeRequest(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.updateMergeRequest, req, callOptions);
+        },
+        searchMergeRequestReviewers(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.searchMergeRequestReviewers, req, callOptions);
+        },
+        getMergeRequestCreateDefaults(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getMergeRequestCreateDefaults, req, callOptions);
+        },
+        createMergeRequest(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.createMergeRequest, req, callOptions);
+        },
+        searchMergeRequestLinkCandidates(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.searchMergeRequestLinkCandidates, req, callOptions);
         },
         resolveAnnotationTarget(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.resolveAnnotationTarget, req, callOptions);
@@ -1325,6 +1424,9 @@ export function createDesktopServiceClient(options) {
         getSidebarSession(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.getSidebarSession, req, callOptions);
         },
+        moveSidebarProject(req, callOptions) {
+            return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.moveSidebarProject, req, callOptions);
+        },
         ensureMiniAppHostSession(req, callOptions) {
             return invokeHttpJson(options, DESKTOP_SERVICE_ROUTES.ensureMiniAppHostSession, req, callOptions);
         },
@@ -1354,6 +1456,9 @@ export function createDesktopServiceClient(options) {
         },
         subscribeGlobalEvents(req, callOptions) {
             return invokeHttpSse(options, DESKTOP_SERVICE_SSE_CONTRACTS.subscribeGlobalEvents, req, callOptions);
+        },
+        subscribeExtensionStream(req, callOptions) {
+            return invokeHttpSse(options, DESKTOP_SERVICE_SSE_CONTRACTS.subscribeExtensionStream, req, callOptions);
         },
         sendMessage(req, callOptions) {
             return invokeHttpSse(options, DESKTOP_SERVICE_SSE_CONTRACTS.sendMessage, req, callOptions);

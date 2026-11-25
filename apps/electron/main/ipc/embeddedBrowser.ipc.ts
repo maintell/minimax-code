@@ -357,7 +357,7 @@ export function setupEmbeddedBrowserIPC() {
             ...(params?.selectIfAgentTarget === true ? { selectIfAgentTarget: true } : {}),
         }, layoutCommandId);
     });
-    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_DESTROY, async (_event, params) => manager.destroy(normalizeDestroyParams(params)));
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_DESTROY, async (_event, params) => manager.destroy(normalizeDestroyParams(params), { closedByUser: true }));
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_ADOPT_SESSION, async (_event, params) => {
         const { fromSessionId, toSessionId } = (params ?? {});
         if (typeof fromSessionId !== 'string' ||
@@ -403,6 +403,7 @@ export function setupEmbeddedBrowserIPC() {
         return { success: true };
     });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_SCREENSHOT, async (_event, params) => {
+        manager.takeOverForUserScreenshot(normalizeBrowserTarget(params));
         const result = (await manager.executeTool('screenshot', normalizeBrowserTarget(params)));
         if (result?.success === true && typeof result.data === 'string') {
             const image = nativeImage.createFromBuffer(Buffer.from(result.data, 'base64'));
@@ -428,6 +429,39 @@ export function setupEmbeddedBrowserIPC() {
         return { success: true };
     });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_FORCE_RELOAD, async (_event, params) => manager.forceReload(normalizeBrowserTarget(params)));
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_TAKE_OVER, async (_event, params) => {
+        const record = params && typeof params === 'object' ? params : {};
+        const sessionId = typeof record.sessionId === 'string' ? record.sessionId.trim() : '';
+        const tabId = typeof record.tabId === 'number' ? record.tabId : NaN;
+        if (!sessionId || !Number.isSafeInteger(tabId)) {
+            return { success: false, error: 'sessionId and tabId are required' };
+        }
+        return manager.takeOverAgentControl(sessionId, tabId);
+    });
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_SET_TAKEOVER_PILL_APPEARANCE, async (_event, appearance) => manager.setTakeoverPillAppearance(appearance));
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_CONSUME_PENDING_REVEAL, async (_event, params) => {
+        const record = params && typeof params === 'object' ? params : {};
+        const sessionId = typeof record.sessionId === 'string' ? record.sessionId.trim() : '';
+        if (!sessionId)
+            return { success: false, error: 'sessionId is required' };
+        const tabId = typeof record.tabId === 'number' && Number.isSafeInteger(record.tabId)
+            ? record.tabId
+            : undefined;
+        return {
+            success: true,
+            reveal: manager.consumePendingReveal(sessionId, {
+                peek: record.peek === true,
+                ...(tabId !== undefined ? { tabId } : {}),
+            }),
+        };
+    });
+    ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_DESCRIBE_TABS, async (_event, params) => {
+        const record = params && typeof params === 'object' ? params : {};
+        const sessionId = typeof record.sessionId === 'string' ? record.sessionId.trim() : '';
+        if (!sessionId)
+            return { success: false, error: 'sessionId is required' };
+        return { success: true, tabs: manager.describeTabsForTurn(sessionId) };
+    });
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_SET_ZOOM, async (_event, params) => manager.setZoom(typeof params?.factor === 'number' ? params.factor : 1, normalizeBrowserTarget(params)));
     ipcMain.handle(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_IN_PAGE, async (_event, params) => {
         const request = normalizeFindInPageRequest(params);

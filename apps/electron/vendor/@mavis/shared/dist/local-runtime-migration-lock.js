@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { resolveV2DirectoryContract } from './local-runtime-paths.js';
+import { isPidAlive } from './process-alive.js';
 /**
  * Cross-process migration lock: one process per dataDir may run the v2 layout
  * migration and database initialization at a time. `O_EXCL` file creation,
@@ -283,16 +284,6 @@ function isLockFileOlderThan(lockFilePath, staleMs) {
     }
     catch {
         return false;
-    }
-}
-/** POSIX and Windows: ESRCH means the pid is gone; EPERM means it exists but is protected. */
-function isPidAlive(pid) {
-    try {
-        process.kill(pid, 0);
-        return true;
-    }
-    catch (error) {
-        return !hasCode(error, 'ESRCH');
     }
 }
 function removeLockFile(lockFilePath) {

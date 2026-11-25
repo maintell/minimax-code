@@ -27,6 +27,11 @@ export function initializeAssignments(input, publishUpdate) {
         nowMs: options.nowMs,
     });
     service = new AssignmentService(options, changed, activity, reports);
+    // The verdict writes live on the assignment service; the report service only reports rounds.
+    reports.bindVerdictPort({
+        record: (review) => service.recordReviewerVerdict(review),
+        abandon: (release) => service.abandonVerdictReview(release),
+    });
     updates = new AssignmentUpdateService({
         sessions: options.sessions,
         tasks: options.tasks,

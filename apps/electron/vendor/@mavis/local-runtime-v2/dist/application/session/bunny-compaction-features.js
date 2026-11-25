@@ -219,10 +219,9 @@ export function spaceHighlights(input) {
                 const identity = {
                     ...spaceIdentity(space),
                     lastActiveAtMs: Math.max(space.updatedAt, ...open.map(taskActivityAtMs)),
-                    ...(space.system ? { system: true } : {}),
                     goal: space.goal ?? '',
                 };
-                if (open.length === 0 || space.system)
+                if (open.length === 0)
                     return {
                         ...identity,
                         hasOpenTasks: open.length > 0,

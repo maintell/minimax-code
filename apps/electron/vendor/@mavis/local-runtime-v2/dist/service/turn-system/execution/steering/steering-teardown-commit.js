@@ -1,5 +1,5 @@
 import { isUserMessageId } from '../../../session-system/index.js';
-import { prepareSteeringTeardownCanonicalInput } from '../../agent-host/assembly/local-turn-input-preparation.js';
+import { prepareSteeringTeardownCanonicalInput, } from '@mavis/harness';
 export function createSteeringTeardownCommit(options) {
     return {
         async commit({ sessionId, turnId, messages, onCommitted }) {
@@ -8,10 +8,17 @@ export function createSteeringTeardownCommit(options) {
             // duplicate-identity boundary. An unreadable vector degrades to the
             // per-append duplicate tolerance below.
             const identityVector = await readIdentityVector(options, sessionId);
+            const coordinator = await readReceiverIsCoordinator(options, sessionId);
             for (const message of messages) {
                 try {
                     await options.projectDisplay({ sessionId, turnId, message });
-                    await appendCanonicalUserRow(options, { sessionId, turnId, message, identityVector });
+                    await appendCanonicalUserRow(options, {
+                        sessionId,
+                        turnId,
+                        message,
+                        identityVector,
+                        coordinator,
+                    });
                 }
                 catch (error) {
                     options.logger?.warn({
@@ -64,6 +71,15 @@ async function readIdentityVector(options, sessionId) {
         return undefined;
     }
 }
+/** The coordinator answer for one commit; an unreadable or absent reader reads as ordinary. */
+async function readReceiverIsCoordinator(options, sessionId) {
+    try {
+        return (await options.receiverIsCoordinator?.(sessionId)) === true;
+    }
+    catch {
+        return false;
+    }
+}
 async function appendCanonicalUserRow(options, input) {
     const userMessageId = hintedUserMessageId(input.message);
     if (userMessageId && input.identityVector?.includes(userMessageId))
@@ -93,6 +109,7 @@ function teardownAppendChange(options, input, userMessageId) {
     const canonical = prepareSteeringTeardownCanonicalInput({
         message: message.message,
         provenance: message.provenance,
+        receiverIsCoordinator: input.coordinator,
     });
     const row = {
         role: 'user',

@@ -199,7 +199,7 @@ function scanWindowsCommandCharacter(character, quote) {
  * Reads redirect destinations before command segmentation discards the
  * operator. The caller applies normal protected-path checks to each target.
  */
-function readWindowsRedirectionTargets(command) {
+export function readWindowsRedirectionTargets(command) {
     const targets = [];
     let quote;
     for (let index = 0; index < command.length; index += 1) {

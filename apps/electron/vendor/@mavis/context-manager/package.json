@@ -14,6 +14,7 @@
     "@earendil-works/pi-ai": "file:../../@earendil-works/pi-ai",
     "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
     "@mavis/agent-core": "file:../agent-core",
+    "@mavis/shared": "file:../shared",
     "gpt-tokenizer": "^3.4.0"
   }
 }

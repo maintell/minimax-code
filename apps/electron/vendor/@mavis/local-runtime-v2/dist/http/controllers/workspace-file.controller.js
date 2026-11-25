@@ -401,6 +401,7 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
         if (result.status >= 400)
             throw managedWorktreeRemovalError({ status: result.status, body });
         await releaseWorkspaceQuietly(this.services.workspaceGit, req.worktreeDir);
+        this.services.worktreeCleanup?.request();
         return body;
     }
     async listManagedWorkspaceGitWorktrees(_ctx, req) {
@@ -408,7 +409,7 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
             return this.services.managedWorktrees.list(req.workspace);
         if (!this.services.workspaceGit)
             return this.requireManagedWorktrees().list(req.workspace);
-        return this.requireWorkspaceGit().listWorktrees(req.workspace);
+        return this.requireWorkspaceGit().listManagedWorktrees(req.workspace);
     }
     async removeManagedWorkspaceGitWorktree(_ctx, req) {
         if (!this.services.managedWorktrees && !this.services.workspaceGit) {
@@ -422,6 +423,7 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
                     body: toRemoveWorktreeResponse(result),
                 });
             await releaseWorkspaceQuietly(this.services.workspaceGit, req.worktreeDir);
+            this.services.worktreeCleanup?.request();
             return toRemoveWorktreeResponse(result);
         }
         const workspaceIdentity = this.services.workspaceGit
@@ -431,7 +433,21 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
         if (result.status >= 400)
             throw managedWorktreeRemovalError(result);
         await this.services.workspaceGit?.releaseWorkspace(workspaceIdentity);
+        this.services.worktreeCleanup?.request();
         return result.body;
+    }
+    async restoreSessionWorktree(_ctx, req) {
+        if (!req.sessionId) {
+            throw new AppError(400, 'SESSION_ID_REQUIRED', 'sessionId is required');
+        }
+        if (!this.services.worktreeCleanup) {
+            return {
+                success: false,
+                reason: 'unknown',
+                error: 'Worktree restore is not available in this runtime',
+            };
+        }
+        return this.services.worktreeCleanup.restore(req.sessionId);
     }
     async removeManagedWorkspaceGitWorktreesBatch(_ctx, req) {
         if (req.items.length === 0) {
@@ -442,6 +458,8 @@ class WorkspaceFileController extends WorkspaceFileControllerBase {
             for (const workspace of result.removedPaths) {
                 await releaseWorkspaceQuietly(this.services.workspaceGit, workspace);
             }
+            if (result.removedPaths.length > 0)
+                this.services.worktreeCleanup?.request();
             return result;
         }
         const identities = new Map(await Promise.all(req.items.map(async (item) => [

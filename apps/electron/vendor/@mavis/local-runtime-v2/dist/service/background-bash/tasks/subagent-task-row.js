@@ -5,18 +5,22 @@
  */
 export function createLocalSubagentTaskRow(input) {
     const now = input.host.nowMs();
+    const { spawnedBy } = input;
     return input.host.backgroundTaskService.create({
         taskId: input.taskId,
         kind: 'subagent',
         status: 'queued',
         ownerSessionId: input.ownerSessionId,
         description: input.taskInput.description,
-        toolCallId: input.toolCtx.toolCallId,
+        // A plugin-spawned row has no owner Turn or tool call. It is latched as delivered from the
+        // start, so no terminal writer (task_stop, a restart marking it lost) leaves a result for the
+        // main Agent's delivery, reminder or pending notification to pick up.
+        ...(spawnedBy ? { deliveredAt: now } : { toolCallId: input.toolCtx.toolCallId }),
         createdAt: now,
         updatedAt: now,
         metadata: {
             parentSessionId: input.ownerSessionId,
-            parentTurnId: input.toolCtx.turnId,
+            ...(spawnedBy ? { spawnedBy } : { parentTurnId: input.toolCtx.turnId }),
             agentName: input.target.resolvedAgentName,
             requestedAgentName: input.target.requestedName,
             exactOwnerName: input.target.exactOwnerName,

@@ -13,6 +13,7 @@
 import { createBusyTimeAccumulator, incrementMetric, observeMetric, } from '@mavis/shared/local-runtime-logging/metric-registry';
 import { normalizeLLMError, toLLMFailureErrorKind, toLLMMetricErrorKind, } from '@mavis/shared/llm-error-classifier';
 import { classifyLocalResourceError } from '@mavis/shared/local-resource-errors';
+import { parseContentReviewError } from './content-review.js';
 import { isLLMCallPreempted } from './llm-preemption.js';
 import { LLMRequestStoppedError, } from './llm-retry.js';
 import { normalizeAbortSource, } from './types.js';
@@ -252,6 +253,7 @@ export class TurnMetricsRecorder {
     agentLabels;
     agentKind;
     wake;
+    conversation;
     modelId;
     turnLabels;
     turnStartedAt;
@@ -287,6 +289,7 @@ export class TurnMetricsRecorder {
         this.agentKind = turn.agentKind;
         this.agentLabels = agentKindLabels(turn.agentKind);
         this.wake = turn.wake ?? 'system';
+        this.conversation = turn.conversation ?? 'existing';
         this.modelId = String(model.id);
         this.turnLabels = {
             provider: String(model.provider),
@@ -528,6 +531,7 @@ export class TurnMetricsRecorder {
             caller,
             compacted: this.compactedBeforeFirstRequest ? 'true' : 'false',
             wake: this.wake,
+            conversation: this.conversation,
             ...this.agentLabels,
         });
     }
@@ -544,6 +548,7 @@ export class TurnMetricsRecorder {
             caller: this.caller,
             compacted: this.compactedBeforeFirstRequest ? 'true' : 'false',
             wake: this.wake,
+            conversation: this.conversation,
             ...this.agentLabels,
         });
     }
@@ -612,9 +617,16 @@ export class TurnMetricsRecorder {
     getLLMFailureObservation() {
         return this.llmFailure;
     }
-    /** A recovered provider error must not become the turn's failure provenance. */
+    /**
+     * A recovered provider error must not become the turn's failure provenance,
+     * whether it is still an observation or already the terminal failure.
+     * Request and error counters already emitted stay.
+     */
     forgetLLMFailureObservation() {
         this.llmFailure = undefined;
+        if (this.terminalFailure?.errorSource === 'llm') {
+            this.terminalFailure = this.firstNonLlmTerminalFailure;
+        }
     }
     /**
      * Record the first terminal failure of the turn. `cause` is the error behind
@@ -908,7 +920,12 @@ export class TurnMetricsRecorder {
             // 而不是逻辑请求包装层，避免把多次重试合并成一条日志。`'abort'` 不是真实的
             // provider 失败，且方案要求“用户取消默认不上报”，因此排除用户取消。
             // 通过 `swallow` 保护调用，保证 hook 抛错也不会破坏请求、重试或 turn。
-            if (observation.metricKind !== 'abort' && this.owner.onLLMRequestFailure) {
+            // 网关打回内容（content_error）是业务结果，不是 provider 故障，不交给失败上报。
+            const contentReviewed = parseContentReviewError(final) !== undefined ||
+                parseContentReviewError(thrown) !== undefined;
+            if (observation.metricKind !== 'abort' &&
+                !contentReviewed &&
+                this.owner.onLLMRequestFailure) {
                 const hook = this.owner.onLLMRequestFailure;
                 swallow(() => hook({
                     sessionId: this.diagnostics.sessionId,

@@ -357,8 +357,9 @@ function toFlatSseAttachment(attachment, meta, local) {
         local?.dataUrl,
         local?.data_url,
     ]);
+    const drive = driveAssetFields(attachment, local);
     return {
-        type: attachmentType === 'image' || mimeType?.startsWith('image/') ? 'image' : 'file',
+        type: flatAttachmentType(attachmentType, mimeType, drive),
         file_path: filePath ?? '',
         file_name: fileName,
         mime_type: mimeType ?? '',
@@ -366,8 +367,37 @@ function toFlatSseAttachment(attachment, meta, local) {
             ['asset_id', assetId],
             ['desktop_path', desktopPath],
             ['data_url', previewUrl],
+            ...drive,
         ]),
     };
+}
+function flatAttachmentType(attachmentType, mimeType, drive) {
+    if (attachmentType === 'folder' && drive.length > 0)
+        return 'folder';
+    return attachmentType === 'image' || mimeType?.startsWith('image/') ? 'image' : 'file';
+}
+/** Drive node facts of an asset library attachment, as UI `drive_node_id` / `drive_path`. */
+function driveAssetFields(attachment, local) {
+    const driveNodeId = firstString([
+        attachment.drive_node_id,
+        attachment.driveNodeId,
+        local?.driveNodeId,
+        local?.drive_node_id,
+    ]);
+    if (!driveNodeId)
+        return [];
+    return [
+        ['drive_node_id', driveNodeId],
+        [
+            'drive_path',
+            firstString([
+                attachment.drive_path,
+                attachment.drivePath,
+                local?.drivePath,
+                local?.drive_path,
+            ]),
+        ],
+    ];
 }
 function firstString(values) {
     return values.find((value) => typeof value === 'string' && value.trim().length > 0);

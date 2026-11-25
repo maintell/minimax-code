@@ -1,6 +1,24 @@
 import { ConversationTurnRejectedError } from '@mavis/conversation-contract';
 import { verdictIdempotencyKey, } from '../../session-system/index.js';
 import { renderVerdictNotice } from './verdict-notice.js';
+/**
+ * The origin a wake Turn carries: only the chat to answer in, and only when there is
+ * one. A desktop task's wake stays exactly as before, with no origin at all. The key
+ * is not `assignmentReport`: a wake is not a task report, and its wake reason stays.
+ */
+function verdictWakeOrigin(channel) {
+    return channel ? { verdictWake: { channel: { ...channel } } } : undefined;
+}
+/** The chat a checked task answers in, as the field of its wake. */
+function wakeChannel(assignment) {
+    return assignment.originChannel ? { originChannel: assignment.originChannel } : {};
+}
+function channelKey(wake) {
+    const channel = wake.originChannel;
+    return channel
+        ? JSON.stringify([channel.platform, channel.clientName, channel.chatId, channel.threadId ?? ''])
+        : '';
+}
 /** How long a stored verdict waits before it wakes its assigner. */
 const VERDICT_WAKE_DELAY_MS = 2000;
 /** Task history type marking one verdict as already woken. */
@@ -10,7 +28,7 @@ const VERDICT_DELIVERED = 'task.verdict_delivered';
  * reads the verdict, tells the user, and only then concludes the task.
  *
  * Separate from report batches: a verdict wake is not a task report and never carries a
- * report origin. A verdict already marked delivered in task history is never woken
+ * report origin; a task from an IM chat carries only `verdictWake.channel`. A verdict already marked delivered in task history is never woken
  * again, so a retry after a crash cannot produce a second Turn.
  */
 export class VerdictWakeDelivery {
@@ -29,6 +47,10 @@ export class VerdictWakeDelivery {
      * again, so a retry after a crash cannot produce a second Turn.
      */
     recorded(sessionId, verdict) {
+        // A switched-off gate wakes nobody: there is no conclusion for the assigner to read and
+        // act on, and the sweep releases whatever link is left instead.
+        if (this.deps.options.verdictGate?.() !== true)
+            return;
         this.deps.track(async () => {
             const assignment = await this.deps.options.tasks.get(sessionId);
             if (!assignment)
@@ -43,6 +65,7 @@ export class VerdictWakeDelivery {
                     reviewTaskId: verdict.reviewTaskId,
                     revision: verdict.revision,
                 }),
+                ...wakeChannel(assignment),
             };
             const batch = this.batches.get(target) ?? new Map();
             batch.set(sessionId, wake);
@@ -50,6 +73,43 @@ export class VerdictWakeDelivery {
             this.deps.onDelivered?.(sessionId);
             this.schedule(target);
         });
+    }
+    /**
+     * Startup recovery: a verdict stored before the last shutdown is woken again.
+     *
+     * The batches live in this process, so a restart loses every wake that had not gone out
+     * yet, and nothing else would pick them up: the backstop only retries what is already
+     * held here. Re-reading the task graph puts each stored verdict of an open task back into
+     * its assigner's batch. A verdict task history already records as delivered is dropped
+     * again by collectPending, so this never produces a second Turn.
+     */
+    async recover() {
+        if (this.deps.isClosed() || this.deps.options.verdictGate?.() !== true)
+            return;
+        for (const { sessionId, assignment } of await this.deps.options.tasks.list({
+            archived: false,
+        })) {
+            const verdict = assignment.verdict;
+            if (!verdict || assignment.completion)
+                continue;
+            const target = await this.deps.reportTarget(assignment);
+            if (!target)
+                continue;
+            const batch = this.batches.get(target) ?? new Map();
+            batch.set(sessionId, {
+                sessionId,
+                verdict,
+                key: verdictIdempotencyKey({
+                    reviewTaskId: verdict.reviewTaskId,
+                    revision: verdict.revision,
+                }),
+                ...wakeChannel(assignment),
+            });
+            this.batches.set(target, batch);
+        }
+        for (const [target, batch] of this.batches)
+            if (batch.size)
+                this.schedule(target);
     }
     /** A Turn of `target` settled; a wake held for it may go out now. */
     settled(target) {
@@ -90,7 +150,10 @@ export class VerdictWakeDelivery {
         // A busy assigner is never interrupted; its wakes wait for that Turn to end.
         if (!targetSession || targetSession.status === 'started')
             return;
-        const pending = await this.collectPending(batch);
+        // One Turn answers one chat: wakes of tasks from other chats wait for the next Turn.
+        const all = await this.collectPending(batch);
+        const first = all[0];
+        const pending = first ? all.filter((wake) => channelKey(wake) === channelKey(first)) : [];
         if (!pending.length)
             return;
         this.delivering.add(target);
@@ -145,12 +208,16 @@ export class VerdictWakeDelivery {
             return events.some((event) => event.payload.key === wake.key);
         }
         catch (error) {
-            this.deps.options.logger.warn({ sessionId: wake.sessionId, error: error instanceof Error ? error.message : String(error) }, 'Verdict delivery history unreadable; sending the wake again');
+            this.deps.options.logger.warn({
+                sessionId: wake.sessionId,
+                error: error instanceof Error ? error.message : String(error),
+            }, 'Verdict delivery history unreadable; sending the wake again');
             return false;
         }
     }
     /** One Turn carrying every pending verdict for this assigner. */
     async submit(target, pending) {
+        const origin = verdictWakeOrigin(pending[0]?.originChannel);
         try {
             const result = await this.deps.options.conversation.ingress.submit({
                 sessionId: target,
@@ -159,6 +226,7 @@ export class VerdictWakeDelivery {
                 message: {
                     content: pending.map((wake) => renderVerdictNotice(wake)).join('\n\n'),
                     attachments: [],
+                    ...(origin ? { origin } : {}),
                 },
             });
             if ('accepted' in result && result.accepted === false)

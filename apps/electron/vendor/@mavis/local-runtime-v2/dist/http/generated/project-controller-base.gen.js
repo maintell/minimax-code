@@ -70,5 +70,10 @@ export class ProjectControllerBase {
         void req;
         throw new NotImplementedError('getSidebarSession');
     }
+    async moveSidebarProject(ctx, req) {
+        void ctx;
+        void req;
+        throw new NotImplementedError('moveSidebarProject');
+    }
 }
 //# sourceMappingURL=project-controller-base.gen.js.map

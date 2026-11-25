@@ -17,6 +17,7 @@ export function initializeCronService(options) {
             ? { mainConversationAgents: options.mainConversationAgents }
             : {}),
         ...(options.isAgentPaused ? { isAgentPaused: options.isAgentPaused } : {}),
+        ...(options.scheduleOrigins ? { scheduleOrigins: options.scheduleOrigins } : {}),
         metrics,
     });
     let readyPromise;

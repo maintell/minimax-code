@@ -15,12 +15,13 @@ export function buildHostChannelFacadePort(input) {
         permissionOutbound: subsystem.channelPermissionBridge,
         forgetPermissionSession: (sessionId) => subsystem.channelPermissionBridge.forgetSession(sessionId),
         // v2 adaptation: the runner's delivery API takes an input object.
-        deliverReplyFromMessages: ({ ctx, messages, sessionId, workspaceDir, error }) => runner.deliverReplyFromMessages({
+        deliverReplyFromMessages: ({ ctx, messages, sessionId, workspaceDir, error, replyScope }) => runner.deliverReplyFromMessages({
             ctx: channelContextFromMessageContext(ctx),
             messages,
             sessionId,
             ...(workspaceDir !== undefined ? { workspaceDir } : {}),
             ...(error !== undefined ? { error } : {}),
+            ...(replyScope !== undefined ? { replyScope } : {}),
         }),
         notifyTurnStart: (ctx) => runner.notifyTurnStart(channelContextFromMessageContext(ctx)),
         notifyTurnEnd: (ctx) => runner.notifyTurnEnd(channelContextFromMessageContext(ctx)),

@@ -13,8 +13,11 @@ const worklineCreateSchema = z
  * `<summary>`; passing one is a clear error instead of a silent drop.
  */
 const RETIRED_SPACE_UPDATE_FIELDS = ['instructions', 'decisions', 'next_steps'];
+// The create shape with every field optional. Written out instead of
+// `.partial()`, which would wrap the already-optional goal and projects a
+// second time, a construct the JSON Schema conversion cannot express.
 const worklineUpdateSchema = z
-    .object({ space_id: idString, ...worklineCreateSchema.partial().shape })
+    .object({ space_id: idString, ...worklineCreateSchema.shape, name: optionalString })
     .passthrough()
     .superRefine((value, context) => {
     const retired = RETIRED_SPACE_UPDATE_FIELDS.filter((field) => field in value);
@@ -29,11 +32,10 @@ const worklineUpdateSchema = z
         !RETIRED_SPACE_UPDATE_FIELDS.includes(key));
     if (unknown.length)
         context.addIssue({ code: z.ZodIssueCode.unrecognized_keys, keys: unknown });
-})
-    .transform(({ space_id, name, goal, projects }) => ({ space_id, name, goal, projects }));
+});
 const contextReadSchema = z.object({ space_id: idString }).strict();
 /** Same limit and the same count (string length) as the runtime's SPACE_CONTEXT_SUMMARY_LIMIT. */
-const SPACE_CONTEXT_SUMMARY_MAX = 32000;
+export const SPACE_CONTEXT_SUMMARY_MAX = 32000;
 /**
  * An over-long summary says how long it is and how much to cut, so Bunny can shorten it in
  * one go instead of guessing. The error map keeps `.max()` as a plain check, so the JSON
@@ -72,7 +74,6 @@ export const BUNNY_MAVIS_COMMAND_SCHEMAS = {
     'space get': z.object({ space_id: idString }).strict(),
     'space context read': contextReadSchema,
     'space context write': contextWriteSchema,
-    'project list': z.object({}),
     'task model list': z.object({}).strict(),
     'task model set': taskModelSetSchema,
 };
@@ -83,7 +84,6 @@ export const BUNNY_MAVIS_COMMAND_HANDLERS = {
     'space get': handleWorklineGet,
     'space context read': handleContextRead,
     'space context write': handleContextWrite,
-    'project list': handleProjectList,
     'task model list': handleTaskModelList,
     'task model set': handleTaskModelSet,
 };
@@ -100,6 +100,7 @@ export function buildCreateAssignmentRequest(input) {
         ...(input.worktree !== undefined ? { worktree: input.worktree } : {}),
         title: input.title,
         content: input.content,
+        ...(input.attachments !== undefined ? { attachments: [...input.attachments] } : {}),
         userWords: input.userWords,
         ...(input.doneWhen !== undefined ? { doneWhen: input.doneWhen } : {}),
         ...(input.agent ? { agent: input.agent } : {}),
@@ -107,6 +108,7 @@ export function buildCreateAssignmentRequest(input) {
         ...(input.requestId ? { requestId: input.requestId } : {}),
         ...(input.reviewOf ? { reviewOf: input.reviewOf } : {}),
         ...(input.callerTurnId ? { callerTurnId: input.callerTurnId } : {}),
+        ...(input.originChannel ? { originChannel: input.originChannel } : {}),
     };
 }
 function requireBunnyCaller(ctx, message) {
@@ -125,11 +127,7 @@ function requireHandler(ctx, name, unavailable) {
 async function handleWorklineCreate(ctx, args) {
     const callerSessionId = requireBunnyCaller(ctx, WORKLINE_CALLER_ERROR);
     const handler = requireHandler(ctx, 'createWorkline', 'Workline creation is unavailable');
-    return success(ctx.command, await handler({
-        ...args,
-        callerSessionId,
-        ...(ctx.currentTurnId ? { callerTurnId: ctx.currentTurnId } : {}),
-    }));
+    return success(ctx.command, await handler({ ...args, callerSessionId }));
 }
 async function handleWorklineUpdate(ctx, args) {
     const callerSessionId = requireBunnyCaller(ctx, WORKLINE_CALLER_ERROR);
@@ -167,10 +165,6 @@ async function handleContextWrite(ctx, args) {
         ...(args.sections ? { sections: args.sections } : {}),
         revision: args.revision,
     }));
-}
-async function handleProjectList(ctx) {
-    const handler = requireHandler(ctx, 'listProjects', 'Project listing is unavailable');
-    return success(ctx.command, await handler({ callerSessionId: requireBunnyCaller(ctx, WORKLINE_CALLER_ERROR) }));
 }
 const TASK_MODEL_CALLER_ERROR = 'Only bunny sessions can manage the task model';
 async function handleTaskModelList(ctx) {

@@ -1,4 +1,4 @@
-import { Role } from '@mavis/agent-core/protocol';
+import { isAbandonedStreamClosingMessage, MsgType, Role } from '@mavis/agent-core/protocol';
 import { queryCollapseSteeringProjection, } from '../conversation/index.js';
 import { sessionClioQueuedQueryId } from '../../service/session-clio/index.js';
 /**
@@ -207,37 +207,25 @@ export function reportRootBestEffortFailure(reportFailure, input) {
     const stage = input.stage === 'turn-abort' ? 'abort' : input.stage.replaceAll('-', '_');
     reportFailure?.(input.sessionId, `root_replacement_${stage}_failed:${describeError(input.error)}`);
 }
-/** Read this logical query, including continuation steering, and the runner's exact final reply. */
+/**
+ * Feeds the title review: the logical query of the committed reply, including continuation
+ * steering, with the runner's exact final reply; or, for a Session still being named, its first
+ * request whichever later reply triggered the attempt.
+ */
 export function createReplyTitleReviewHandler(sessions, reportFailure) {
+    const repository = sessions.messages.repository;
     return (input) => {
         detachedTitleResolutions.add((async () => {
             try {
                 await sessions.titleReviews.review({
                     sessionId: input.sessionId,
                     turnId: input.turnId,
-                    loadContent: async () => {
-                        const messages = await sessions.messages.repository.listTurn(input.sessionId, input.turnId);
-                        const reply = messages.find((message) => message.msg_id === input.replyMessageId && message.role === Role.Assistant);
-                        if (typeof reply?.msg_content !== 'string' || !reply.msg_content.trim())
-                            return null;
-                        let inputMessages = messages.slice(0, messages.indexOf(reply));
-                        if (typeof reply.query_key === 'string' && reply.query_key) {
-                            const queryRootKey = queryCollapseSteeringProjection(reply.query_key).root_query_key ??
-                                reply.query_key;
-                            inputMessages = [
-                                ...(await sessions.messages.repository.list(input.sessionId, {
-                                    role: 'user',
-                                    queryRootKey,
-                                    before: input.replyMessageId,
-                                })).messages,
-                            ];
+                    loadContent: async (request) => {
+                        const reply = await readReplyRequest(repository, input);
+                        if (request.scope === 'first-request') {
+                            return readFirstRequest(repository, input, request.session, reply);
                         }
-                        return {
-                            userInputs: inputMessages.flatMap((message) => message.role === Role.User && typeof message.msg_content === 'string'
-                                ? [message.msg_content]
-                                : []),
-                            finalReply: reply.msg_content,
-                        };
+                        return reply && { userInputs: reply.userInputs, finalReply: reply.finalReply };
                     },
                 });
             }
@@ -251,5 +239,110 @@ export function createReplyTitleReviewHandler(sessions, reportFailure) {
             }
         })());
     };
+}
+async function readReplyRequest(repository, input) {
+    const messages = await repository.listTurn(input.sessionId, input.turnId);
+    const reply = messages.find((message) => message.msg_id === input.replyMessageId && message.role === Role.Assistant);
+    if (typeof reply?.msg_content !== 'string' || !reply.msg_content.trim())
+        return null;
+    const queryRootKey = rootQueryKey(reply.query_key);
+    const request = { ...(queryRootKey ? { queryRootKey } : {}), turnId: input.turnId };
+    const inputs = await readRequestRows(repository, input.sessionId, request, {
+        role: 'user',
+        before: input.replyMessageId,
+        turnRows: messages,
+    });
+    return { userInputs: userTexts(inputs), finalReply: reply.msg_content, request };
+}
+/**
+ * The Session's own first request, after any inherited SideChat prefix. The committed reply is
+ * used as is when it answers that request; otherwise the request's final reply is read from
+ * history on every attempt, so a first request that was rewound or continued is read as it is
+ * now. A first request that ended without a final reply contributes its user inputs only.
+ */
+async function readFirstRequest(repository, input, session, reply) {
+    const boundary = session.sideChatOrigin?.inheritedThroughMessageId;
+    const first = await repository.findFirstUserMessage(input.sessionId, boundary ? { afterMessageId: boundary } : undefined);
+    if (!first)
+        return null;
+    const request = requestOf(first);
+    if (reply && sameRequest(reply.request, request)) {
+        return { userInputs: reply.userInputs, finalReply: reply.finalReply };
+    }
+    const finalReply = await findRequestReply(repository, input.sessionId, request);
+    const inputs = request.queryRootKey || request.turnId
+        ? await readRequestRows(repository, input.sessionId, request, {
+            role: 'user',
+            ...(finalReply?.msg_id ? { before: finalReply.msg_id } : {}),
+        })
+        : [first];
+    return {
+        userInputs: userTexts(inputs),
+        finalReply: typeof finalReply?.msg_content === 'string' ? finalReply.msg_content : '',
+    };
+}
+function requestOf(message) {
+    const queryRootKey = rootQueryKey(message.query_key);
+    return {
+        ...(queryRootKey ? { queryRootKey } : {}),
+        ...(message.turnId ? { turnId: message.turnId } : {}),
+    };
+}
+function sameRequest(left, right) {
+    if (right.queryRootKey !== undefined && left.queryRootKey === right.queryRootKey)
+        return true;
+    return right.turnId !== undefined && left.turnId === right.turnId;
+}
+/** A request's rows of one role, oldest first, ending before `before` when it is given. */
+async function readRequestRows(repository, sessionId, request, options) {
+    const { role, before } = options;
+    if (request.queryRootKey) {
+        const page = await repository.list(sessionId, {
+            role,
+            queryRootKey: request.queryRootKey,
+            ...(before ? { before } : {}),
+        });
+        return page.messages;
+    }
+    if (!request.turnId)
+        return [];
+    const turn = options.turnRows ?? (await repository.listTurn(sessionId, request.turnId));
+    const end = before ? turn.findIndex((message) => message.msg_id === before) : -1;
+    return (end < 0 ? turn : turn.slice(0, end)).filter((message) => message.role === role);
+}
+const NON_FINAL_FINISH_REASONS = new Set(['toolUse', 'tool_use', 'tool_calls', 'aborted', 'error']);
+/**
+ * A request's final reply read from history: its last assistant text, and only when that ended
+ * normally. An interrupted, abandoned or failed request has no reply.
+ */
+async function findRequestReply(repository, sessionId, request) {
+    const rows = await readRequestRows(repository, sessionId, request, { role: 'assistant' });
+    const last = [...rows].reverse().find(isAssistantText);
+    return last && endedNormally(last) ? last : undefined;
+}
+function isAssistantText(message) {
+    return (message.role === Role.Assistant &&
+        message.msg_type !== MsgType.SystemEvent &&
+        typeof message.msg_content === 'string' &&
+        message.msg_content.trim().length > 0);
+}
+function endedNormally(message) {
+    if (message.msg_type === MsgType.AgentToolCall)
+        return false;
+    // A stream abandoned mid-answer leaves a half answer behind; it is not the request's reply.
+    if (isAbandonedStreamClosingMessage(message))
+        return false;
+    const finish = message.finish_reason;
+    return typeof finish !== 'string' || !NON_FINAL_FINISH_REASONS.has(finish);
+}
+function rootQueryKey(queryKey) {
+    if (typeof queryKey !== 'string' || !queryKey)
+        return undefined;
+    return queryCollapseSteeringProjection(queryKey).root_query_key ?? queryKey;
+}
+function userTexts(messages) {
+    return messages.flatMap((message) => message.role === Role.User && typeof message.msg_content === 'string'
+        ? [message.msg_content]
+        : []);
 }
 //# sourceMappingURL=turn-message-delivery.js.map

@@ -1,11 +1,13 @@
 import { prepareChannelOutboundMessage } from '../../delivery/outbound-message.js';
 import { feishuClientId, } from './feishu-store.js';
 import { feishuMessageSnapshotToQuotedMessage, parseLocalFeishuEvent } from './feishu-events.js';
-import { buildQuestionnaireCard, buildReplyCard, unwrapMaybeEncryptedFeishuEvent, } from './cards/feishu-card.js';
+import { unwrapMaybeEncryptedFeishuEvent } from './cards/feishu-card.js';
 import { buildPermissionCard, extractPermissionActionValue, } from './cards/feishu-permission-card.js';
 import { FeishuSender, } from './outbound/feishu-sender.js';
 import { enrichFeishuSenderName } from './outbound/feishu-sender-name.js';
-import { makeFeishuWsAttachmentDownloader, removeAckReaction, startFeishuEventDispatcher, } from './feishu-ws.js';
+import { deliverFeishuReply, settleUnansweredFeishuCard, } from './outbound/feishu-reply-delivery.js';
+import { markFeishuReactionExecuting, } from './outbound/feishu-reactions.js';
+import { makeFeishuWsAttachmentDownloader, startFeishuEventDispatcher, } from './feishu-ws.js';
 import { errorMessage, isUsableFeishuBinding, sameWsCredentials, validateFeishuBindCredentials, pickString, } from './feishu-adapter-utils.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
 import { buildFeishuSdkLoggerBridge, clearFeishuWsError, describeFeishuWsStatus, transitionFeishuWsStatus, } from './feishu-sdk-logger.js';
@@ -270,33 +272,40 @@ export class FeishuPlatformAdapter {
         }
     }
     /**
-     * Compute the thread-reply option for an outbound send. When the ctx lives
-     * inside a Feishu thread/topic (`ctx.threadId` set) AND we hold a concrete
-     * anchor message ID inside that thread, the send is routed through the
-     * `reply` endpoint (`reply_in_thread`). The anchor prefers the triggering
-     * message ID; falls back to the pending thinking card's inbound message ID.
-     * No threadId / no anchor → `undefined` (top-level send, unchanged).
-     * Shared by {@link sendMessage} and {@link renderPermission} so permission
-     * cards route exactly like normal replies.
+     * Thread-reply option for a card that must land inside a Feishu
+     * thread/topic (permission asks). Normal replies go through
+     * {@link deliverFeishuReply}, which decides quoting and `reply_in_thread`
+     * from the same ctx.
+     *
+     * The anchor is the message the card answers (`ctx.sourceMessageId`). A
+     * permission ask has none — its ctx comes from the permission bridge, which
+     * only knows the chat and the thread the turn started in — so it falls back
+     * to the newest inbound message of THAT thread, which is what keeps the card
+     * inside the originating topic instead of the top-level conversation. No
+     * threadId, or neither anchor available → `undefined` (top-level send).
      */
     resolveThreadReply(ctx) {
-        const threadAnchorId = ctx.sourceMessageId ?? this.pendingThinkingStore?.get(ctx.chatId)?.inboundMessageId;
-        return ctx.threadId && threadAnchorId ? { replyToMessageId: threadAnchorId } : undefined;
+        const threadId = ctx.threadId;
+        if (!threadId)
+            return undefined;
+        const anchorId = ctx.sourceMessageId?.trim() ||
+            // Same client namespace as the WS writer: it keys on the envelope's
+            // `clientName`, which `normalizeInbound` stamps from `this.clientName`.
+            this.pendingThinkingStore?.getLatestInboundMessageId(this.clientName, ctx.chatId, threadId);
+        if (!anchorId)
+            return undefined;
+        return { replyToMessageId: anchorId, inThread: true };
     }
     /**
-     * Send an outbound message. The three message parts (`text` / `media` /
-     * `questionnaire`) are additive per the contract:
-     *   - `questionnaire` present → interactive card first
-     *   - then per-media uploads (best-effort: one failure does not block
-     *     the others, but the overall result reports the FIRST error so the
-     *     caller's retry policy still kicks in)
-     *   - then plain text (if non-empty)
+     * Send an outbound message through the shared Feishu delivery, so this
+     * adapter and `LocalFeishuChannelClient` quote the inbound message, patch
+     * only that message's placeholder card and settle its ack reaction
+     * identically.
      *
      * Returns the platform message id of the LAST successful send, or
      * `'error'` status with the first failure surfaced.
      */
     async sendMessage(input) {
-        const executionFailure = Boolean(input.error);
         const outbound = prepareChannelOutboundMessage(input);
         const record = await this.store.get(this.agentName);
         if (!isUsableFeishuBinding(record)) {
@@ -307,149 +316,88 @@ export class FeishuPlatformAdapter {
             };
         }
         const sender = this.ensureSender(record);
-        const chatId = outbound.ctx.chatId;
-        // Thread-aware reply: when the inbound message lived inside a Feishu
-        // thread/topic (`ctx.threadId` set), route every outbound send through the
-        // `reply` endpoint anchored on a message ID inside that thread, so the
-        // reply lands in the thread instead of the top-level conversation.
-        const thread = this.resolveThreadReply(outbound.ctx);
-        // Inbound message id whose 👀 `OnIt` ack reaction should be revoked once
-        // the reply is delivered. MUST be resolved before the questionnaire path
-        // below deletes the pending thinking card (its `inboundMessageId` is the
-        // fallback when the ctx carries no `sourceMessageId`).
-        const ackInboundMessageId = outbound.ctx.sourceMessageId ?? this.pendingThinkingStore?.get(chatId)?.inboundMessageId;
-        const revokeAckReaction = () => removeAckReaction({
-            store: this.pendingReactionStore,
-            inboundMessageId: ackInboundMessageId,
-            remove: (m, r) => sender.removeReaction(m, r),
+        const result = await deliverFeishuReply({
+            sender,
+            clientName: this.clientName,
+            ...(this.pendingThinkingStore ? { pendingThinkingStore: this.pendingThinkingStore } : {}),
+            ...(this.pendingReactionStore ? { pendingReactionStore: this.pendingReactionStore } : {}),
+            ...(this.onQuestionnaireRendered
+                ? {
+                    onQuestionnaireRendered: ({ chatId, request, messageId }) => {
+                        this.onQuestionnaireRendered?.({ chatId, request, messageId });
+                    },
+                }
+                : {}),
+        }, {
+            ctx: outbound.ctx,
+            text: outbound.text,
+            ...(outbound.media ? { media: outbound.media } : {}),
+            ...(outbound.questionnaire ? { questionnaire: outbound.questionnaire } : {}),
+            ...(outbound.noticeKind ? { noticeKind: outbound.noticeKind } : {}),
+            ...(outbound.replyScope ? { replyScope: outbound.replyScope } : {}),
         });
-        const state = { lastId: '' };
-        if (outbound.questionnaire) {
-            await this.sendQuestionnairePart({
-                questionnaire: outbound.questionnaire,
-                sender,
-                chatId,
-                thread,
-                revokeAckReaction,
-                state,
-            });
+        if (result.firstError) {
+            return { id: result.lastMessageId, status: 'error', error: result.firstError };
         }
-        await this.sendMediaParts(outbound, sender, thread, state);
-        // Feishu Card 2.0 form already carries the question text inside the card.
-        // Avoid double-posting a tail text when a questionnaire is rendered —
-        // historical behaviour (`feat/im-genui-full-mr`) was card-only.
-        if (outbound.text.trim() && !outbound.questionnaire) {
-            await this.sendReplyCardPart({
-                text: outbound.text,
-                executionFailure,
-                sender,
-                chatId,
-                thread,
-                revokeAckReaction,
-                state,
-            });
-        }
-        if (state.firstError) {
-            return {
-                id: state.lastId,
-                status: 'error',
-                error: state.firstError,
-            };
-        }
-        return { id: state.lastId, status: 'sent' };
+        return { id: result.lastMessageId, status: 'sent' };
     }
     /**
-     * Questionnaire bubble: consume any pending "🤔 思考中…" grey card by
-     * patching it into the questionnaire card so the chat stays at one bubble
-     * per turn; fall back to a fresh card.
+     * A queued message started executing: its `OneSecond` reaction goes back to
+     * `OnIt`. An entry still on `OnIt` only records that the turn started, which
+     * is what stops a late queued notice from downgrading it again.
+     *
+     * Best-effort like every reaction transition: a failure is logged and never
+     * surfaces to the turn.
      */
-    async sendQuestionnairePart(part) {
-        const { questionnaire, sender, chatId, thread, state } = part;
+    async notifyTurnStart(ctx) {
+        const inboundMessageId = ctx.sourceMessageId?.trim();
+        if (!inboundMessageId || !this.pendingReactionStore?.has(inboundMessageId))
+            return;
         try {
-            const card = buildQuestionnaireCard(questionnaire);
-            const pendingThinking = this.pendingThinkingStore?.get(chatId);
-            let messageId;
-            if (pendingThinking) {
-                this.pendingThinkingStore?.delete(chatId);
-                try {
-                    await sender.patchCard(pendingThinking.messageId, card);
-                    messageId = pendingThinking.messageId;
-                }
-                catch {
-                    /* patch failed — fall through to fresh card send */
-                }
-            }
-            if (!messageId) {
-                const result = await sender.sendCard(chatId, card, 'chat_id', thread);
-                messageId = result?.messageId;
-            }
-            if (messageId) {
-                state.lastId = messageId;
-                this.onQuestionnaireRendered?.({ chatId, request: questionnaire, messageId });
-                // Questionnaire delivered — revoke the 👀 inbound ack reaction.
-                await part.revokeAckReaction();
-            }
+            const record = await this.store.get(this.agentName);
+            if (!isUsableFeishuBinding(record))
+                return;
+            const sender = this.ensureSender(record);
+            await markFeishuReactionExecuting({
+                store: this.pendingReactionStore,
+                inboundMessageId,
+                add: (messageId, emojiType) => sender.addReaction(messageId, emojiType),
+                remove: (messageId, reactionId) => sender.removeReaction(messageId, reactionId),
+            });
         }
         catch (err) {
-            state.firstError ??= errorMessage(err);
-        }
-    }
-    /** Media refs are sent in order; each failure records the first error only. */
-    async sendMediaParts(outbound, sender, thread, state) {
-        for (const ref of outbound.media ?? []) {
-            try {
-                const result = await sender.sendMedia(outbound.ctx.chatId, ref, 'chat_id', thread);
-                if (result?.messageId)
-                    state.lastId = result.messageId;
-            }
-            catch (err) {
-                state.firstError ??= errorMessage(err);
-            }
+            logger.warn({ clientName: this.clientName, inboundMessageId, err: errorMessage(err) }, 'Feishu turn-start reaction update failed');
         }
     }
     /**
-     * Tail reply: wrap the text in a Card 2.0 "回复" card (green header,
-     * `chat_outlined` icon, `回复` tag) to match the historical
-     * `feat/im-genui-full-mr` style. Plain `msg_type: text` would show as a
-     * bare text bubble — inconsistent with how Ask user / media render. On an
-     * execution failure the pending thinking card is patched in place first so
-     * the failure replaces the grey bubble.
+     * This inbound message gets no reply of its own — its Turn ended without
+     * output, it never became a Turn, or it was consumed as an answer. Rewrite
+     * its "🤔 思考中…" card into the terminal card and drop the store entry;
+     * `kind` picks the wording ("已结束，本轮没有回复内容" vs "✅ 已收到你的回答").
+     *
+     * A no-op once a reply or a notice already consumed the card, which is what
+     * keeps it from racing a delivery that is still to come. Best-effort like
+     * every other placeholder transition.
      */
-    async sendReplyCardPart(part) {
-        const { sender, chatId, thread, state } = part;
+    async settleUnansweredInbound(ctx, kind = 'unanswered') {
+        const store = this.pendingThinkingStore;
+        const inboundMessageId = ctx.sourceMessageId?.trim();
+        if (!store || !inboundMessageId)
+            return;
+        if (!store.getCard(this.clientName, inboundMessageId))
+            return;
         try {
-            const replyCard = buildReplyCard(part.text);
-            let patchedFailureReply = false;
-            if (part.executionFailure) {
-                patchedFailureReply = await this.patchFailureIntoThinkingCard(sender, chatId, replyCard, state);
-            }
-            if (!patchedFailureReply) {
-                const result = await sender.sendCard(chatId, replyCard, 'chat_id', thread);
-                if (result?.messageId)
-                    state.lastId = result.messageId;
-            }
-            // Reply card delivered — revoke the 👀 inbound ack reaction.
-            await part.revokeAckReaction();
+            const record = await this.store.get(this.agentName);
+            if (!isUsableFeishuBinding(record))
+                return;
+            await settleUnansweredFeishuCard({
+                sender: this.ensureSender(record),
+                clientName: this.clientName,
+                pendingThinkingStore: store,
+            }, ctx, kind);
         }
         catch (err) {
-            state.firstError ??= errorMessage(err);
-        }
-    }
-    /** PATCH the failure reply over the grey card; expired cards fall through. */
-    async patchFailureIntoThinkingCard(sender, chatId, replyCard, state) {
-        const pendingThinking = this.pendingThinkingStore?.get(chatId);
-        if (!pendingThinking)
-            return false;
-        this.pendingThinkingStore?.delete(chatId);
-        try {
-            await sender.patchCard(pendingThinking.messageId, replyCard);
-            state.lastId = pendingThinking.messageId;
-            return true;
-        }
-        catch {
-            // The pre-existing card may have expired. Fall through to a
-            // thread-aware fresh reply so the failure remains visible.
-            return false;
+            logger.warn({ clientName: this.clientName, inboundMessageId, err: errorMessage(err) }, 'Feishu unanswered inbound settle failed');
         }
     }
     async resolveQuotedMessageForEnvelope(envelope, record) {

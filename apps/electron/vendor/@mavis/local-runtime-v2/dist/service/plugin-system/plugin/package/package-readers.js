@@ -1,5 +1,6 @@
 import { lstat, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
+import { mcpServerLaunchConfig } from '../../mcp/config.js';
 import { readAgentPluginPackage } from './agent-plugin-reader.js';
 import { readCompatiblePluginPackage } from './compatibility-reader.js';
 import { canonicalizePluginRoot, pluginPathExists } from './filesystem.js';
@@ -17,10 +18,44 @@ export function hasSupportedCapability(plugin) {
         plugin.mcpServers.length > 0 ||
         (plugin.hooks?.length ?? 0) > 0 ||
         (plugin.agents?.length ?? 0) > 0 ||
-        Boolean(plugin.miniapp));
+        Boolean(plugin.miniapp) ||
+        Boolean(plugin.extension));
 }
 export function readMiniMaxPlugin(packageRoot, options) {
     return readMiniMaxPluginPackage(packageRoot, options);
+}
+/**
+ * Reads an extension preview candidate once, with the reader install and the session overlay
+ * use: manifest, declared `*.mcp.json`, Skills, agents and `hooks.json#modules`.
+ */
+export async function readExtensionCandidatePackage(candidateRoot) {
+    let read;
+    try {
+        read = await readMiniMaxPluginPackage(candidateRoot, {
+            source: 'LOCAL_MINIMAX',
+            extensionCandidate: true,
+        });
+    }
+    catch (error) {
+        if (error instanceof PluginReaderError || error instanceof PluginPackageContractError) {
+            return { ok: false, code: error.code, detail: error.detail };
+        }
+        throw error;
+    }
+    const plugin = withoutMiniAppContribution(read);
+    return {
+        ok: true,
+        package: {
+            name: read.name,
+            ...(read.extension ? { extension: read.extension } : {}),
+            mcpServers: read.mcpServers.map((server) => ({
+                name: server.name,
+                launch: mcpServerLaunchConfig(server),
+            })),
+            diagnostics: read.diagnostics,
+            plugin: { ...plugin, source: 'LOCAL_PREVIEW' },
+        },
+    };
 }
 export async function readImportedPluginPackage(rootPath, options) {
     const root = await canonicalizePluginRoot(rootPath, { rejectSymlink: true });

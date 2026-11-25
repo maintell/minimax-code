@@ -1,6 +1,7 @@
 import { and, eq, ne, sql } from 'drizzle-orm';
 import { projects } from '../../../infra/db/schema/projects.js';
 import { sessions } from '../../../infra/db/schema/sessions.js';
+import { listedFirstValues } from './project-list-position.js';
 // The boundary IDs distinguish old and new sessions created in the same millisecond.
 export function recordProjectRemoval(db, project, atMs, newlyCreatedSessionId) {
     const boundaryIds = db
@@ -49,8 +50,9 @@ export function restoreSessionAfterProjectRemoval(db, sessionId, nowMs, isListab
         .where(eq(projects.projectId, row.projectId))
         .run();
     if (row.hidden !== 0 && isListable()) {
+        // The removed project comes back with this task and is listed first.
         db.update(projects)
-            .set({ hidden: 0, updatedAtMs: nowMs })
+            .set({ ...listedFirstValues(db, nowMs, { unhide: true }), updatedAtMs: nowMs })
             .where(eq(projects.projectId, row.projectId))
             .run();
     }

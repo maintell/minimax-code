@@ -1,5 +1,6 @@
 import { recoverPtcCrashState, } from '../../messages/ptc/crash-recovery.js';
 import { SESSION_SHUTDOWN_SOURCE } from './capabilities.js';
+import { logger } from '../../../../infra/logging/logger.js';
 export const SESSION_INTERRUPTION_MESSAGE = 'This session was interrupted because the previous local runtime stopped.';
 /** `errorSource` of a Session whose running Turn the previous process left behind. */
 const SESSION_CRASH_RECOVERY_SOURCE = 'crash-recovery';
@@ -24,6 +25,15 @@ export class SessionRecoveryService {
     constructor(options) {
         this.options = options;
         this.batchSize = normalizeBatchSize(options.batchSize);
+    }
+    /** Display-only: a failed fact replay must not keep this or later Sessions stale. */
+    async recoverChildExecutions(sessionId) {
+        try {
+            await this.options.subagentExecutions?.recover(sessionId);
+        }
+        catch (error) {
+            logger.warn({ error: error instanceof Error ? error.message : String(error), sessionId }, 'Subagent execution recovery failed; Session is still interrupted');
+        }
     }
     async recoverPreviousProcess(input) {
         if (!Number.isFinite(input.processStartedAtMs)) {
@@ -51,6 +61,8 @@ export class SessionRecoveryService {
                 recoveredPtcTurnIds.add(turnId);
             }
             for (const candidate of candidates) {
+                // Close exact durable child-turn markers before clearing stale Session state.
+                await this.recoverChildExecutions(candidate.sessionId);
                 const updated = await this.options.sessions.update(candidate.sessionId, {
                     status: 'interrupted',
                     errorMessage: SESSION_INTERRUPTION_MESSAGE,

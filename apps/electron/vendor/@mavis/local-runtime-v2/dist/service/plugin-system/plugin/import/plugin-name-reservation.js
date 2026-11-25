@@ -14,9 +14,7 @@ export class PluginNameReservation {
         this.source = source;
     }
     async assertAvailable(pluginName, options = {}) {
-        const officialInstallations = await this.source.readOfficialInstallations();
-        const nameKey = normalizedPluginName(pluginName);
-        if (officialInstallations.some((installation) => installation.installed && normalizedPluginName(installation.name) === nameKey)) {
+        if (await this.isOfficialName(pluginName)) {
             throw alreadyInstalled(options.allowEnabledMiniAppUpdate ? 'OFFICIAL_PLUGIN_READ_ONLY' : undefined);
         }
         const key = pluginIdKey({ name: pluginName, marketplace: LOCAL_PLUGIN_MARKETPLACE });
@@ -33,6 +31,20 @@ export class PluginNameReservation {
             return;
         }
         throw alreadyInstalled();
+    }
+    /**
+     * A `LOCAL_PREVIEW` extension is a per-session overlay and an installed extension is a LOCAL
+     * Plugin: either may share the name of an installed local Plugin, never that of an installed
+     * official one.
+     */
+    async assertPreviewAvailable(pluginName) {
+        if (await this.isOfficialName(pluginName)) {
+            throw new PluginSystemError('EXTENSION_NAME_RESERVED', 'An extension cannot replace an installed official Plugin');
+        }
+    }
+    async isOfficialName(pluginName) {
+        const nameKey = normalizedPluginName(pluginName);
+        return (await this.source.readOfficialInstallations()).some((installation) => installation.installed && normalizedPluginName(installation.name) === nameKey);
     }
 }
 function alreadyInstalled(reasonCode) {

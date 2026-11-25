@@ -1,101 +1,137 @@
-/**
- * Screenshot IPC Handlers
- * 处理截图相关的 IPC 通信
- */
-import { ipcMain, BrowserWindow } from "electron";
+import { BrowserWindow, ipcMain, shell } from "electron";
+import { startCaptureMeasurement } from "../modules/screenshot/capture-analytics";
+import { mkdir } from "node:fs/promises";
+import { cleanCaptureCache, captureStorageRoot } from "../modules/screenshot/capture-storage";
+import { getIsEn } from "../utils/tool";
+import logger from "../utils/logger";
 import { IPC_CHANNELS } from "../config/constants";
-import { startScreenshot } from "../modules/screenshot";
-import { hideArchonMiniChatWindow, showArchonMiniChatWindow } from "../windows/archonMiniChatWindow";
+import { openScreenCaptureSettings, ensureScreenCapturePermission } from "../modules/screenshot/capture-permission";
+import { startCaptureSession } from "../modules/screenshot/capture-session";
+import { getArchonMiniChatWindow, runWhileKeepingMiniChatVisible } from "../windows/archonMiniChatWindow";
 import { windowManager } from "../windows";
-function isArchonMode() {
-    return windowManager.getWindowType() === 'archon';
-}
-function finiteNumber(value) {
-    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+function trustedWindow(event) {
+    const main = windowManager.getWindowByType('archon');
+    const mini = getArchonMiniChatWindow();
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win ||
+        win.isDestroyed() ||
+        (win !== main && win !== mini) ||
+        event.senderFrame !== event.sender.mainFrame)
+        throw new Error('Unauthorized screenshot caller');
+    return win;
 }
 function parseCaptureRegion(value) {
     if (!value || typeof value !== 'object')
         return null;
-    const record = value;
-    const x = finiteNumber(record.x);
-    const y = finiteNumber(record.y);
-    const width = finiteNumber(record.width);
-    const height = finiteNumber(record.height);
-    if (x === null || y === null || width === null || height === null)
-        return null;
-    if (width <= 0 || height <= 0)
+    const { x, y, width, height } = value;
+    if (![x, y, width, height].every(Number.isFinite) || x < 0 || y < 0 || width <= 0 || height <= 0)
         return null;
     return {
-        x: Math.max(0, Math.round(x)),
-        y: Math.max(0, Math.round(y)),
-        width: Math.max(1, Math.round(width)),
-        height: Math.max(1, Math.round(height)),
+        x: Math.round(x),
+        y: Math.round(y),
+        width: Math.round(width),
+        height: Math.round(height),
     };
 }
-/**
- * 设置截图相关的 IPC 处理器
- */
+let busy = false;
 export function setupScreenshotIPC() {
+    void cleanCaptureCache().catch((error) => logger.error('[Screenshot] Cache cleanup failed:', error));
+    ipcMain.handle(IPC_CHANNELS.SCREENSHOT_MANAGE_STORAGE, async (event, action) => {
+        trustedWindow(event);
+        if (action === 'open') {
+            const directory = captureStorageRoot();
+            await mkdir(directory, { recursive: true, mode: 0o700 });
+            const error = await shell.openPath(directory);
+            if (error)
+                throw new Error(error);
+        }
+        else if (action === 'clear-cache') {
+            if (busy)
+                return 'busy';
+            await cleanCaptureCache(true);
+        }
+        else
+            throw new Error('Invalid capture storage action');
+    });
     ipcMain.handle(IPC_CHANNELS.SCREENSHOT_CAPTURE_PAGE_REGION, async (event, value) => {
+        // The recorder in login and onboarding may capture its own page.
+        const target = BrowserWindow.fromWebContents(event.sender);
+        if (!target ||
+            target.isDestroyed() ||
+            event.sender !== target.webContents ||
+            event.senderFrame !== event.sender.mainFrame ||
+            (!windowManager.getTypeByWindowId(target.id) && target !== getArchonMiniChatWindow()))
+            throw new Error('Unauthorized screenshot caller');
         const rect = parseCaptureRegion(value);
-        if (!rect) {
+        if (!rect)
             throw new Error('Invalid capture region');
-        }
-        const targetWindow = BrowserWindow.fromWebContents(event.sender) ??
-            windowManager.getWindowByType('archon') ??
-            windowManager.getWindow();
-        if (!targetWindow || targetWindow.isDestroyed()) {
-            throw new Error('No active window to capture');
-        }
-        const image = await targetWindow.webContents.capturePage(rect);
-        if (image.isEmpty()) {
+        const image = await target.webContents.capturePage(rect);
+        if (image.isEmpty())
             throw new Error('Captured image is empty');
-        }
         return image.toDataURL();
     });
-    /**
-     * 开始截图
-     * 返回截图文件路径
-     */
-    ipcMain.handle(IPC_CHANNELS.SCREENSHOT_START, async (_, params) => {
+    ipcMain.handle(IPC_CHANNELS.SCREENSHOT_OPEN_PERMISSION_SETTINGS, async (event) => {
+        trustedWindow(event);
+        await openScreenCaptureSettings();
+    });
+    ipcMain.handle(IPC_CHANNELS.SCREENSHOT_START, async (event, entry = 'button') => {
+        let report;
+        let mode = 'unknown';
+        let acquired = false;
         try {
-            console.log('[Screenshot IPC] Starting screenshot with params:', params);
-            // 隐藏小窗
-            hideArchonMiniChatWindow();
-            // 等待 100ms 开始截图
-            await new Promise((resolve) => setTimeout(resolve, 100));
-            const filePath = await startScreenshot(params?.workspaceDir);
-            showArchonMiniChatWindow();
-            console.log('[Screenshot IPC] Screenshot saved:', filePath);
-            return {
-                success: true,
-                filePath,
-            };
+            const owner = trustedWindow(event);
+            if (busy)
+                return { success: false, errorType: 'busy' };
+            busy = true;
+            acquired = true;
+            report = startCaptureMeasurement(entry, owner === getArchonMiniChatWindow() ? 'mini_chat' : 'main');
+            // Mini Chat hides on blur; keep it while macOS shows its authorization prompt.
+            return await runWhileKeepingMiniChatVisible(owner, async () => {
+                const permission = await ensureScreenCapturePermission(owner);
+                // The composer explains a missing permission with the shared permission dialog.
+                if (permission !== 'granted') {
+                    report?.(permission, mode);
+                    return {
+                        success: false,
+                        errorType: 'permission',
+                        permissionStatus: permission,
+                        error: 'Screen recording permission is not granted',
+                    };
+                }
+                // Keep the desktop intact: only the capture overlay controls its own visibility.
+                const result = await startCaptureSession(event.sender, getIsEn() ? 'en' : 'zh', (value) => {
+                    mode = value;
+                });
+                if (mode === 'unknown')
+                    mode = result.mimeType === 'video/mp4' ? 'record' : 'image';
+                report?.('success', mode);
+                // PNG bytes are already in the clipboard; recordings stay as permanent files.
+                if (result.mimeType === 'video/mp4')
+                    shell.showItemInFolder(result.filePath);
+                await cleanCaptureCache().catch((error) => logger.error('[Screenshot] Cache cleanup failed:', error));
+                return { success: true, ...result };
+            });
         }
         catch (error) {
-            console.error('[Screenshot IPC] Screenshot failed:', error);
-            showArchonMiniChatWindow();
-            // 判断错误类型
-            let errorType = 'error';
-            let errorMessage = 'Unknown error';
-            if (error instanceof Error) {
-                errorMessage = error.message;
-                // 检查错误类型
-                if (error.type === 'permission') {
-                    errorType = 'permission';
-                }
-                else if (errorMessage.includes('cancelled') || errorMessage.includes('canceled')) {
-                    errorType = 'cancelled';
-                }
-            }
-            else {
-                errorMessage = String(error);
-            }
+            const message = error instanceof Error ? error.message : String(error);
+            const cancelled = /cancelled|canceled/i.test(message);
+            report?.(error instanceof Error && error.name === 'CaptureInterruptedError'
+                ? 'interrupted'
+                : cancelled
+                    ? 'cancelled'
+                    : 'error', mode);
+            if (!cancelled)
+                logger.error('[Screenshot] Capture failed:', message);
             return {
                 success: false,
-                error: errorMessage,
-                errorType,
+                error: message,
+                errorType: cancelled ? 'cancelled' : 'error',
             };
+        }
+        finally {
+            if (acquired) {
+                busy = false;
+            }
         }
     });
 }

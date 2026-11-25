@@ -69,7 +69,7 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     }
     return useValue ? value : void 0;
 };
-import { bindTool } from '@mavis/agent-core/tools';
+import { bindTool, withProgrammaticResult, } from '@mavis/agent-core/tools';
 import { CloudTodoWriteToolDef as TodoWriteToolDef } from './builtin-defs.js';
 import { MsgType, RespDataType, } from '@mavis/agent-core/protocol/agent-message';
 import { buildStreamRespEvent } from '@mavis/agent-core/event-bridge';
@@ -134,7 +134,7 @@ let CloudTodoWriteTool = (() => {
             const completed = todos.filter((t) => t.status === 'completed').length;
             const cancelled = todos.filter((t) => t.status === 'cancelled').length;
             const text = TODO_WRITE_SUCCESS;
-            return {
+            return withProgrammaticResult({
                 tool_name: TodoWriteToolDef.name,
                 text,
                 content: [{ type: 'text', text }],
@@ -146,7 +146,13 @@ let CloudTodoWriteTool = (() => {
                     cancelled,
                     event_emitted: eventEmitted,
                 },
-            };
+            }, 
+            // TodoWriteData; text and details are unchanged.
+            // Completeness: the text is the fixed 'success' receipt, so it is never cut.
+            {
+                data: { total: todos.length, active, completed, cancelled },
+                completeness: { truncated: false },
+            });
         }
     };
     return CloudTodoWriteTool = _classThis;

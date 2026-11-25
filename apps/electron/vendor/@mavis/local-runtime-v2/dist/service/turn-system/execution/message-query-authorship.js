@@ -1,6 +1,5 @@
 import { isOrdinaryQuestionnaireResponseOrigin } from '@mavis/shared/questionnaire';
-import { isUserAuthoredSource, isUserAuthoredTurnSource, } from '../agent-host/canonical-user-input.js';
-import { resolveInputWakeReason } from '../agent-host/preparation/turn-wake-reasons.js';
+import { isUserAuthoredSource, isUserAuthoredTurnSource, resolveInputWakeReason, } from '@mavis/harness';
 export { isUserAuthoredSource, isUserAuthoredTurnSource };
 /** Resolves exact user-query authorship before execution and display diverge. */
 export function resolveGenuineUserQueryText(input) {

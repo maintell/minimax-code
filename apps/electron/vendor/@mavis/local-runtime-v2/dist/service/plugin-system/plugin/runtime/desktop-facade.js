@@ -8,6 +8,7 @@ import { PluginRegistryClient } from './registry-client.js';
 import { effectiveInstallationPolicy } from './repository.js';
 import { builtInMarketplaces, catalogEntryDetail, catalogEntrySummary, installedIdentityFields, localMarketplaceSummary, marketplaceInfo, nameHolder, nameOwnerField, } from './wire/marketplace-views.js';
 import { categoryId, categoryName, declaredTransport, optionalPluginIcon, pluginPackageSummary, } from './wire/package-views.js';
+import { installedOfficialPostInstall, withInstallPostInstall } from './wire/post-install.js';
 import { PluginDesktopFacadeError, readUserMarketplaceName, resolveCatalogTarget, resolvePluginTarget, userMarketplaceOf, } from './wire/plugin-selector.js';
 export { PluginDesktopFacadeError } from './wire/plugin-selector.js';
 const DEFAULT_LIMIT = 50;
@@ -71,11 +72,15 @@ export class PluginDesktopFacade {
             const response = await this.options.registryClient.getMarketplace(req);
             if (!response.plugin)
                 return response;
-            const installations = await this.options.system.listOfficialPluginInstallations();
+            const [installations, postInstall] = await Promise.all([
+                this.options.system.listOfficialPluginInstallations(),
+                installedOfficialPostInstall(this.options.system, response.plugin.summary.name),
+            ]);
             return {
                 ...response,
                 plugin: {
                     ...response.plugin,
+                    ...(postInstall ? { postInstall } : {}),
                     summary: overlayOfficialSummary(response.plugin.summary, installations, this.options.system.currentSnapshot, this.options.system.forbiddenPluginNames),
                 },
             };
@@ -368,7 +373,7 @@ export class PluginDesktopFacade {
                 ...(response.package ? { package: response.package } : {}),
             }, scope);
             this.forgetMiniAppPermissions(action, response.installExists, requestedName, 'official');
-            return response;
+            return await withInstallPostInstall(this.options.system, action, requestedName, response);
         }
         catch (error) {
             // Once the request is in flight, the registry may already have committed

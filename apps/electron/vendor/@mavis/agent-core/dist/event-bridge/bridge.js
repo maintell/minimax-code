@@ -228,13 +228,13 @@ export class EventBridge {
      *
      * The bridge handles the events relevant to streaming assistant turns —
      * `message_*`, `tool_execution_*`. Pi lifecycle frames (`agent_*`,
-     * `turn_*`, `tool_execution_update`) do not have a `stream.resp`
-     * representation — hosts already track turn outcome at a higher level
-     * (PiTurnRunner) and emit the terminal status explicitly. They are
-     * surfaced as `debug.trace` events so observers (replay tools, cloud
-     * tracing, daemon SSE consumers) can see Pi's full producer-side
-     * lifecycle without affecting the canonical wire format. Callers can
-     * still safely forward every event without coordination.
+     * `turn_*` do not have a `stream.resp` representation — hosts already
+     * track turn outcome at a higher level (PiTurnRunner) and emit the
+     * terminal status explicitly. The `task` tool's `tool_execution_update` is
+     * the exception: it publishes a safe, structured start receipt (the newly
+     * created sub-session id) while the call is still running, so it is
+     * projected as an ordinary tool-call chunk as well as a trace.
+     * Callers can still safely forward every event without coordination.
      * `observedAtMs` uses the bridge clock and is captured before caller-side
      * queues or response hooks; omitted timestamps are measured during processing.
      */
@@ -263,10 +263,7 @@ export class EventBridge {
                     tool_result_count: event.toolResults.length,
                 });
             case 'tool_execution_update':
-                return this.onPiLifecycleTrace('pi_tool_execution_update', 'Pi tool execution partial update', {
-                    tool_name: event.toolName,
-                    tool_call_id: event.toolCallId,
-                });
+                return this.onToolExecutionUpdate(event);
             default: {
                 // Defensive — future pi variants surface here as a debug trace so
                 // we can detect them without crashing.
@@ -279,11 +276,9 @@ export class EventBridge {
     }
     /**
      * Emit a single `debug.trace` event carrying a Pi lifecycle marker.
-     * Used for the producer-side frames (`agent_*` / `turn_*` /
-     * `tool_execution_update`) that have no wire-level `stream.resp`
-     * representation — surfacing them as traces keeps observers informed
-     * without affecting the canonical streaming surface or message
-     * lifecycle.
+     * Used for producer-side frames (`agent_*` / `turn_*`) that have no
+     * wire-level `stream.resp` representation. Tool partial updates use their
+     * own projector below so they can update the live tool-call snapshot.
      */
     onPiLifecycleTrace(phase, message, attrs) {
         return {
@@ -612,46 +607,11 @@ export class EventBridge {
         const errorMessage = extractAssistantErrorMessage(event.message);
         if (errorMessage)
             this.lastAssistantErrorMessage = errorMessage;
-        // 当 LLM error 被分类为 UI 已支持的 typed daemon code 时，输出紧凑的
-        // `code:message` terminal error。UI 会将 assistant + finish_reason=error
-        // 消费为 session status，local-runtime 会过滤掉这类 terminal assistant 气泡。
-        const classified = errorMessage ? classifyLLMErrorToCode(errorMessage) : null;
-        const typedErrorText = classified !== null && TYPED_TERMINAL_ERROR_CODES.has(classified.status_code)
-            ? `${classified.status_code}:${classified.message}`
-            : undefined;
-        const assistantText = extractAssistantText(event.message);
-        const systemErrorContent = !assistantText && Boolean(errorMessage);
-        const text = assistantText || typedErrorText || (errorMessage ? `[Error] ${errorMessage}` : '');
-        const thinking = extractAssistantThinking(event.message) || undefined;
-        const toolCalls = extractAssistantToolCalls(event.message);
-        const finishReason = isAssistantError(event.message) ? 'error' : stopReason;
-        const thinkingDurationMs = this.thinkingStartMs !== undefined && this.thinkingEndMs !== undefined
-            ? Math.max(0, this.thinkingEndMs - this.thinkingStartMs)
-            : undefined;
-        const requestDurationMs = this.ctx.includeDetailedUsage === true
-            ? this.ctx.requestDurationMs?.(event.message)
-            : undefined;
-        const decodeDurationMs = this.ctx.includeDetailedUsage === true && this.firstTokenMs !== undefined
-            ? Math.max(0, (observedAtMs ?? this.now()) - this.firstTokenMs)
-            : undefined;
-        const usage = {
-            ...(extractAssistantUsage(event.message, this.contextWindow) ?? {
-                total_tokens: 0,
-                context_window: this.contextWindow,
-            }),
-            ...(decodeDurationMs !== undefined && Number.isFinite(decodeDurationMs)
-                ? { decode_duration_ms: decodeDurationMs }
-                : {}),
-            ...(typeof requestDurationMs === 'number' &&
-                Number.isFinite(requestDurationMs) &&
-                requestDurationMs > 0
-                ? { request_duration_ms: requestDurationMs }
-                : {}),
-        };
-        // Always emit the finish chunk immediately at message_end — it signals
-        // "LLM is done generating" and downstream consumers (UI, archon-server
-        // queue gating) rely on it to advance state regardless of tool-execution
-        // status. The completed RespData (type=2) emit is decided next.
+        const { text, systemErrorContent, thinking, toolCalls, finishReason, thinkingDurationMs, usage, } = this.summarizeAssistantMessage(event.message, stopReason, observedAtMs);
+        // Always emit the finish chunk immediately at message_end — it marks the
+        // end of one model step (tool-use steps included); the UI finalizes that
+        // step's message on it while the Turn keeps running. The completed
+        // RespData (type=2) emit is decided next.
         const finishEvent = buildFinishChunk({
             sessionId: this.ctx.sessionId,
             turnId: this.ctx.turnId,
@@ -705,6 +665,109 @@ export class EventBridge {
         };
         return { events: [finishEvent] };
     }
+    /**
+     * The completed-message fields of one assistant message, as `onMessageEnd`
+     * stages them. Thinking and decode timing come from this bridge's own
+     * stream observation, so a message this bridge never streamed has none.
+     */
+    summarizeAssistantMessage(message, stopReason, observedAtMs) {
+        const errorMessage = extractAssistantErrorMessage(message);
+        // 当 LLM error 被分类为 UI 已支持的 typed daemon code 时，输出紧凑的
+        // `code:message` terminal error。UI 会将 assistant + finish_reason=error
+        // 消费为 session status，local-runtime 会过滤掉这类 terminal assistant 气泡。
+        const classified = errorMessage ? classifyLLMErrorToCode(errorMessage) : null;
+        const typedErrorText = classified !== null && TYPED_TERMINAL_ERROR_CODES.has(classified.status_code)
+            ? `${classified.status_code}:${classified.message}`
+            : undefined;
+        const assistantText = extractAssistantText(message);
+        const systemErrorContent = !assistantText && Boolean(errorMessage);
+        const text = assistantText || typedErrorText || (errorMessage ? `[Error] ${errorMessage}` : '');
+        const thinking = extractAssistantThinking(message) || undefined;
+        const toolCalls = extractAssistantToolCalls(message);
+        const finishReason = isAssistantError(message) ? 'error' : stopReason;
+        const thinkingDurationMs = this.thinkingStartMs !== undefined && this.thinkingEndMs !== undefined
+            ? Math.max(0, this.thinkingEndMs - this.thinkingStartMs)
+            : undefined;
+        const requestDurationMs = this.ctx.includeDetailedUsage === true ? this.ctx.requestDurationMs?.(message) : undefined;
+        const decodeDurationMs = this.ctx.includeDetailedUsage === true && this.firstTokenMs !== undefined
+            ? Math.max(0, (observedAtMs ?? this.now()) - this.firstTokenMs)
+            : undefined;
+        const usage = {
+            ...(extractAssistantUsage(message, this.contextWindow) ?? {
+                total_tokens: 0,
+                context_window: this.contextWindow,
+            }),
+            ...(decodeDurationMs !== undefined && Number.isFinite(decodeDurationMs)
+                ? { decode_duration_ms: decodeDurationMs }
+                : {}),
+            ...(typeof requestDurationMs === 'number' &&
+                Number.isFinite(requestDurationMs) &&
+                requestDurationMs > 0
+                ? { request_duration_ms: requestDurationMs }
+                : {}),
+        };
+        return {
+            text,
+            systemErrorContent,
+            thinking,
+            toolCalls,
+            finishReason,
+            thinkingDurationMs,
+            usage,
+        };
+    }
+    /**
+     * Re-open an assistant message an earlier run of the same Turn streamed but
+     * never completed (it stopped at a yield while its tool calls waited), so
+     * the resumed tool calls attach to its `msgId` and its completed message is
+     * emitted once, with that id, when the last of them ends. Calls that already
+     * have a result are staged with it; the rest wait for their tool events.
+     */
+    resumeAssistantMessage(input) {
+        this.beginAssistantMessage();
+        this.activeAssistantMessageId = input.msgId;
+        this.awaitingMessageId = false;
+        const results = new Map(input.toolResults.map((result) => [result.toolCallId, result]));
+        let pending = 0;
+        for (const part of input.assistant.content) {
+            if (part.type !== 'toolCall')
+                continue;
+            const started = {
+                tool_name: part.name,
+                tool_call_id: part.id,
+                args: part.arguments,
+                status: 'started',
+                ...this.resolveToolCallProvenance({
+                    phase: 'start',
+                    toolName: part.name,
+                    args: part.arguments,
+                }),
+            };
+            const result = results.get(part.id);
+            if (!result)
+                pending += 1;
+            // A settled call gets the snapshot a live tool end builds; its duration was not measured here.
+            const end = result && {
+                toolCallId: part.id,
+                toolName: part.name,
+                result: { content: result.content, details: result.details },
+                isError: result.isError,
+            };
+            this.completedToolCalls.set(part.id, end ? this.endedToolCall(end, started) : started);
+        }
+        this.pendingToolCount = pending;
+        const summary = this.summarizeAssistantMessage(input.assistant, input.assistant.stopReason);
+        this.pendingCompletedMessage = {
+            msgId: input.msgId,
+            text: summary.text,
+            systemErrorContent: summary.systemErrorContent,
+            thinking: summary.thinking,
+            thinkingDurationMs: undefined,
+            finishReason: summary.finishReason,
+            usage: summary.usage,
+            assistant: input.assistant,
+        };
+    }
     onToolStart(event) {
         if (!this.activeAssistantMessageId) {
             return {
@@ -722,6 +785,8 @@ export class EventBridge {
             };
         }
         const args = event.args;
+        // Before the chunk below sanitizes anything: the host reads the raw arguments from here.
+        this.ctx.toolCallContent?.recordStart(event.toolCallId, args);
         const toolCall = {
             tool_name: event.toolName,
             tool_call_id: event.toolCallId,
@@ -776,6 +841,71 @@ export class EventBridge {
             ],
         };
     }
+    /**
+     * Project a tool's partial result into the live tool-call stream. Partial
+     * results are not fed back to the model; they only update the display-side
+     * snapshot until the terminal `tool_execution_end` arrives. This is what
+     * lets a foreground `task` expose its child session id before the child
+     * finishes.
+     */
+    onToolExecutionUpdate(event) {
+        // Only known dispatch receipts enter the timeline; arbitrary progress stays trace-only.
+        const name = event.toolName.toLowerCase();
+        if (name !== 'task' &&
+            !(name === 'code_review' && isReviewStartedReceipt(event.partialResult))) {
+            return this.onPiLifecycleTrace('pi_tool_execution_update', 'Pi tool execution partial update', { tool_name: event.toolName, tool_call_id: event.toolCallId });
+        }
+        const startedSnapshot = this.completedToolCalls.get(event.toolCallId);
+        const parentToolCallId = event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id;
+        const args = startedSnapshot?.args ??
+            (event.args !== undefined && typeof event.args === 'object' && event.args !== null
+                ? event.args
+                : undefined);
+        const toolCall = {
+            tool_name: event.toolName,
+            tool_call_id: event.toolCallId,
+            ...(parentToolCallId ? { parent_tool_call_id: parentToolCallId } : {}),
+            status: 'started',
+            ...(args ? { args } : {}),
+            ...(event.partialResult !== undefined
+                ? { result: event.partialResult }
+                : startedSnapshot?.result !== undefined
+                    ? { result: startedSnapshot.result }
+                    : {}),
+            ...(startedSnapshot?.plugin_provenances
+                ? { plugin_provenances: startedSnapshot.plugin_provenances }
+                : {}),
+        };
+        this.completedToolCalls.set(event.toolCallId, toolCall);
+        const trace = buildDebugTraceEvent({
+            sessionId: this.ctx.sessionId,
+            turnId: this.ctx.turnId,
+            eventId: this.ctx.eventIdGenerator('pi_tool_execution_update'),
+            phase: 'pi_tool_execution_update',
+            message: 'Pi tool execution partial update',
+            attrs: {
+                tool_name: event.toolName,
+                tool_call_id: event.toolCallId,
+            },
+        });
+        if (!this.activeAssistantMessageId)
+            return { events: [trace] };
+        return {
+            events: [
+                trace,
+                buildToolCallChunk({
+                    sessionId: this.ctx.sessionId,
+                    turnId: this.ctx.turnId,
+                    eventId: this.ctx.eventIdGenerator('coding_tool_update'),
+                    runtimeSeq: this.ctx.runtimeSeqGenerator(),
+                    msgId: this.activeAssistantMessageId,
+                    chunkIndex: this.nextChunkIndex(),
+                    toolCall,
+                    nowMs: this.now(),
+                }),
+            ],
+        };
+    }
     async onToolEnd(event) {
         const startedSnapshot = this.completedToolCalls.get(event.toolCallId);
         if (event.parentToolCallId &&
@@ -814,26 +944,8 @@ export class EventBridge {
                 this.toolStartMs.delete(event.toolCallId);
             }
         }
-        const toolCall = {
-            tool_name: event.toolName,
-            tool_call_id: event.toolCallId,
-            ...((event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id)
-                ? {
-                    parent_tool_call_id: event.parentToolCallId ?? startedSnapshot?.parent_tool_call_id,
-                }
-                : {}),
-            ...(startedSnapshot?.args !== undefined ? { args: startedSnapshot.args } : {}),
-            status: event.isError ? 'failed' : 'completed',
-            ...(event.result !== undefined ? { result: event.result } : {}),
-            ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
-            ...this.resolveToolCallProvenance({
-                phase: 'end',
-                toolName: event.toolName,
-                ...(startedSnapshot?.args !== undefined ? { args: startedSnapshot.args } : {}),
-                ...(event.result !== undefined ? { result: event.result } : {}),
-                isError: event.isError,
-            }, startedSnapshot?.plugin_provenances),
-        };
+        const toolCall = this.endedToolCall(event, startedSnapshot, durationMs);
+        this.ctx.toolCallContent?.recordEnd(event.toolCallId, event.result);
         const events = [
             ...this.closeUnknownPtcChildren(event),
             buildDebugTraceEvent({
@@ -927,6 +1039,7 @@ export class EventBridge {
                     },
                 },
             };
+            this.ctx.toolCallContent?.recordEnd(record.child_tool_call_id, closed.result);
             const startedAtMs = this.toolStartMs.get(record.child_tool_call_id);
             if (startedAtMs !== undefined)
                 closed.duration_ms = this.now() - startedAtMs;
@@ -944,6 +1057,30 @@ export class EventBridge {
             }));
         }
         return events;
+    }
+    /**
+     * The terminal snapshot of a tool call: the started snapshot's parent and
+     * args, the end status and result, and the Plugin provenance resolved at end
+     * (the start's when the end resolves none).
+     */
+    endedToolCall(end, started, durationMs) {
+        const parentToolCallId = end.parentToolCallId ?? started?.parent_tool_call_id;
+        return {
+            tool_name: end.toolName,
+            tool_call_id: end.toolCallId,
+            ...(parentToolCallId ? { parent_tool_call_id: parentToolCallId } : {}),
+            ...(started?.args !== undefined ? { args: started.args } : {}),
+            status: end.isError ? 'failed' : 'completed',
+            ...(end.result !== undefined ? { result: end.result } : {}),
+            ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
+            ...this.resolveToolCallProvenance({
+                phase: 'end',
+                toolName: end.toolName,
+                ...(started?.args !== undefined ? { args: started.args } : {}),
+                ...(end.result !== undefined ? { result: end.result } : {}),
+                isError: end.isError,
+            }, started?.plugin_provenances),
+        };
     }
     resolveToolCallProvenance(input, fallback) {
         const resolver = this.ctx.toolCallProvenanceResolver;
@@ -1162,6 +1299,23 @@ function normalizePluginProvenances(input) {
     return [...unique.values()].sort((left, right) => left.plugin_name.localeCompare(right.plugin_name, 'en-US') ||
         (left.plugin_version ?? '').localeCompare(right.plugin_version ?? '', 'en-US') ||
         left.capability_name.localeCompare(right.capability_name, 'en-US'));
+}
+function isReviewStartedReceipt(result) {
+    if (!result || typeof result !== 'object')
+        return false;
+    const details = result.details;
+    if (!details || typeof details !== 'object')
+        return false;
+    const executions = details.subagent_executions;
+    return (Array.isArray(executions) &&
+        executions.length > 0 &&
+        executions.every((entry) => {
+            if (!entry || typeof entry !== 'object')
+                return false;
+            return (entry.status === 'started' &&
+                ['agent_name', 'sub_session_id', 'sub_turn_id'].every((key) => typeof entry[key] === 'string' && entry[key].trim().length > 0) &&
+                ['description', 'agent_display_name'].every((key) => entry[key] === undefined || typeof entry[key] === 'string'));
+        }));
 }
 /**
  * A tool batch whose every result ended the Turn on purpose is the Turn's last

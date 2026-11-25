@@ -19,7 +19,7 @@
  * `unpdf` is imported lazily inside the PDF branch only — it embeds a
  * ~2MB pdfjs build that must not sit on the startup path of every read.
  */
-import { readFile } from './physical-fs.js';
+import { physicalToolFs } from './physical-fs.js';
 import { extname } from 'node:path';
 import { readErrorResult } from './read-result.js';
 /** reference CLI apiLimits.ts: PDF_MAX_PAGES_PER_READ */
@@ -89,7 +89,7 @@ export function validatePdfPagesParam(pages) {
  * reference CLI ignores them for PDFs too) — paging is expressed with `pages`.
  */
 export async function readPdfAsToolResult(opts) {
-    const { toolName, absolutePath, pages } = opts;
+    const { toolName, absolutePath, pages, fs = physicalToolFs } = opts;
     // 1. Pure string validation first — no file I/O for malformed input.
     if (pages !== undefined) {
         const invalid = validatePdfPagesParam(pages);
@@ -100,7 +100,7 @@ export async function readPdfAsToolResult(opts) {
     // pi-compatible filename variants resolve them before invoking this helper.
     let data;
     try {
-        data = new Uint8Array(await readFile(absolutePath));
+        data = new Uint8Array(await fs.readFile(absolutePath));
     }
     catch (err) {
         const code = err.code;

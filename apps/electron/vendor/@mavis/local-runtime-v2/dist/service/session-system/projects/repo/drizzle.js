@@ -3,6 +3,7 @@ import { and, asc, desc, eq, getTableColumns, gt, isNotNull, lt, or, sql, } from
 import { DEFAULT_PROJECT_ORDER_INDEX, projects } from '../../../../infra/db/schema/projects.js';
 import { sessions } from '../../../../infra/db/schema/sessions.js';
 import { canonicalProjectWorkspaceDir } from '../../shared/workspace.js';
+import { listedFirstValues, moveProjectInList } from '../../shared/project-list-position.js';
 import { recordProjectRemoval, restoreSessionAfterProjectRemoval, } from '../../shared/project-removal.js';
 import { eligible } from '../sidebar/predicate.js';
 import { sessionAgentNamePredicate } from '../../sessions/repo/agent-name-predicate.js';
@@ -153,11 +154,12 @@ class DrizzleProjectRepository {
     async setMetadata(projectId, metadata, nowMs) {
         // Metadata and any legacy removal boundary are committed together;
         // updatedAt advances once and other metadata remains unchanged.
-        const { displayName, iconJson, workspaceRoots, unhide } = metadata;
+        const { displayName, iconJson, workspaceRoots, unhide, relist } = metadata;
         if (displayName === undefined &&
             iconJson === undefined &&
             workspaceRoots === undefined &&
-            !unhide) {
+            !unhide &&
+            !relist) {
             return this.getById(projectId);
         }
         const extraDataPaths = [];
@@ -181,7 +183,7 @@ class DrizzleProjectRepository {
                     }
                     : {}),
                 ...(displayName !== undefined ? { displayName } : {}),
-                ...(unhide ? { hidden: 0 } : {}),
+                ...(relist || unhide ? listedFirstValues(tx, nowMs, { unhide }) : {}),
                 updatedAtMs: sql `max(${projects.updatedAtMs} + 1, ${nowMs})`,
             })
                 .where(eq(projects.projectId, projectId))
@@ -199,7 +201,7 @@ class DrizzleProjectRepository {
     async setHidden(projectId, hidden, nowMs) {
         this.options.db.transaction((tx) => {
             const project = tx
-                .select({ projectId: projects.projectId })
+                .select({ projectId: projects.projectId, hidden: projects.hidden })
                 .from(projects)
                 .where(eq(projects.projectId, projectId))
                 .get();
@@ -208,7 +210,13 @@ class DrizzleProjectRepository {
             if (hidden)
                 recordProjectRemoval(tx, project, nowMs);
             tx.update(projects)
-                .set({ hidden: hidden ? 1 : 0, updatedAtMs: nowMs })
+                .set({
+                // A removed project that is shown again is listed first, like a new one.
+                ...(!hidden && project.hidden
+                    ? listedFirstValues(tx, nowMs, { unhide: true })
+                    : { hidden: hidden ? 1 : 0 }),
+                updatedAtMs: nowMs,
+            })
                 .where(eq(projects.projectId, projectId))
                 .run();
         });
@@ -229,6 +237,10 @@ class DrizzleProjectRepository {
                 .where(eq(projects.projectId, projectId))
                 .run();
         }));
+    }
+    async moveListed(projectId, afterProjectId, nowMs) {
+        this.options.db.transaction((tx) => moveProjectInList(tx, projectId, afterProjectId, nowMs));
+        return this.getById(projectId);
     }
     async touchRecent(projectId, nowMs) {
         return this.update(projectId, { recentAtMs: nowMs, updatedAtMs: nowMs });

@@ -1,14 +1,18 @@
 import { executionLocationLabel } from './execution-location.js';
 import { BUNNY_AGENT_NAME } from '../../bunny/index.js';
 import { escapeAssignmentData, FULL_REPLY_TOKENS, PREVIEW_EDGE_TOKENS, renderTaskReport as renderTaskReportText, replyOmissionLine, replyPreviewNote, REVIEW_FAILURE_CAUSE, REVIEW_STOPPED, reviewGaveUp, ROUND_INTERRUPTED_BY_RESTART, } from '../../coordinator-text/index.js';
-import { DEFAULT_SPACE_NAME, isAssignedByBunny, stoppedByRestart, } from '../../session-system/index.js';
+import { stoppedByRestart, } from '../../session-system/index.js';
 import { refusalCooldownMs } from '@mavis/agent-core/pi-turn-runner';
 import { ConversationTurnRejectedError } from '@mavis/conversation-contract';
 import { createDefaultTokenEstimator } from '@mavis/context-manager';
 import { classifyFinishStepError } from '@mavis/shared/llm-error-classifier';
 import { deliveredArtifacts, } from '../contracts.js';
+import { reviewConclusionHeld } from '../state/conclusion-facts.js';
+import { assignmentReportOrigin, checkedByBunny, sameOrigin } from '../state/origin-routing.js';
 import { taskErrorReason } from '../state/task-error-reason.js';
+import { isVerdictGated } from '../verdict/verdict-gate.js';
 import { VerdictWakeDelivery } from '../verdict/verdict-wake.js';
+import { ReportVerdictWiring } from '../verdict/verdict-wiring.js';
 /**
  * A review that does not finish (its turn fails, or a restart interrupts it)
  * redelivers its report at most this many times. The count is persisted on the
@@ -42,6 +46,8 @@ export class AssignmentReportService {
     batches = new Map();
     /** Verdict wakes: separate from report batches, a wake is not a task report. */
     verdicts;
+    /** The verdict path's report-side wiring; see verdict/verdict-wiring.ts. */
+    verdictWiring;
     reported = new Set();
     /**
      * Bunny sessions that asked a questionnaire in the turn now running. A session
@@ -74,6 +80,16 @@ export class AssignmentReportService {
         this.unsubscribe = options.events.subscribe({
             next: (event) => this.track(() => this.observe(event)),
         });
+        this.verdictWiring = new ReportVerdictWiring({
+            options: this.options,
+            reviewTimeoutMs: MAX_BACKSTOP_RETRIES * BACKSTOP_INTERVAL_MS,
+            userTurn: (signal) => this.userTurn(signal),
+            lastReply: (messages) => lastReply(messages),
+        });
+    }
+    /** @see ReportVerdictWiring.bind */
+    bindVerdictPort(port) {
+        this.verdictWiring.bind(port);
     }
     failed(signal) {
         this.track(() => this.capture({ ...signal, state: 'failed' }));
@@ -134,11 +150,19 @@ export class AssignmentReportService {
             const session = await this.options.sessions.get(sessionId);
             if (!session || session.archived || session.status === 'started')
                 continue;
-            if (assignment.review &&
+            // A verdict-gated task's review is the review task's, not a coordinator Turn's: the
+            // sweep below owns whether it gave up, so the old review recovery must not touch it.
+            // Its report still recovers like any other task's.
+            if (!isVerdictGated(assignment) &&
+                assignment.review &&
                 !(await this.recoverReview({ session, assignment })))
                 continue;
             await this.recoverRound(session);
         }
+        // A verdict stored before the last shutdown is woken again; the batches that held it
+        // died with the previous process, and nothing else would pick it up.
+        await this.verdicts.recover();
+        await this.verdictWiring.sweep();
     }
     /**
      * Reports the task's last round if the previous process did not. A round the
@@ -187,6 +211,8 @@ export class AssignmentReportService {
         for (const coordinatorId of new Set([...this.handling.values()].map((e) => e.coordinatorId)))
             if (await this.heldReviewEnd(coordinatorId))
                 this.releaseHandling(coordinatorId);
+        // A review that will never report releases the gate it holds, so no task waits for good.
+        await this.verdictWiring.sweep();
         // A verdict wake held by a busy assigner is retried here too.
         this.verdicts.retryAll();
     }
@@ -195,7 +221,9 @@ export class AssignmentReportService {
         const session = await this.options.sessions.get(sessionId);
         if (!session || session.archived)
             return undefined;
-        if (assignment.review) {
+        // Same as in ready(): the verdict sweep owns a gated task's review, not this retry. An
+        // undelivered report of a gated task is still retried below like any other.
+        if (!isVerdictGated(assignment) && assignment.review) {
             const task = { session, assignment };
             const end = await this.heldReviewEnd(task.assignment.review.sessionId);
             if (!end || (await this.options.facts.status(session)).pendingQuestionCount)
@@ -349,6 +377,8 @@ export class AssignmentReportService {
             return this.questionDismissed(event.payload.sessionId);
         if (isTerminalEvent(event))
             await this.recordRound(event);
+        if (isTerminalEvent(event))
+            await this.verdictWiring.reviewVerdict(event);
         await this.reviewEvent(event);
         const signal = reportSignal(event);
         if (signal)
@@ -472,6 +502,14 @@ export class AssignmentReportService {
             return;
         const { retry, reviewRetries, gaveUp } = this.reviewRetry(task, event.type === 'session.error');
         const sessionId = task.session.sessionId;
+        if (await reviewConclusionHeld(assignment, success, sessionId, this.options.facts)) {
+            await this.options.tasks.finishReview(sessionId, {
+                clearReportedKey: false,
+                result: REVIEW_RESULT[event.type],
+            });
+            this.onDelivered?.(sessionId);
+            return;
+        }
         const reviewError = this.givenUp(review, event, gaveUp === true);
         await this.options.tasks.finishReview(sessionId, {
             ...(reviewRetries ? { reviewRetries } : {}),
@@ -484,13 +522,18 @@ export class AssignmentReportService {
         if (retry)
             await this.redeliver(sessionId, review.reportKey, reviewCooldownMs(event));
     }
-    /** Bunny's review ended without a conclusion: the report's summary stands for it. */
+    /**
+     * Bunny's review ended without a conclusion: the report's summary stands for it. The
+     * closure is marked automatic, so a background result the task started that finishes
+     * later reopens the task instead of only telling Bunny.
+     */
     async reviewedCompletion(task) {
         return {
             state: 'completed',
             by: 'assigner',
             at: this.options.nowMs(),
             reason: 'review_passed',
+            automatic: true,
             summary: task.assignment.review.summary,
             ...(await deliveredArtifacts(this.options.assets, task.session.sessionId)),
         };
@@ -628,8 +671,10 @@ export class AssignmentReportService {
             initiator,
             ...(signal.detail ? { detail: signal.detail } : {}),
         };
-        const spaceName = (await this.options.worklines.list()).find((space) => space.id === item.worklineId)?.name ??
-            DEFAULT_SPACE_NAME;
+        const spaceName = item.worklineId
+            ? ((await this.options.worklines.list()).find((space) => space.id === item.worklineId)
+                ?.name ?? item.worklineId)
+            : undefined;
         const assets = await this.options.assets(session.sessionId, signal.turnId);
         return {
             item,
@@ -690,7 +735,7 @@ export class AssignmentReportService {
         // go out on its terminal event or settlement (3.3).
         if (targetSession.status === 'started')
             return;
-        const items = await this.currentReports(batch);
+        const items = sameOrigin(await this.currentReports(batch));
         if (!items.length)
             return;
         batch.delivering = true;
@@ -720,7 +765,7 @@ export class AssignmentReportService {
         return {
             content: items.map(renderTaskReport).join('\n\n'),
             attachments: [],
-            origin: { assignmentReport: { items: items.map(({ item }) => item) } },
+            origin: assignmentReportOrigin(items, MAX_REVIEW_RETRIES),
         };
     }
     async deliver(target, items) {
@@ -766,12 +811,15 @@ export class AssignmentReportService {
                 this.reported.delete(oldest);
         }
         const checked = checkedByBunny(pending);
+        // A verdict-gated task is checked by its own review task, not by Bunny's turn: writing
+        // assignment.review here would hand the automatic conclusion path a task the gate owns.
+        const gated = isVerdictGated(pending.assignment);
         // Only the round this report was made for records it; a newer send keeps its own state.
         await this.options.tasks.recordReport(pending.item.sessionId, pending.assignment, {
             reportKey: pending.key,
             ...reportRound(pending),
             // Only Bunny's own round is reviewed; the user's round is not an approval to check.
-            ...(checked && pending.item.state === 'completed'
+            ...(checked && !gated && pending.item.state === 'completed'
                 ? {
                     review: {
                         sessionId: target,
@@ -788,10 +836,6 @@ export class AssignmentReportService {
             batch.pending.delete(pending.item.sessionId);
         this.onDelivered?.(pending.item.sessionId);
     }
-}
-/** Bunny checks its own rounds of its own tasks; the user's round is not Bunny's to check. */
-function checkedByBunny(pending) {
-    return isAssignedByBunny(pending.assignment) && pending.item.initiator === 'assigner';
 }
 /**
  * A v2 skip: the question stays pending and answerable but has `dismissedAt`
@@ -947,7 +991,7 @@ function renderTaskReport({ item, assignment, text, spaceName, assets }) {
     const safe = escapeAssignmentData;
     return renderTaskReportText({
         title: safe(item.title),
-        spaceName: safe(spaceName),
+        ...(spaceName ? { spaceName: safe(spaceName) } : {}),
         projectName: safe(item.projectName),
         sessionId: safe(item.sessionId),
         initiator: item.initiator,

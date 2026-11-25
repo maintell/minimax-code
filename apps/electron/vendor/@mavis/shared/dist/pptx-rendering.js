@@ -1,5 +1,5 @@
 import { PPTX_DIAGNOSTIC_POLICY_BY_CODE_V1, } from './pptx-diagnostic-policy.generated.js';
-import { PPTX_PREVIEW_LIMITS_V1, PPTX_PREVIEW_LIMITS_VERSION_V1, } from './pptx-preview-limits.generated.js';
+import { PPTX_PREVIEW_LIMITS_V1, PPTX_PREVIEW_LIMITS_VERSION_V1, isPptxStoredMediaEntryV1, } from './pptx-preview-limits.generated.js';
 import { normalizePptxErrorTraceV1, normalizePptxNodeProfileV1 } from './pptx-telemetry.js';
 import { PPTX_ANIMATION_EVALUATION_SCHEMA_V1, PPTX_CORE_SESSION_SCHEMA_V1, PPTX_CORE_STREAM_CHUNK_BYTES_V1, PPTX_CORE_STREAM_MAX_UNACKNOWLEDGED_V1, PPTX_CORE_STREAM_SCHEMA_V1, PPTX_DECK_SUMMARY_SCHEMA_V1, PPTX_DIAGNOSTIC_REPORT_SCHEMA_V1, PPTX_RENDER_RESOURCE_SCHEMA_V1, PPTX_RENDER_WIRE_LIMITS_V1, PPTX_SELECTION_RESOURCE_SCHEMA_V1, PPTX_SLIDE_ANIMATION_SCHEMA_V1, PPTX_SLIDE_NOTES_SCHEMA_V1, PPTX_SLIDE_RENDER_SCHEMA_V1, PPTX_SLIDE_SELECTION_MODEL_SCHEMA_V1, PPTX_SLIDE_SELECTION_MODEL_SCHEMA_V2, PPTX_TEXT_SEARCH_SCHEMA_V1, PPTX_TRANSITION_EVALUATION_SCHEMA_V1, SAFE_PACKAGE_HANDLE_SCHEMA_V1, } from './pptx-rendering-contract.js';
 import { DIAGNOSTIC_REASON, MEDIA_TYPE, NOTES_DIAGNOSTIC_CODE, NOTES_LANGUAGE_HINT, NOTES_LIMITS_V1, PPTX_DIAGNOSTIC_STAGES_V1, PPT_DOCUMENT_HASH, PPT_DOCUMENT_ID, PPT_DOCUMENT_REVISION, PPT_NODE_ID, TEXT_SEARCH_LIMITS_V1, booleanValue, boundedNotesText, boundedSourceText, boundedStrings, boundedText, decodeNotesSourceAnchorV1, decodeRect, decodeRenderNode, decodeRenderResourceRef, deepFreezeWire, exactKeys, finiteInteger, nonNegativeInteger, opaque, partUri, pptIdentity, record, renderHash, renderNodeId, renderResourceId, sha256, } from './pptx-wire-validation.js';
@@ -322,7 +322,13 @@ export function decodeSafePackageHandleV1(value) {
             !['indexed', 'materializing', 'ready', 'terminal'].includes(entry.state))
             throw new TypeError('invalid entry classification');
         const compressedSize = nonNegativeInteger(entry.compressedSize, 'compressedSize', PPTX_PREVIEW_LIMITS_V1.maxInputBytes);
-        const uncompressedSize = nonNegativeInteger(entry.uncompressedSize, 'uncompressedSize', PPTX_PREVIEW_LIMITS_V1.maxEntryUncompressedBytes);
+        const storedMedia = entry.category === 'media' &&
+            isPptxStoredMediaEntryV1(canonicalPartUri, entry.compressionMethod);
+        const uncompressedSize = nonNegativeInteger(entry.uncompressedSize, 'uncompressedSize', storedMedia
+            ? PPTX_PREVIEW_LIMITS_V1.maxStoredMediaEntryBytes
+            : PPTX_PREVIEW_LIMITS_V1.maxEntryUncompressedBytes);
+        if (storedMedia && compressedSize !== uncompressedSize)
+            throw new TypeError('stored media entry size mismatch');
         totalUncompressedBytes += uncompressedSize;
         if (entry.category === 'media')
             mediaBytes += uncompressedSize;

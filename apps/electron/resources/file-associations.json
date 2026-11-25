@@ -171,5 +171,12 @@
   ],
   "skills": [
     "skill"
+  ],
+  "miniapp": [
+    "stl",
+    "step",
+    "stp",
+    "pcraft",
+    "ccproj"
   ]
 }

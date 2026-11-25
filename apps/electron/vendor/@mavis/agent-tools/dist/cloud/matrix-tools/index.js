@@ -7,7 +7,7 @@
  *   2. 导出 `MATRIX_TOOL_NAMES` 常量(RuntimeTool name 列表),
  *      `CAPABILITY_TO_TOOL_NAMES.Other` 直接 spread 引用
  *   3. 导出 `getSuppressedToolNamesForModelCapabilities` —— 共享的 model
- *      capability gate(cloud-runtime + local-runtime 都消费这一份 SoT),
+ *      capability gate(harness turn tool catalog 与 cloud tool catalog 都消费这一份 SoT),
  *      用于在每 turn 装配 tool 时屏蔽已被原生模态吸收的兜底工具
  *      (`images_understand` / `videos_understand`)
  *
@@ -145,34 +145,6 @@ function withMatrixLogger(tool, matrixLogger) {
     };
 }
 export { MATRIX_TOOL_PATHS };
-/**
- * Model capability → concrete tool suppression table.
- *
- * Tool authorization still starts from `agent_config.tools[]`; this table only
- * narrows redundant model-assist tools when the active model can natively
- * consume that modality. Model switches are explicit turn-level capability
- * changes, so the per-turn tool snapshot should reflect the current model's
- * real effective surface instead of keeping stale fallback tools around.
- *
- * Shared by both cloud-runtime (`packages/cloud-runtime/src/tools/index.ts`)
- * and local-runtime (`packages/local-runtime-v2/src/service/turn-system/agent-host/assembly/local-turn-tool-catalog.ts`)
- * so the two runtimes apply the same gate against the same `IModelCapabilities`
- * shape.
- */
-const MODEL_CAPABILITY_SUPPRESSED_TOOL_NAMES = {
-    supportImage: [MatrixImagesUnderstandToolDef.name],
-    supportVideo: [MatrixVideosUnderstandToolDef.name],
-};
-export function getSuppressedToolNamesForModelCapabilities(capabilities) {
-    const suppressed = new Set();
-    if (capabilities?.support_image === true) {
-        for (const name of MODEL_CAPABILITY_SUPPRESSED_TOOL_NAMES.supportImage)
-            suppressed.add(name);
-    }
-    if (capabilities?.support_video === true) {
-        for (const name of MODEL_CAPABILITY_SUPPRESSED_TOOL_NAMES.supportVideo)
-            suppressed.add(name);
-    }
-    return suppressed;
-}
+// The model-capability gate is host-neutral; it lives in tool-policy/.
+export { getSuppressedToolNamesForModelCapabilities } from '../../tool-policy/model-capability-suppression.js';
 //# sourceMappingURL=index.js.map

@@ -263,6 +263,24 @@ async function routeFileOpen(request, action) {
         return target;
     return runOpenCommand(action, target.absolute);
 }
+function readIdeOpenOptions(body, filePath) {
+    if (body['fileOnly'] !== undefined && typeof body['fileOnly'] !== 'boolean') {
+        return json({ error: 'fileOnly must be a boolean' }, { status: 400 });
+    }
+    const fileOnly = body['fileOnly'] === true;
+    if (fileOnly && !filePath) {
+        return json({ error: 'path is required for fileOnly' }, { status: 400 });
+    }
+    const line = body['line'];
+    if (line === undefined)
+        return { fileOnly };
+    if (typeof line !== 'number' || !Number.isSafeInteger(line) || line < 1) {
+        return json({ error: 'line must be a positive integer' }, { status: 400 });
+    }
+    if (!filePath)
+        return json({ error: 'path is required for line' }, { status: 400 });
+    return { fileOnly, line };
+}
 async function routeFileOpenInIde(request) {
     const body = await readJsonBody(request);
     const ideId = readString(body, 'ideId');
@@ -273,15 +291,11 @@ async function routeFileOpenInIde(request) {
     if (!workspace && !filePath) {
         return json({ error: 'workspace or path is required' }, { status: 400 });
     }
-    if (body['fileOnly'] !== undefined && typeof body['fileOnly'] !== 'boolean') {
-        return json({ error: 'fileOnly must be a boolean' }, { status: 400 });
-    }
-    const fileOnly = body['fileOnly'] === true;
-    if (fileOnly && !filePath) {
-        return json({ error: 'path is required for fileOnly' }, { status: 400 });
-    }
+    const options = readIdeOpenOptions(body, filePath);
+    if (options instanceof Response)
+        return options;
     try {
-        await ideLauncher.openWorkspaceInIde(workspace, ideId, filePath, fileOnly);
+        await ideLauncher.openWorkspaceInIde(workspace, ideId, filePath, options);
         return json({ ok: true });
     }
     catch (error) {

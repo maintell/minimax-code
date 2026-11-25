@@ -1,7 +1,8 @@
-import { realpath, stat } from 'node:fs/promises';
-import { isAbsolute, relative, resolve } from 'node:path';
-import { git, gitCommonDir, gitRoot } from '../operations/git-process.js';
+import { stat } from 'node:fs/promises';
+import { isAbsolute, relative } from 'node:path';
+import { git, gitCommonDir } from '../operations/git-process.js';
 import { listWorkspaceGitWorktrees } from '../operations/worktrees.js';
+import { canonicalWorktreePath, inspectRepositoryWorktrees, } from '../operations/worktree-registry.js';
 export class ManagedWorktreeService {
     runtimeSafety;
     constructor(runtimeSafety) {
@@ -15,14 +16,6 @@ export class ManagedWorktreeService {
     }
     async removeBatch(items, activeWorktreeDir) {
         return removeManagedWorktreesBatch(items, activeWorktreeDir, await this.runtimeSafety.listRunningWorktreeDirs());
-    }
-}
-async function canonicalWorktreePath(path) {
-    try {
-        return await realpath(path);
-    }
-    catch {
-        return resolve(path);
     }
 }
 async function resolveProtectedWorktreePaths(paths) {
@@ -61,49 +54,21 @@ export async function removeManagedWorktree(workspace, worktreeDir, activeWorktr
  * lightweight and reuse it for every requested worktree in the same repository.
  */
 async function inspectManagedWorktrees(workspace) {
-    const root = await gitRoot(workspace);
-    if (!root) {
-        return {
-            result: {
+    const inspected = await inspectRepositoryWorktrees(workspace);
+    if (inspected.kind === 'listed')
+        return { snapshot: inspected.repository };
+    return {
+        result: inspected.kind === 'not_repository'
+            ? {
                 status: 400,
                 body: { success: false, reason: 'not_found', error: 'Not a git repository' },
-            },
-        };
-    }
-    const listed = await git(['worktree', 'list', '--porcelain'], root);
-    if (listed.code !== 0) {
-        return {
-            result: {
-                status: 500,
-                body: {
-                    success: false,
-                    reason: 'unknown',
-                    error: listed.stderr || listed.stdout || 'Failed to inspect git worktrees',
-                },
-            },
-        };
-    }
-    const rawEntries = listed.stdout
-        .split(/\n\n+/)
-        .map((block) => Object.fromEntries(block
-        .split('\n')
-        .filter(Boolean)
-        .map((line) => {
-        const [key, ...rest] = line.split(' ');
-        return [key, rest.join(' ')];
-    })))
-        .filter((item) => typeof item.worktree === 'string');
-    const mainRoot = typeof rawEntries[0]?.worktree === 'string' ? rawEntries[0].worktree : root;
-    const entries = await Promise.all(rawEntries.map(async (entry) => ({
-        canonicalPath: await canonicalWorktreePath(String(entry.worktree)),
-        isLocked: 'locked' in entry,
-        isMain: resolve(String(entry.worktree)) === resolve(mainRoot),
-    })));
-    return { snapshot: { mainRoot, entries } };
+            }
+            : { status: 500, body: { success: false, reason: 'unknown', error: inspected.error } },
+    };
 }
 async function prepareManagedWorktreeRemoval(snapshot, worktreeDir, protectedWorktreePaths) {
     const requestedPath = await canonicalWorktreePath(worktreeDir);
-    const entry = snapshot.entries.find((candidate) => candidate.canonicalPath === requestedPath);
+    const entry = snapshot.entries.find((candidate) => candidate.path === requestedPath);
     if (!entry) {
         return {
             kind: 'refused',
@@ -254,7 +219,7 @@ export async function removeManagedWorktreesBatch(items, activeWorktreeDir, runn
             }
         }
     }
-    return { success: true, removedPaths, failedItems };
+    return { success: failedItems.length === 0, removedPaths, failedItems };
 }
 async function groupWorktreeRemovalItems(items) {
     const byWorkspace = new Map();
@@ -280,7 +245,7 @@ async function removeManagedWorktreeGroup(items, activeWorktreeDir, runningWorkt
     if ('result' in snapshot)
         return items.map((item) => ({ item, result: snapshot.result }));
     const protectedWorktreePaths = await resolveProtectedWorktreePaths([
-        activeWorktreeDir ?? items[0]?.workspace ?? snapshot.snapshot.mainRoot,
+        ...(activeWorktreeDir ? [activeWorktreeDir] : items.map((item) => item.workspace)),
         ...runningWorktreeDirs,
     ]);
     // The repository snapshot and status checks are shared by this group. Once

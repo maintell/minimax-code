@@ -4,7 +4,8 @@
  *
  * Reader: Bunny's main conversation model.
  * Injected: as the error result of a mavis call: a session command its assignment tools
- * replace, or a `space update` that passes a retired field; and, inside a Turn the user woke,
+ * replace, or a `space update` that passes a retired field; as the error result of a
+ * namespaced tool outside its allowlist; and, inside a Turn the user woke,
  * as the follow-up after a reply of plain text, which only send_to_user can deliver (the
  * AgentHost asks it and may depend on this package, never on local-runtime-v2's
  * `coordinator-text/`).
@@ -36,7 +37,7 @@ const AGENT_ROSTER_WRITE = "Creating, changing or deleting an Agent is the user'
 const MCP_READ = 'The coordinator does not read MCP settings: schedule a task with assignment_create when the answer needs it, or ask the user.';
 const MCP_WRITE = "Adding, changing or removing an MCP server is the user's own action: ask the user to do it in the app.";
 const SESSION_SETTINGS = "Renaming, archiving or re-modelling a conversation is not the coordinator's: use assignment_cancel to drop a task, and ask the user for anything else.";
-const SESSION_HELP = 'There is no session help for the coordinator: its mavis lists its own space, project and task model commands and the read-only session commands.';
+const SESSION_HELP = 'There is no session help for the coordinator: it reaches its own task spaces through bunny_task_space_list and bunny_task_space_get, the user projects through project_list, and other conversations through the read-only session_list, session_get and session_messages.';
 /**
  * What the coordinator's mavis answers for a shared command it withholds. The Agent
  * roster, MCP servers and a conversation's own settings are the user's actions; a task's
@@ -58,8 +59,43 @@ export const BUNNY_WITHHELD_COMMAND_REPLACEMENTS = {
     'session update': SESSION_SETTINGS,
     'session help': SESSION_HELP,
 };
+/**
+ * What the coordinator gets for a mavis command it does not own: the Agent roster, MCP
+ * servers and a conversation's own settings (`BUNNY_COMMAND_NOT_AVAILABLE`), or a task's
+ * conversation, which its assignment tools own (`BUNNY_ASSIGNMENT_TOOL_REQUIRED`).
+ * Undefined for every other command. The mavis executor and the executor guard in front
+ * of every namespaced tool both answer with this one result.
+ */
+export function coordinatorMavisCommandRefusal(command) {
+    const withheld = BUNNY_WITHHELD_COMMAND_REPLACEMENTS[command];
+    if (withheld !== undefined) {
+        const text = coordinatorRefusalText(command, 'BUNNY_COMMAND_NOT_AVAILABLE', withheld);
+        return {
+            tool_name: 'mavis',
+            text,
+            content: [{ type: 'text', text }],
+            isError: true,
+            programmatic: { data: JSON.parse(text) },
+        };
+    }
+    const replacement = BUNNY_COMMAND_REPLACEMENTS[command];
+    if (replacement === undefined)
+        return undefined;
+    const text = coordinatorRefusalText(command, 'BUNNY_ASSIGNMENT_TOOL_REQUIRED', replacement);
+    return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
+}
+/** The JSON every coordinator refusal of a mavis command carries. */
+export function coordinatorRefusalText(command, code, message) {
+    return JSON.stringify({ ok: false, command, error: { kind: 'validation', code, message } });
+}
+/**
+ * What the coordinator gets for any other namespaced tool outside its allowlist (a
+ * sidebar, panel, plugin or session write, or a fork): none of them is its own, so the
+ * answer names the tools that are.
+ */
+export const BUNNY_TOOL_NOT_AVAILABLE = "This tool is not the coordinator's. To dispatch, continue or stop work, use your assignment tools; ask the user for any change to the app, its sidebar, plugins or the user's own conversations.";
 /** The space memory fields `space update` no longer takes; they live in context.md's `<summary>`. */
-export const RETIRED_SPACE_UPDATE_FIELD_ERROR = 'instructions、decisions、next_steps 已取消，请用 space context write 改写 context.md 的 <summary>';
+export const RETIRED_SPACE_UPDATE_FIELD_ERROR = 'instructions、decisions、next_steps 已取消，请用 bunny_task_space_context_write 改写 context.md 的 <summary>';
 const TURN_ONLY_REMINDER = 'This reminder applies only to the current Turn. Do not save or generalize it.';
 /**
  * Asked once when a Turn that took in user input ends with text the user never sees,

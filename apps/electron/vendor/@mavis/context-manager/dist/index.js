@@ -1,8 +1,10 @@
 export { ContextManager } from './manager.js';
+export { countProjectedReplayMessages } from './replay-token-counting.js';
 export { computeCompactionTriggerAt, DEFAULT_CONTEXT_MANAGER_SETTINGS } from './settings.js';
 export { isValidCompactionTriggerSetting, resolveCompactionTokenBudget, resolveConfiguredCompactionTrigger, resolveSegmentCompactionBudget, resolveDynamicMaxTokens, } from './provider-budget.js';
 export { BpeTokenEstimator, createDefaultContextTokenEstimator, createDefaultTokenEstimator, } from './token-estimator.js';
-export { renderLocalSkillsCatalogResult, } from './skill-catalog.js';
+export { countMessagesWithVisualPricing, estimateImageBlockTokens, estimateMiniMaxMVisualTokensForDimensions, estimateVisualTokensForDimensions, FALLBACK_IMAGE_TOKENS, messagesContainImageData, parseImageDimensionsFromBase64, } from './visual-token-pricing.js';
+export { measureSkillCatalogDescriptionTokens, normalizeSkillCatalogDescription, normalizeSkillUsageKey, renderLocalSkillsCatalogResult, resolveSkillCatalogBudgetTokens, SKILL_NAME_ONLY_NOTICE, skillCatalogDescription, } from './skill-catalog.js';
 export { buildCountTokensRequestBody, cjkFallbackTokens, cjkFallbackTokensForBody, estimateCharsToTokensCjkAware, } from './count-tokens-body.js';
 export { estimatePreparedContextUsage, readContextWindowTokens, } from './context-usage-estimator.js';
 export { boundRequestMedia, checkpointImageText, DEFAULT_REQUEST_IMAGE_ENCODING, encodeRequestImage, encodeRequestImageBlocks, encodeRequestImageDetails, isRequestMediaRejection, omittedRequestImageText, PROVIDER_IMAGE_MAX_BASE64_BYTES, resolveRequestMediaBudget, selectRequestImages, withoutThinking, } from './request-media.js';

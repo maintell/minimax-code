@@ -24,6 +24,12 @@ export let ELECTRON_BROWSER_PUBLIC_ACTIONS = [
     'get_js_dialog',
     'handle_js_dialog',
     'open_tab',
+    'list_tabs',
+    'select_tab',
+    'close_tab',
+    'mark_tab',
+    'show_tab',
+    'release_tab',
     'run_script',
 ];
 const ELECTRON_BROWSER_ROUTE_OWNERS = {
@@ -52,6 +58,12 @@ const ELECTRON_BROWSER_ROUTE_OWNERS = {
     get_js_dialog: 'core',
     handle_js_dialog: 'core',
     open_tab: 'host',
+    list_tabs: 'host',
+    select_tab: 'host',
+    close_tab: 'host',
+    mark_tab: 'host',
+    show_tab: 'host',
+    release_tab: 'host',
     run_script: 'core',
 };
 export let ELECTRON_BROWSER_CORE_ACTIONS = ELECTRON_BROWSER_PUBLIC_ACTIONS.filter((action) => ELECTRON_BROWSER_ROUTE_OWNERS[action] === 'core');

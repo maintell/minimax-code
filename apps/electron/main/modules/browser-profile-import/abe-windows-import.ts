@@ -9,7 +9,7 @@
 
 import { resolveAbeBrokerBinary, createWindowsAbeBrokerConnector } from "./abe-broker-connector";
 import { createWindowsAbePrivilegedOperations, AbeElevationError } from "./abe-elevation";
-import { readWindowsChromeAppBoundKey, AbeKeyError } from "./abe-key-provider";
+import { AbeKeyError, readWindowsChromeAppBoundKey } from "./abe-key-provider";
 import { BrowserProfileImportFailure } from "./errors";
 /**
  * 构造一次导入用的特权能力。
@@ -32,12 +32,14 @@ export function createWindowsAbeImportRuntime(options = {}) {
         const elevation = elevationErrorOf(error);
         if (!elevation || signal.aborted || !options.requestId || !options.onDiagnostic)
             return;
+        const cngKeyName = error instanceof AbeKeyError ? error.cngKeyName : undefined;
         options.onDiagnostic({
             event: 'abe_broker_failed',
             requestId: options.requestId,
             step,
             reason: elevation.reason,
             ...brokerFailureCodes(elevation.detail),
+            ...(cngKeyName ? { cngKeyName } : {}),
         });
     };
     return {

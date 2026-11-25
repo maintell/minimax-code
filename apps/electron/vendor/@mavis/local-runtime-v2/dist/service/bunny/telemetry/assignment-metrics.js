@@ -22,7 +22,6 @@ export function assignmentMetricLabels(action, reason) {
  */
 export function taskCreatedLabels(dispatch) {
     return {
-        space_type: known(TASK_CREATED_LABELS.space_type, dispatch.spaceType) ?? 'unknown',
         exec_location: known(TASK_CREATED_LABELS.exec_location, dispatch.execLocation) ?? 'unknown',
         trigger: known(TASK_CREATED_LABELS.trigger, dispatch.trigger) ?? 'unknown',
     };

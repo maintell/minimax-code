@@ -1,0 +1,431 @@
+import { Buffer } from 'node:buffer';
+import { isDefaultThinkingModelId } from '@earendil-works/pi-ai';
+import { ThinkingLevel, ThinkingMode } from '@mavis/protocol';
+import { isCoordinatorAgent } from '@mavis/shared/agent-coordination';
+import { CUSTOM_PROVIDER_ID_PREFIX, MINIMAX_API_PROVIDER_ID } from '@mavis/config';
+import { resolveInputWakeReason } from '../../preparation/turn-wake-reasons.js';
+import { resolveGatewayFileUploadEndpoint } from './file-api-endpoint.js';
+import { readTrustedAgentCoordination } from '../local-turn-tool-catalog-source.js';
+import { buildMessagesFileApiPatcher, } from './messages-file-api-patcher.js';
+const OPENPLATFORM_THINKING_VARIANTS_CAPABILITY = 'openplatform_thinking_variants';
+const DEFAULT_FILE_API_REF_SCHEME = 'mm_file://';
+const DEFAULT_FILE_API_TTL_SEC = 43_200;
+/**
+ * Builds the provider payload transform owned by the v2 Turn executor.
+ * Credential-bearing provider setup remains in the model resolver; this
+ * transform only consumes the prepared AgentConfig capability projection.
+ */
+export function buildLocalTurnPayloadTransform(agentConfig, options = {}) {
+    const modelConfig = readRecord(agentConfig.model);
+    const capabilities = readRecord(modelConfig?.capabilities);
+    const videoEnabled = capabilities?.support_video === true;
+    const fileApiPatcher = createFileApiPatcher(capabilities, options);
+    const thinkingVariants = readThinkingVariants(capabilities);
+    const thinkingOn = options.managedProvider && modelConfig?.thinking_level !== undefined
+        ? modelConfig.thinking_level !== ThinkingLevel.OFF
+        : (options.thinkingLevel ?? 'off') !== 'off';
+    const thinking = thinkingOn ? thinkingVariants?.thinking : thinkingVariants?.noneThinking;
+    const managedThinking = readManagedThinking(modelConfig ?? {}, capabilities ?? {}, options.managedProvider, thinkingOn);
+    const selectedEffort = readSelectedThinkingEffort(modelConfig ?? {}, capabilities ?? {}, options.managedProvider, thinkingOn);
+    return (payload, model) => transformLocalTurnPayload({
+        payload,
+        model,
+        videoEnabled,
+        fileApiPatcher,
+        thinking,
+        managedThinking,
+        ...(selectedEffort ? { selectedEffort } : {}),
+        thinkingRequestPatch: options.thinkingRequestPatch,
+        outputContract: options.outputContract,
+        jsonObjectOutputEnabled: options.supportsJsonObjectOutput === true,
+        maxRequestBodyBytes: options.maxRequestBodyBytes,
+    });
+}
+function readManagedThinking(model, capabilities, managed, enabled) {
+    if (!managed)
+        return undefined;
+    const effort = readRawThinkingEffort(model, capabilities);
+    if (model.thinking_level === undefined &&
+        capabilities.thinking_mode === undefined &&
+        effort === undefined)
+        return undefined;
+    return {
+        enabled,
+        mode: capabilities.thinking_mode,
+        ...(enabled && typeof effort === 'string' && effort !== 'on' && effort !== 'off'
+            ? { effort }
+            : {}),
+    };
+}
+function readRawThinkingEffort(model, capabilities) {
+    return model.thinking_effort ?? capabilities.selected_thinking_effort;
+}
+/**
+ * The explicitly selected effort level for an API-key request. Plain on/off
+ * models have no level, and `default` means "let the provider decide", so
+ * neither is forwarded.
+ */
+function readSelectedThinkingEffort(model, capabilities, managed, enabled) {
+    if (managed || !enabled)
+        return undefined;
+    const effort = readRawThinkingEffort(model, capabilities);
+    return typeof effort === 'string' && !['', 'on', 'off', 'default'].includes(effort)
+        ? effort
+        : undefined;
+}
+export function buildLocalRequestPayloadTransform(input, runtime) {
+    return buildLocalTurnPayloadTransform(input.agentConfig, {
+        thinkingLevel: input.llm.thinkingLevel ?? 'off',
+        maxRequestBodyBytes: input.llm.maxRequestBodyBytes,
+        ...(input.llm.thinkingRequestPatch
+            ? { thinkingRequestPatch: input.llm.thinkingRequestPatch }
+            : {}),
+        managedProvider: input.llm.managedProvider === true,
+        modelBaseUrl: input.llm.model.baseUrl,
+        ...(input.llm.fileApiGatewayAuth ? { gatewayAuth: input.llm.fileApiGatewayAuth } : {}),
+        ...fileApiTransformOptions(input, runtime.fileApi),
+        ...(runtime.nowMs ? { nowMs: runtime.nowMs } : {}),
+        signal: input.signal,
+        ...(input.outputContract ? { outputContract: input.outputContract } : {}),
+        supportsJsonObjectOutput: input.llm.supportsJsonObjectOutput === true,
+    });
+}
+function fileApiTransformOptions(input, fileApi) {
+    if (!fileApi)
+        return {};
+    const fileApiFetch = resolveFileApiFetch(input.llm, fileApi.fetchImpl);
+    return {
+        fileApiUploadStore: fileApi.uploadStores.forSession(input.sessionId),
+        ...(fileApiFetch ? { fetchImpl: fileApiFetch } : {}),
+        ...(fileApi.logger ? { logger: fileApi.logger } : {}),
+    };
+}
+/**
+ * Optional next-message calls reuse the main request transform unchanged, so
+ * thinking and effort follow exactly what the user selected for the Turn. Only
+ * the main Turn's output contract is dropped: the suggestion is plain text.
+ */
+export function buildPromptSuggestionPayloadTransform(input, runtime) {
+    return buildLocalRequestPayloadTransform({ ...input, outputContract: undefined }, runtime);
+}
+export function buildTurnPayloadTransforms(input, outputContract, options) {
+    const transformInput = {
+        agentConfig: input.preparation.agentConfig,
+        llm: input.preparation.llm,
+        sessionId: input.lease.sessionId,
+        signal: input.lease.signal,
+    };
+    const payloadTransform = buildLocalRequestPayloadTransform({ ...transformInput, outputContract }, options);
+    if (!outputContract)
+        return { payloadTransform };
+    return {
+        payloadTransform,
+        auxiliaryPayloadTransform: buildLocalRequestPayloadTransform(transformInput, options),
+    };
+}
+function resolveFileApiFetch(llm, fallback) {
+    return llm.managedProvider === true ? (llm.fetch ?? fallback) : fallback;
+}
+/**
+ * Spec 12.4: in Bunny's conversation a questionnaire answer, also one a requeue
+ * redelivered with the `api` source, is the user's answer and not text the user
+ * typed. Other Sessions keep the shared authorship rule (spec 18.5).
+ */
+export function resolveCoordinatorGenuineUserQueryText(input, genuineUserQueryText) {
+    if (!isTrustedCoordinatorTurn(input))
+        return genuineUserQueryText;
+    return resolveInputWakeReason(input.request) === 'user_answer' ? '' : genuineUserQueryText;
+}
+/** The Turn runs a trusted built-in profile that declares the coordinator role. */
+export function isTrustedCoordinatorTurn(input) {
+    return isCoordinatorAgent(readTrustedAgentCoordination(input.preparation.agentConfig));
+}
+/**
+ * The Turn's coordinator declares the assignment-snapshot reminder, which a
+ * main-conversation Turn receives as its delta block (spec 8, 9).
+ */
+export function declaresAssignmentSnapshotReminder(input) {
+    return (readTrustedAgentCoordination(input.preparation.agentConfig)?.reminders?.includes('assignment-snapshot') === true);
+}
+async function transformLocalTurnPayload(input) {
+    if (!isRecord(input.payload))
+        return undefined;
+    const changed = input.model.api === 'anthropic-messages'
+        ? await patchMessagesPayload({ ...input, payload: input.payload })
+        : false;
+    const requestPatchChanged = patchRequestPayload(input.payload, input.thinkingRequestPatch);
+    const outputFormatChanged = patchOutputFormatPayload(input.payload, input.model, input.outputContract, input.jsonObjectOutputEnabled);
+    assertRequestBodyFits(input.payload, input.maxRequestBodyBytes);
+    return changed || requestPatchChanged || outputFormatChanged ? input.payload : undefined;
+}
+/** The video, File API and thinking patches only the Messages protocol takes. */
+async function patchMessagesPayload(input) {
+    const videoChanged = patchVideoPayload(input.payload, input.videoEnabled);
+    const fileApiChanged = await patchFileApiPayload(input.payload, input.model, input.fileApiPatcher);
+    const thinkingChanged = input.managedThinking
+        ? patchManagedThinkingPayload(input.payload, input.thinking, input.managedThinking)
+        : patchThinkingPayload(input.payload, input.thinking, input.model, input.selectedEffort);
+    return videoChanged || fileApiChanged || thinkingChanged;
+}
+/** The estimate used to trigger compaction is not the final request body. */
+function assertRequestBodyFits(payload, limit) {
+    if (limit === undefined)
+        return;
+    const bytes = Buffer.byteLength(JSON.stringify(payload), 'utf8');
+    if (bytes <= limit)
+        return;
+    // `request_too_large` lets Pi's isContextOverflow recognise the local gate
+    // like the provider rejection it pre-empts.
+    throw Object.assign(new Error(`Request body too large (request_too_large): ${bytes} bytes exceeds client limit ${limit} bytes.`), {
+        code: 'REQUEST_BODY_TOO_LARGE',
+        retryable: false,
+    });
+}
+function patchOutputFormatPayload(payload, model, outputContract, jsonObjectOutputEnabled) {
+    if (!outputContract)
+        return false;
+    assertLocalOutputFormatCapability(model, outputContract, jsonObjectOutputEnabled);
+    if (outputContract.type === 'json_object') {
+        payload.response_format = { type: 'json_object' };
+        return true;
+    }
+    const schema = outputContract.schema;
+    const schemaSnapshot = structuredClone(schema);
+    const contract = {
+        name: 'mcode_output',
+        strict: true,
+        schema: schemaSnapshot,
+    };
+    if (model.api === 'openai-responses') {
+        payload.text = {
+            ...(readRecord(payload.text) ?? {}),
+            format: { type: 'json_schema', ...contract },
+        };
+        return true;
+    }
+    if (model.api === 'openai-completions') {
+        payload.response_format = {
+            type: 'json_schema',
+            json_schema: contract,
+        };
+        return true;
+    }
+    payload.output_config = {
+        ...(readRecord(payload.output_config) ?? {}),
+        format: {
+            type: 'json_schema',
+            schema: schemaSnapshot,
+        },
+    };
+    return true;
+}
+export function assertLocalOutputFormatCapability(model, outputContract, jsonObjectOutputEnabled = false) {
+    if (!outputContract)
+        return;
+    if (outputContract.type === 'json_object') {
+        if (model.api === 'openai-completions' && jsonObjectOutputEnabled)
+            return;
+        throw Object.assign(new Error(`JSON object output is unsupported for Provider API ${model.api} or the selected model has not declared support_json_object_output.`), {
+            category: 'config',
+            code: 'MODEL_CAPABILITY_UNAVAILABLE',
+            retryable: false,
+        });
+    }
+    if (model.api === 'openai-responses' ||
+        model.api === 'openai-completions' ||
+        model.api === 'anthropic-messages') {
+        return;
+    }
+    throw Object.assign(new Error(`--output-schema is unsupported for Provider API ${model.api}.`), {
+        category: 'config',
+        code: 'MODEL_CAPABILITY_UNAVAILABLE',
+        retryable: false,
+    });
+}
+function createFileApiPatcher(capabilities, options) {
+    if (capabilities?.support_files_api !== true)
+        return undefined;
+    if (options.managedProvider !== true)
+        return undefined;
+    if (!options.gatewayAuth || !options.fileApiUploadStore)
+        return undefined;
+    const uploadEndpoint = resolveGatewayFileUploadEndpoint(readString(capabilities, 'files_api_upload_endpoint'), options.modelBaseUrl);
+    if (!uploadEndpoint)
+        return undefined;
+    return buildMessagesFileApiPatcher({
+        uploadEndpoint,
+        refScheme: readString(capabilities, 'files_api_ref_scheme')?.trim() || DEFAULT_FILE_API_REF_SCHEME,
+        gatewayHeaders: options.gatewayAuth.gatewayHeaders,
+        callerIdentityHash: options.gatewayAuth.callerIdentityHash,
+        ttlSec: resolveFileApiTtlSec(capabilities.files_api_file_id_ttl_sec),
+        store: options.fileApiUploadStore,
+        ...fileApiRuntimeOptions(options),
+    });
+}
+function fileApiRuntimeOptions(options) {
+    return {
+        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+        ...(options.nowMs ? { nowMs: options.nowMs } : {}),
+        ...(options.signal ? { signal: options.signal } : {}),
+        ...(options.logger ? { logger: options.logger } : {}),
+    };
+}
+function patchVideoPayload(payload, enabled) {
+    if (!enabled || !Array.isArray(payload.messages))
+        return false;
+    let mutated = false;
+    for (const message of payload.messages) {
+        mutated = patchVideoMessage(message) || mutated;
+    }
+    return mutated;
+}
+async function patchFileApiPayload(payload, model, patcher) {
+    if (!patcher)
+        return false;
+    return (await patcher(payload, model)) !== undefined;
+}
+function patchRequestPayload(payload, patch) {
+    if (!patch)
+        return false;
+    mergeRequestPatch(payload, patch);
+    return true;
+}
+function mergeRequestPatch(target, patch) {
+    for (const [key, value] of Object.entries(patch)) {
+        if (value === undefined) {
+            delete target[key];
+            continue;
+        }
+        const targetValue = target[key];
+        if (isRecord(targetValue) && isRecord(value)) {
+            mergeRequestPatch(targetValue, value);
+            continue;
+        }
+        target[key] = isRecord(value) ? structuredClone(value) : value;
+    }
+}
+function patchThinkingPayload(payload, thinking, model, selectedEffort) {
+    if (!thinking || !Array.isArray(payload.messages))
+        return false;
+    if (model.api === 'anthropic-messages' && isDefaultThinkingModelId(model.id)) {
+        const hadThinking = Object.prototype.hasOwnProperty.call(payload, 'thinking');
+        delete payload.thinking;
+        return hadThinking;
+    }
+    payload.thinking = { ...thinking };
+    if (shouldPreserveCustomProviderTopEffort(payload, model))
+        return true;
+    if (selectedEffort && model.provider === MINIMAX_API_PROVIDER_ID) {
+        // The MiniMax API-key path speaks the same Messages dialect as the managed
+        // gateway; keep the selected `--effort` exactly like patchManagedThinkingPayload.
+        payload.output_config = { ...readRecord(payload.output_config), effort: selectedEffort };
+        return true;
+    }
+    delete payload.output_config;
+    return true;
+}
+function patchManagedThinkingPayload(payload, thinking, selection) {
+    if (!Array.isArray(payload.messages))
+        return false;
+    if (selection.mode === ThinkingMode.FORCED_ON)
+        delete payload.thinking;
+    else if (thinking)
+        payload.thinking = { ...thinking };
+    else if (selection.mode === ThinkingMode.SWITCHABLE)
+        payload.thinking = { type: selection.enabled ? 'adaptive' : 'disabled' };
+    const outputConfig = { ...readRecord(payload.output_config) };
+    delete outputConfig.effort;
+    if (selection.enabled && selection.effort)
+        outputConfig.effort = selection.effort;
+    if (Object.keys(outputConfig).length > 0)
+        payload.output_config = outputConfig;
+    else
+        delete payload.output_config;
+    return true;
+}
+function shouldPreserveCustomProviderTopEffort(payload, model) {
+    const effort = readRecord(payload.output_config)?.effort;
+    return (isCustomProviderId(model.provider) &&
+        (effort === 'xhigh' || effort === 'max') &&
+        model.thinkingLevelMap?.[effort] === effort);
+}
+/**
+ * Same predicate as the Host's `parseProviderId(id)?.source === 'custom_provider'`,
+ * including its tolerance of a missing provider id on untyped model objects.
+ */
+function isCustomProviderId(providerId) {
+    return (!!providerId &&
+        providerId.startsWith(CUSTOM_PROVIDER_ID_PREFIX) &&
+        providerId.length > CUSTOM_PROVIDER_ID_PREFIX.length);
+}
+function resolveFileApiTtlSec(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0
+        ? value
+        : DEFAULT_FILE_API_TTL_SEC;
+}
+function patchVideoMessage(value) {
+    if (!isRecord(value) || !Array.isArray(value.content))
+        return false;
+    return value.content.reduce((mutated, block) => patchVideoBlock(block) || mutated, false);
+}
+/**
+ * Video MIME spellings the gateway rejects although it takes the same format
+ * under another name: `video/mkv` fails with `video data url media type
+ * "video/mkv" not supported (2013)` while `video/x-matroska` passes. User
+ * attachments may carry either spelling (multimodal-attachments allowlist).
+ */
+const GATEWAY_VIDEO_MEDIA_TYPE_ALIASES = new Map([
+    ['video/mkv', 'video/x-matroska'],
+]);
+function patchVideoBlock(value) {
+    if (!isRecord(value))
+        return false;
+    let mutated = patchVideoSource(value);
+    if (Array.isArray(value.content)) {
+        mutated = value.content.reduce((changed, nested) => patchVideoBlock(nested) || changed, mutated);
+    }
+    return mutated;
+}
+function patchVideoSource(block) {
+    const source = block.source;
+    if (!isRecord(source))
+        return false;
+    const mediaType = source.media_type;
+    if (typeof mediaType !== 'string')
+        return false;
+    let mutated = false;
+    if (block.type === 'image' && mediaType.startsWith('video/')) {
+        block.type = 'video';
+        mutated = true;
+    }
+    const alias = GATEWAY_VIDEO_MEDIA_TYPE_ALIASES.get(mediaType.trim().toLowerCase());
+    if (alias && block.type === 'video') {
+        source.media_type = alias;
+        mutated = true;
+    }
+    return mutated;
+}
+function readThinkingVariants(capabilities) {
+    const raw = readRecord(capabilities?.[OPENPLATFORM_THINKING_VARIANTS_CAPABILITY]);
+    if (!raw)
+        return undefined;
+    const thinking = readRecord(raw.thinking);
+    const noneThinking = readRecord(raw['none-thinking']);
+    return thinking || noneThinking
+        ? {
+            ...(thinking ? { thinking: { ...thinking } } : {}),
+            ...(noneThinking ? { noneThinking: { ...noneThinking } } : {}),
+        }
+        : undefined;
+}
+function readRecord(value) {
+    return isRecord(value) ? value : undefined;
+}
+function readString(value, key) {
+    const candidate = value?.[key];
+    return typeof candidate === 'string' ? candidate : undefined;
+}
+function isRecord(value) {
+    return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+//# sourceMappingURL=local-turn-payload-transform.js.map

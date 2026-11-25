@@ -68,13 +68,20 @@ export function isBackgroundTaskAdmittedHere(host, taskId) {
     }
     return false;
 }
-/** Abort this task's runner, including setup before its child Turn is admitted. */
+/**
+ * Abort this task's runner, including setup before its child Turn is admitted.
+ *
+ * Returns whether this process held an abortable admission for the task and its abort ran; a
+ * subagent stopped before its child Session exists has nothing else to stop.
+ */
 export function abortAdmittedBackgroundTask(host, taskId, reason) {
+    let aborted = false;
     for (const task of hostStates.get(host)?.active ?? []) {
         if (task.taskId !== taskId || !task.abort)
             continue;
         try {
             task.abort(reason);
+            aborted = true;
         }
         catch {
             try {
@@ -85,6 +92,7 @@ export function abortAdmittedBackgroundTask(host, taskId, reason) {
             }
         }
     }
+    return aborted;
 }
 export function beginBackgroundTaskShutdown(host, reason = 'runtime-shutdown') {
     const state = getHostState(host);

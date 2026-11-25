@@ -84,8 +84,18 @@ export function applySessionUpdate(existing, fields, fallbackUpdatedAtMs) {
             ? {}
             : { sessionType: normalizeSessionType(fields.sessionType) }),
         ...pickOwnedUpdateFields(fields),
-        updatedAtMs: fields.updatedAtMs ?? fallbackUpdatedAtMs,
+        updatedAtMs: fields.updatedAtMs ??
+            (isArchiveOnlyUpdate(fields) ? existing.updatedAtMs : fallbackUpdatedAtMs),
     };
+}
+/**
+ * Archiving or unarchiving is not activity: the Session keeps its place in
+ * recency order, so undoing an archive restores a project's task order exactly.
+ * Any other field in the same update is activity as before.
+ */
+function isArchiveOnlyUpdate(fields) {
+    const keys = Object.keys(fields);
+    return keys.length === 1 && keys[0] === 'archived' && fields.archived !== undefined;
 }
 function normalizeVisibility(sessionKind, visibility) {
     if (sessionKind === 'task')
@@ -119,6 +129,7 @@ const OWNED_UPDATE_FIELDS = [
     'titleSource',
     'titleReviewState',
     'titleReviewTurnId',
+    'titleReviewAttempts',
     'parentSessionId',
     'purpose',
     'runLocation',

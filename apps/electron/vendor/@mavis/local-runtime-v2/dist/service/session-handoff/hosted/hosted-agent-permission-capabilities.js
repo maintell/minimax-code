@@ -1,4 +1,5 @@
-import { snapshotPermissionInput, validatePermissionExecutionPlan, } from '@mavis/permission';
+import { ASSIGNMENT_RULE_TOOL_NAMES, assignmentApprovalCommand, needsAssignmentProjectApproval, } from '@mavis/agent-tools/namespaced-tools';
+import { resolveWriteTargetLocation, snapshotPermissionInput, validatePermissionExecutionPlan, } from '@mavis/permission';
 import { buildLocalPermissionRuleContents, readLocalPermissionMode, buildPermissionToolDescription, } from '../../permission/index.js';
 import { safeJsonStringify } from '../../../infra/transport/host-http.js';
 import { requestLocalPermissionApproval, } from '../../permission/index.js';
@@ -23,11 +24,13 @@ function toHostedPermissionDecision(decision) {
         ...(ruleMatchers ? { ruleMatchers } : {}),
         ...(decision.executionPlan ? { executionPlan: decision.executionPlan } : {}),
         ...(decision.hookAutoApprovalEligible === true ? { hookAutoApprovalEligible: true } : {}),
+        ...(decision.permissionMode ? { permissionMode: decision.permissionMode } : {}),
     };
 }
 export function createHostedAgentPermissionCapabilities(host) {
     return {
         executionPlans: {
+            resolveWriteTarget: resolveWriteTargetLocation,
             snapshotInput: snapshotPermissionInput,
             validate: validatePermissionExecutionPlan,
         },
@@ -42,8 +45,14 @@ export function createHostedAgentPermissionCapabilities(host) {
                     permissionModeOverride: input.permissionMode ?? readLocalPermissionMode(ctx.configGetter().permissionMode),
                     trustedExactWritePaths: [...(input.trustedExactWritePaths ?? [])],
                     sessionOwnedReadablePaths: [...(input.sessionOwnedReadablePaths ?? [])],
+                    ...(input.trustedWorkspaceRoots?.length
+                        ? { trustedAdditionalWorkingPaths: [...input.trustedWorkspaceRoots] }
+                        : {}),
                     ...(input.nativeDeleteSnapshot !== undefined
                         ? { nativeDeleteSnapshot: input.nativeDeleteSnapshot }
+                        : {}),
+                    ...(input.trustedMcpRuleSubject
+                        ? { trustedMcpRuleSubject: input.trustedMcpRuleSubject }
                         : {}),
                 });
                 if (decision.behavior === 'deny')
@@ -77,6 +86,8 @@ export function createHostedAgentPermissionCapabilities(host) {
                         : {}),
                     ...(input.stopPtcOnDeny ? { stopPtcOnDeny: true } : {}),
                     ...(origin ? { origin } : {}),
+                    ...(input.permissionMode ? { permissionMode: input.permissionMode } : {}),
+                    ...(input.sessionKind ? { sessionKind: input.sessionKind } : {}),
                 }, input.signal);
             },
         },
@@ -98,34 +109,10 @@ export function createHostedAgentPermissionCapabilities(host) {
         },
     };
 }
-/**
- * Only assignment semantics carry project approval: `session create` with a
- * project (results report back by default) and `session send` that reports
- * back. Bunny's assignment tools reach here mapped to these commands. An
- * ordinary send between sessions keeps the general policy.
- */
-function needsAssignmentProjectPermission(input) {
-    if (input.toolName !== 'mavis')
-        return false;
-    const args = input.toolInput.args;
-    const record = typeof args === 'object' && args !== null ? args : undefined;
-    if (input.toolInput.command === 'session create')
-        return record !== undefined && Reflect.get(record, 'project') !== undefined;
-    if (input.toolInput.command !== 'session send' || !record)
-        return false;
-    if (Reflect.get(record, 'report_back') !== true)
-        return false;
-    const target = Reflect.get(record, 'session_id');
-    return target !== 'me' && target !== input.sessionId;
-}
-/**
- * Approving Bunny's own assignment tools saves the rule under that tool's name
- * (the approval keeps the original call), while `mavis` approvals save it
- * under `mavis`; the command pattern is the same, so both match.
- */
-const ASSIGNMENT_RULE_TOOL_NAMES = new Set(['mavis', 'assignment_create', 'assignment_send']);
-async function checkAssignmentPermission(host, ctx, input) {
-    if (!needsAssignmentProjectPermission(input))
+async function checkAssignmentPermission(host, ctx, request) {
+    // Every route reads the tool's own name and its own arguments; nothing is
+    // rewritten into a `mavis` command first.
+    if (!needsAssignmentProjectApproval(request.toolName, request.toolInput, request.sessionId))
         return undefined;
     // Resolve the target and apply its project deny before any mode can allow:
     // as in the base engine, bypass and off never lift a deny.
@@ -133,7 +120,7 @@ async function checkAssignmentPermission(host, ctx, input) {
         return { behavior: 'deny', reason: 'Assignment project resolver is unavailable' };
     let project;
     try {
-        project = await host.assignmentTools.resolveAssignmentProject(input.sessionId, input.toolInput);
+        project = await host.assignmentTools.resolveAssignmentProject(request.sessionId, request.toolName, request.toolInput);
     }
     catch (error) {
         return {
@@ -143,10 +130,10 @@ async function checkAssignmentPermission(host, ctx, input) {
     }
     if (!project)
         return { behavior: 'deny', reason: 'Assignment project could not be resolved' };
-    const pattern = `${input.toolInput.command}:${project}`;
+    const pattern = `${assignmentApprovalCommand(request.toolName)}:${project}`;
     const rules = await ctx.permissionRules.listRules({
-        agentName: input.agentName,
-        sessionId: input.sessionId,
+        agentName: request.agentName,
+        sessionId: request.sessionId,
     });
     const matching = rules.filter((rule) => ASSIGNMENT_RULE_TOOL_NAMES.has(rule.ruleValue.toolName.toLowerCase()) &&
         rule.ruleValue.matcher?.kind === 'command' &&
@@ -154,7 +141,7 @@ async function checkAssignmentPermission(host, ctx, input) {
     const denied = matching.find((rule) => rule.ruleBehavior === 'deny');
     if (denied)
         return { behavior: 'deny', reason: 'Assignment denied by project rule' };
-    const mode = input.permissionMode ?? readLocalPermissionMode(ctx.configGetter().permissionMode);
+    const mode = request.permissionMode ?? readLocalPermissionMode(ctx.configGetter().permissionMode);
     if (mode === 'bypassPermissions' || mode === 'off')
         return { behavior: 'allow', reason: 'Assignment allowed by permission mode' };
     if (matching.some((rule) => rule.ruleBehavior === 'allow'))
@@ -162,7 +149,10 @@ async function checkAssignmentPermission(host, ctx, input) {
     return {
         behavior: 'ask',
         reason: 'Approval is required to assign work to this project',
-        ruleContents: [`mavis(${pattern})`],
+        // Saved under the tool's own name. The command pattern is the same for every
+        // name in ASSIGNMENT_RULE_TOOL_NAMES, so this rule covers the other tools
+        // that dispatch into the same project, exactly as a `mavis` rule did.
+        ruleContents: [`${request.toolName}(${pattern})`],
         ruleMatchers: [{ kind: 'command', pattern }],
     };
 }
@@ -170,7 +160,11 @@ function assignmentProjectError(error) {
     if (!(error instanceof Error))
         return 'Invalid assignment project';
     if ('candidates' in error)
-        return JSON.stringify({ message: error.message, candidates: error.candidates });
+        return JSON.stringify({
+            ...('code' in error && typeof error.code === 'string' ? { code: error.code } : {}),
+            message: error.message,
+            candidates: error.candidates,
+        });
     return error.message;
 }
 function normalizeHostedPermissionRuleMatchers(matchers) {

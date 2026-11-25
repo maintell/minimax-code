@@ -1,5 +1,4 @@
-// The observe read lives in its own file because local-browser.ts sits at the
-// repository's source-file line limit.
+import { isRecord } from './type-guards.js';
 const OBSERVE_DEFAULT_WAIT_MS = 5_000;
 const OBSERVE_DEFAULT_TEXT_CHARS = 4_000;
 /** Settle time before reading: the action's own settle covers sync DOM work, not async renders. */
@@ -115,8 +114,5 @@ function pause(ms, signal) {
         const timer = setTimeout(done, ms);
         signal.addEventListener('abort', done, { once: true });
     });
-}
-function isRecord(value) {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 //# sourceMappingURL=local-browser-observe.js.map

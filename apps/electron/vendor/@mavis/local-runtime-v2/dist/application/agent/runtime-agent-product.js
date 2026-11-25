@@ -5,6 +5,7 @@ import { ownsElectronRuntimeCapabilities } from './runtime-browser-use-compositi
 import { createComputerUseTurnToolSafetyGuard, } from '../../service/computer-use/index.js';
 import { isGitRepo } from '../../service/workspace/index.js';
 import { createModelAccessAuthoring, withCapabilityOwnedSkills, } from './capability-owned-skills.js';
+import { isPtcTurnEnabled } from '@mavis/config';
 import { resolveAgentPromptSurface, createLocalStaticPromptReader, } from '../../service/turn-system/index.js';
 /** Decorates product-owned AgentHost capabilities with process-local runtime adapters. */
 export function createRuntimeAgentProduct(options) {
@@ -36,6 +37,8 @@ export function createRuntimeAgentProduct(options) {
                     surface: resolveAgentPromptSurface(turnInput.session, runtimeOwnerKind),
                     workspaceRoot: turnInput.session.workspaceDir,
                     baseTools: base.nativeTools,
+                    // The same decision and Session mode as the PTC prompt section and catalog.
+                    ptc: isPtcTurnEnabled({ requested: turnInput.session.toolCallMode === 'ptc' }),
                     ...(turnInput.desktopCapabilities
                         ? { desktopCapabilities: turnInput.desktopCapabilities }
                         : {}),

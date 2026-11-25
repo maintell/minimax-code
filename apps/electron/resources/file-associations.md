@@ -6,6 +6,8 @@
 
 修改清单后运行 `node apps/electron/scripts/sync-file-associations.mjs`。它更新全部中英文、正式/测试/内测构建的 macOS 文档声明、Windows 安装器遍历宏，以及 Windows “打开方式”增强登记使用的文本类扩展名清单 `main/modules/file-open-with/text-file-types.generated.ts`。`--check` 校验生成文件未过期。调整清单时须保留旧版本已登记扩展名的 Windows 清理覆盖。
 
+`miniapp` 分组包含在 MCode 内通过 Mini App 打开的 `.stl`、`.step`、`.stp`、`.pcraft` 和 `.ccproj`，仅加入 Windows 安装器的 `SupportedTypes` 清单，不加入文本类增强登记。macOS 通过 rank 为 `None` 的 `Any File` 类型覆盖这些文件，不将此分组加入 `Alternate` 扩展名声明，避免没有其他应用声明某类型时 MCode 成为其默认打开程序。`.json`、`.psd` 已在其他分组登记，不重复加入。
+
 Mac 使用 `Viewer` / `Alternate` 登记明确扩展名，使 MCode 出现在 Finder“打开方式”中但不抢默认。保留 `Any File` 的 Dock/Finder 拖放接收声明，但其 rank 为 `None`：按 Apple 定义，该 rank 永远不会被选来打开文件，只接受拖放，避免某类型没有其他程序时回退为 MCode 默认打开。泛类型接收不表示所有文件都能预览；明确清单中亦包含可作为源码/附件处理的格式。已有 `open-file` 队列在单实例锁之后、异步启动之前注册。
 
 Windows 沿用 per-user NSIS 安装，目标是“打开方式”可发现但永不自动成为默认。实测只要某扩展名的 `OpenWithProgids` 里只有一个候选，即使 ProgID 带 `AllowSilentDefaultTakeOver`，Windows 也会把它当作隐式默认；因此安装器不再登记 `OpenWithProgids`，改为在应用级 `HKCU\Software\Classes\Applications\<应用名>.exe\SupportedTypes` 列出清单扩展名。MCode 由此出现在“选择其他应用”/“更多应用”中，不参与隐式默认选择；代价是新装后首次需从“选择其他应用”里选一次 MCode，之后由系统列入该类型的常用列表。不写 `UserChoice`、扩展名默认值或 Explorer MRU。应用级键由同名 exe 共享：通常只在命令为空、`MCodeAppId` 等于当前 App ID，或无标记的历史命令明确指向当前安装路径时写入（同时重建 `SupportedTypes`，移除已从清单删去的扩展名）；指向其他路径的无标记命令保持不变，以保留其他安装的处理命令。

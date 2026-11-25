@@ -2,7 +2,7 @@ import { GoogleGenAI, ResourceScope, } from "@google/genai";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { notifyProviderError } from "../utils/provider-error.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { consumeGoogleStream, convertMessages, convertTools, getDisabledGoogleThinkingConfig, mapToolChoice, resolveGoogleThinkingRequest, toGoogleSdkThinkingLevel, } from "./google-shared.js";
+import { consumeGoogleStream, convertMessages, convertTools, getDisabledGoogleThinkingConfig, getGeminiMajorVersion, mapToolChoice, resolveGoogleThinkingRequest, toGoogleSdkThinkingLevel, } from "./google-shared.js";
 import { buildBaseOptions } from "./simple-options.js";
 const API_VERSION = "v1";
 const GCP_VERTEX_CREDENTIALS_MARKER = "gcp-vertex-credentials";
@@ -30,12 +30,17 @@ export const streamGoogleVertex = (model, context, options) => {
             const apiKey = resolveApiKey(options);
             // Create the client using either a Vertex API key, if provided, or ADC with project and location
             const client = apiKey
-                ? createClientWithApiKey(model, apiKey, options?.headers)
-                : createClient(model, resolveProject(options), resolveLocation(options), options?.headers);
+                ? createClientWithApiKey(model, apiKey, options?.headers, options?.fetch)
+                : createClient(model, resolveProject(options), resolveLocation(options), options?.headers, options?.fetch);
             let params = buildParams(model, context, options);
             const nextParams = await options?.onPayload?.(params, model);
             if (nextParams !== undefined) {
                 params = nextParams;
+            }
+            if (getGeminiMajorVersion(params.model || model.id) === 4 &&
+                (params.config?.maxOutputTokens ?? 0) > 65_536 &&
+                resolveBaseUrlApiVersion(model.baseUrl) === "v1") {
+                throw new Error("Gemini 4 output above 65,536 tokens requires a v1beta1 Vertex endpoint; update the base URL from v1 to v1beta1");
             }
             const googleStream = await client.models.generateContentStream(params);
             await consumeGoogleStream(googleStream, output, stream, model, options);
@@ -56,36 +61,39 @@ export const streamSimpleGoogleVertex = (model, context, options) => {
         thinking: resolveGoogleThinkingRequest(model, options?.reasoning, options?.thinkingBudgets),
     });
 };
-function createClient(model, project, location, optionsHeaders) {
+function createClient(model, project, location, optionsHeaders, fetch) {
     return new GoogleGenAI({
         vertexai: true,
         project,
         location,
-        apiVersion: API_VERSION,
-        httpOptions: buildHttpOptions(model, optionsHeaders),
+        apiVersion: getGeminiMajorVersion(model.id) === 4 ? "v1beta1" : API_VERSION,
+        httpOptions: buildHttpOptions(model, optionsHeaders, fetch),
     });
 }
-function createClientWithApiKey(model, apiKey, optionsHeaders) {
+function createClientWithApiKey(model, apiKey, optionsHeaders, fetch) {
     return new GoogleGenAI({
         vertexai: true,
         apiKey,
-        apiVersion: API_VERSION,
-        httpOptions: buildHttpOptions(model, optionsHeaders),
+        apiVersion: getGeminiMajorVersion(model.id) === 4 ? "v1beta1" : API_VERSION,
+        httpOptions: buildHttpOptions(model, optionsHeaders, fetch),
     });
 }
-function buildHttpOptions(model, optionsHeaders) {
+function buildHttpOptions(model, optionsHeaders, fetch) {
     const httpOptions = {};
     const baseUrl = resolveCustomBaseUrl(model.baseUrl);
     if (baseUrl) {
         httpOptions.baseUrl = baseUrl;
         httpOptions.baseUrlResourceScope = ResourceScope.COLLECTION;
-        if (baseUrlIncludesApiVersion(baseUrl)) {
+        if (resolveBaseUrlApiVersion(baseUrl) !== undefined) {
             httpOptions.apiVersion = "";
         }
     }
     if (model.headers || optionsHeaders) {
         httpOptions.headers = { ...model.headers, ...optionsHeaders };
     }
+    // Send through the host transport (proxy, CA, capture) like the other providers.
+    if (fetch)
+        httpOptions.fetch = fetch;
     return Object.keys(httpOptions).length > 0 ? httpOptions : undefined;
 }
 function resolveCustomBaseUrl(baseUrl) {
@@ -95,14 +103,30 @@ function resolveCustomBaseUrl(baseUrl) {
     }
     return trimmed;
 }
-function baseUrlIncludesApiVersion(baseUrl) {
+function resolveBaseUrlApiVersion(baseUrl) {
+    const resolved = resolveCustomBaseUrl(baseUrl);
+    if (!resolved)
+        return undefined;
+    let pathname = resolved;
     try {
-        const url = new URL(baseUrl);
-        return url.pathname.split("/").some((part) => /^v\d+(?:beta\d*)?$/.test(part));
+        pathname = new URL(resolved).pathname;
     }
     catch {
-        return /(?:^|\/)v\d+(?:beta\d*)?(?:\/|$)/.test(baseUrl);
+        pathname = resolved.split(/[?#]/, 1)[0] ?? resolved;
     }
+    let version;
+    const parts = pathname.split("/");
+    for (let index = 0; index < parts.length; index += 1) {
+        const part = parts[index] ?? "";
+        const prev = index > 0 ? (parts[index - 1] ?? "").toLowerCase() : "";
+        if (prev === "projects" || prev === "locations" || prev === "publishers" || prev === "models") {
+            continue;
+        }
+        if (/^v\d+(?:beta\d*)?$/i.test(part)) {
+            version = part.toLowerCase();
+        }
+    }
+    return version;
 }
 function resolveApiKey(options) {
     const apiKey = options?.apiKey?.trim();
@@ -130,7 +154,8 @@ function resolveLocation(options) {
 }
 function buildParams(model, context, options = {}) {
     const contents = convertMessages(model, context);
-    const generationConfig = {};
+    const longOutputModel = getGeminiMajorVersion(model.id) === 4;
+    const generationConfig = { automaticContinuation: longOutputModel };
     if (options.temperature !== undefined) {
         generationConfig.temperature = options.temperature;
     }

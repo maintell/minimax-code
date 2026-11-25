@@ -1,5 +1,6 @@
 import { projectConversationRootPredicate } from '../../sessions/repo/filters.js';
-import { and, eq, isNull, ne, notInArray, or, sql } from 'drizzle-orm';
+import { and, eq, exists as sqlExists, isNull, ne, notInArray, or, sql, } from 'drizzle-orm';
+import { explicitWorkspaceProjectPredicate } from '../repo/activity.js';
 import { sessions as s, sessionAgentState as a } from '../../../../infra/db/schema/sessions.js';
 import { projects as p } from '../../../../infra/db/schema/projects.js';
 import { turnIngress as t } from '../../../../infra/db/schema/turn.js';
@@ -22,6 +23,22 @@ export function eligible(includeHiddenProject = false, internalRootIds = [], inc
         : undefined, or(bunny?.showBunnyCreatedSessions && bunny.bunnyCreatedIds.length
         ? and(eq(s.sessionKind, 'conversation'), membership(s.sessionId, bunny.bunnyCreatedIds))
         : undefined, and(eq(s.sessionType, 'branch'), ne(s.visibility, 'hidden'), notInArray(s.sessionKind, ['peek', 'task', 'channel'])), and(eq(s.sessionType, 'branch'), eq(s.sessionKind, 'channel')), and(ne(s.visibility, 'hidden'), projectConversationRootPredicate())));
+}
+/**
+ * Whether a Project is in the sidebar list. A workspace project stays listed after all of its
+ * conversations are archived; only an explicit removal (hidden) takes it out of the sidebar. The
+ * default "no project" bucket still needs an active conversation, and a project the user created
+ * is listed before its first conversation. Existence includes pinned sessions but never internal
+ * ones. The sidebar query and the Session repository (which lists a returning project first)
+ * share it; `excludedSessionId` asks how it stood before that Session was created.
+ */
+export function listedProjectPredicate(db, { internalRootIds, query, excludedSessionId, }) {
+    const hasEligibleSession = (includeArchived) => sqlExists(db
+        .select({ id: s.sessionId })
+        .from(s)
+        .where(and(eq(s.projectId, p.projectId), excludedSessionId === undefined ? undefined : ne(s.sessionId, excludedSessionId), eligible(false, internalRootIds, includeArchived, query), ordinarySidebarSession))
+        .limit(1));
+    return or(hasEligibleSession(false), and(eq(p.projectKind, 'workspace'), hasEligibleSession(true)), explicitWorkspaceProjectPredicate);
 }
 export function sidebarProjectPredicate(q) {
     return and(eq(p.hidden, 0), eq(p.pinned, 0), membership(p.projectId, q.excludedProjectIds, true));

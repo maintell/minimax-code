@@ -1,5 +1,5 @@
 import { waitForRelease } from './wait-for-release.js';
-import { isHandedBackOnClose, isUserSteeringProducer, } from '../../agent-host/contracts.js';
+import { isHandedBackOnClose, isUserSteeringProducer, } from '@mavis/harness';
 const DEFAULT_ABORT_TIMEOUT_MS = 5_000;
 const DEFAULT_RENEWAL_INTERVAL_MS = 10_000;
 /** Turns ended by force whose late writes are still dropped; older ones have long stopped. */

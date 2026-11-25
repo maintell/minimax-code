@@ -12,8 +12,9 @@ const GOOGLE_SDK_THINKING_LEVEL_MAP = {
     LOW: GoogleSdkThinkingLevel.LOW,
     MEDIUM: GoogleSdkThinkingLevel.MEDIUM,
     HIGH: GoogleSdkThinkingLevel.HIGH,
+    XHIGH: "XHIGH",
 };
-/** Resolve a supported pi level or model-specific Google mapping to a standard Google level. */
+/** Resolve a supported pi level or model-specific Google mapping to a standard budget/level key. */
 export function resolveGoogleThinkingLevel(model, level) {
     const mapped = model.thinkingLevelMap?.[level];
     const resolvedLevel = typeof mapped === "string" ? mapped.toLowerCase() : level;
@@ -22,10 +23,17 @@ export function resolveGoogleThinkingLevel(model, level) {
         case "low":
         case "medium":
         case "high":
+        case "xhigh":
             return resolvedLevel;
         default:
             throw new Error(`Unsupported Google thinking level mapping for ${model.provider}/${model.id}: ${level} -> ${String(mapped)}`);
     }
+}
+function isLegacyGeminiBudgetModelId(id) {
+    return /gemini-[12](?:\.\d+)?(?:-|$)/.test(id) || id.includes("2.5-") || id.includes("2.0-");
+}
+function hasExplicitThinkingLevelMap(model) {
+    return Boolean(model.thinkingLevelMap && Object.keys(model.thinkingLevelMap).length > 0);
 }
 /**
  * Whether this model uses Gemini's discrete `thinkingLevel` control instead of
@@ -34,14 +42,20 @@ export function resolveGoogleThinkingLevel(model, level) {
  */
 export function usesGoogleThinkingLevel(model) {
     const id = model.id.toLowerCase();
+    if (isLegacyGeminiBudgetModelId(id))
+        return false;
     return (
     // Gemini 3 Pro/Flash with or without a minor version, such as
     // gemini-3-flash-preview, gemini-3.1-pro-preview and gemini-3.8-flash.
     /gemini-3(?:\.\d+)?-(?:pro|flash)/.test(id) ||
-        // Gemini 4 and later, such as gemini-4-argon.
+        // Rolling aliases pointing at Gemini 3+ (e.g. gemini-flash-latest, gemini-pro-latest).
+        /gemini-(?:flash|pro)(?:-lite)?-latest/.test(id) ||
+        // Gemini 4 and later, such as gemini-4-carbon, gemini-4-argon, gemini-4-hydrogen.
         /gemini-(?:[4-9]|[1-9]\d)/.test(id) ||
         // Both hosted Gemma 4 naming forms: gemma-4-* and gemma4-*.
-        /gemma-?4/.test(id));
+        /gemma-?4/.test(id) ||
+        // Custom/gateway model IDs configured with explicit discrete effort mappings.
+        hasExplicitThinkingLevelMap(model));
 }
 export function toGoogleThinkingLevel(level) {
     switch (level) {
@@ -53,10 +67,12 @@ export function toGoogleThinkingLevel(level) {
             return "MEDIUM";
         case "high":
             return "HIGH";
+        case "xhigh":
+            return "XHIGH";
     }
 }
 export function toGoogleSdkThinkingLevel(level) {
-    return GOOGLE_SDK_THINKING_LEVEL_MAP[level];
+    return GOOGLE_SDK_THINKING_LEVEL_MAP[level] ?? level;
 }
 /**
  * Thinking config used when pi asks for no reasoning.
@@ -66,20 +82,32 @@ export function toGoogleSdkThinkingLevel(level) {
  * stays invisible to pi). Gemini 3.8 Flash and Gemini 4 reject `MINIMAL`, so
  * a model without a level map falls back to `LOW`, which every Gemini 3+
  * model accepts; `thinkingBudget: 0` does not disable thinking there.
+ * Gemini 2.5 Pro also rejects `thinkingBudget: 0`, requiring at least 128.
  */
 export function getDisabledGoogleThinkingConfig(model) {
-    if (!usesGoogleThinkingLevel(model))
-        return { thinkingBudget: 0 };
+    if (!usesGoogleThinkingLevel(model)) {
+        return model.id.toLowerCase().includes("2.5-pro")
+            ? { thinkingBudget: 128 }
+            : { thinkingBudget: 0 };
+    }
     const fallback = clampThinkingLevel(model, "off");
     if (fallback === "off") {
-        return /^gemini-/i.test(model.id) ? { thinkingLevel: GoogleSdkThinkingLevel.LOW } : { thinkingBudget: 0 };
+        const id = model.id.toLowerCase();
+        if (/gemma-?4/.test(id))
+            return { thinkingBudget: 0 };
+        return (getGeminiMajorVersion(model.id) ?? 0) >= 3 ||
+            /gemini-(?:flash|pro)(?:-lite)?-latest/.test(id) ||
+            hasExplicitThinkingLevelMap(model)
+            ? { thinkingLevel: GoogleSdkThinkingLevel.LOW }
+            : { thinkingBudget: 0 };
     }
     const apiLevel = toGoogleThinkingLevel(resolveGoogleThinkingLevel(model, fallback));
     return { thinkingLevel: toGoogleSdkThinkingLevel(apiLevel) };
 }
 /** Token budget for budget-based (Gemini 2.x) thinking. -1 lets the model decide. */
 export function getGoogleThinkingBudget(model, level, customBudgets) {
-    const customBudget = customBudgets?.[level];
+    const budgetKey = level === "xhigh" ? "high" : level;
+    const customBudget = customBudgets?.[budgetKey];
     if (customBudget !== undefined)
         return customBudget;
     if (model.id.includes("2.5-pro")) {
@@ -88,6 +116,7 @@ export function getGoogleThinkingBudget(model, level, customBudgets) {
             low: 2048,
             medium: 8192,
             high: 32768,
+            xhigh: 32768,
         };
         return budgets[level];
     }
@@ -97,6 +126,7 @@ export function getGoogleThinkingBudget(model, level, customBudgets) {
             low: 2048,
             medium: 8192,
             high: 24576,
+            xhigh: 24576,
         };
         return budgets[level];
     }
@@ -106,6 +136,7 @@ export function getGoogleThinkingBudget(model, level, customBudgets) {
             low: 2048,
             medium: 8192,
             high: 24576,
+            xhigh: 24576,
         };
         return budgets[level];
     }
@@ -118,11 +149,19 @@ export function resolveGoogleThinkingRequest(model, reasoning, thinkingBudgets) 
     const clamped = clampThinkingLevel(model, reasoning);
     if (clamped === "off")
         return { enabled: false };
-    const resolved = resolveGoogleThinkingLevel(model, clamped);
     if (usesGoogleThinkingLevel(model)) {
-        return { enabled: true, level: toGoogleThinkingLevel(resolved) };
+        const explicitMapped = model.thinkingLevelMap?.[clamped];
+        if (typeof explicitMapped === "string" && explicitMapped.trim()) {
+            return { enabled: true, level: explicitMapped.trim().toUpperCase() };
+        }
+        return { enabled: true, level: toGoogleThinkingLevel(resolveGoogleThinkingLevel(model, clamped)) };
     }
-    return { enabled: true, budgetTokens: getGoogleThinkingBudget(model, resolved, thinkingBudgets) };
+    const explicitBudgetMapped = model.thinkingLevelMap?.[clamped];
+    const budgetLevel = typeof explicitBudgetMapped === "string" &&
+        !["minimal", "low", "medium", "high", "xhigh"].includes(explicitBudgetMapped.toLowerCase())
+        ? "high"
+        : resolveGoogleThinkingLevel(model, clamped);
+    return { enabled: true, budgetTokens: getGoogleThinkingBudget(model, budgetLevel, thinkingBudgets) };
 }
 /**
  * Determines whether a streamed Gemini `Part` should be treated as "thinking".
@@ -178,8 +217,8 @@ function isValidThoughtSignature(signature) {
 function resolveThoughtSignature(isSameProviderAndModel, signature) {
     return isSameProviderAndModel && isValidThoughtSignature(signature) ? signature : undefined;
 }
-function getGeminiMajorVersion(modelId) {
-    const match = modelId.toLowerCase().match(/^gemini(?:-live)?-(\d+)/);
+export function getGeminiMajorVersion(modelId) {
+    const match = modelId.split("/").pop()?.toLowerCase().match(/^gemini(?:-live)?-(\d+)(?:[.-]|$)/);
     if (!match)
         return undefined;
     return Number.parseInt(match[1], 10);
@@ -699,17 +738,26 @@ export async function consumeGoogleStream(chunks, output, stream, model, options
         const usage = chunk.usageMetadata;
         if (usage && (usage.promptTokenCount !== undefined || usage.totalTokenCount !== undefined)) {
             const cacheRead = usage.cachedContentTokenCount ?? 0;
+            const promptTokens = usage.promptTokenCount ?? 0;
             // promptTokenCount includes cached tokens; tool-use prompt tokens (server-side tools,
             // agentic media) are billed as input but reported separately.
-            const input = (usage.promptTokenCount ?? 0) - cacheRead + (usage.toolUsePromptTokenCount ?? 0);
+            const input = promptTokens - cacheRead + (usage.toolUsePromptTokenCount ?? 0);
             // candidatesTokenCount excludes thinking tokens, which are billed as output.
             const outputTokens = (usage.candidatesTokenCount ?? 0) + (usage.thoughtsTokenCount ?? 0);
+            const totalTokens = usage.totalTokenCount ?? input + cacheRead + outputTokens;
+            const initialPromptTokens = chunk.initialPromptTokenCount ?? usage.initialPromptTokenCount;
+            const repeatedPromptTokens = initialPromptTokens !== undefined && initialPromptTokens < promptTokens
+                ? promptTokens - initialPromptTokens
+                : 0;
             output.usage = {
                 input,
                 output: outputTokens,
                 cacheRead,
                 cacheWrite: 0,
-                totalTokens: usage.totalTokenCount ?? input + cacheRead + outputTokens,
+                totalTokens,
+                ...(repeatedPromptTokens > 0 && {
+                    contextTokens: Math.max(0, totalTokens - repeatedPromptTokens),
+                }),
                 cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
             };
             calculateCost(model, output.usage);
@@ -721,6 +769,11 @@ export async function consumeGoogleStream(chunks, output, stream, model, options
     }
     if (!finishReason) {
         throw new Error(blockReason ? `Prompt blocked by provider: ${blockReason}` : "Google stream ended without a finish reason");
+    }
+    // A valid continuation is consumed by the SDK. A terminal CONTINUATION
+    // without a usable token must not silently finish an incomplete Gemini 4 turn.
+    if (finishReason === "CONTINUATION" && getGeminiMajorVersion(model.id) === 4) {
+        throw new Error("Google stream ended with CONTINUATION without a usable continuation token");
     }
     const stopReason = mapStopReason(finishReason);
     if (stopReason === "error" || stopReason === "aborted") {

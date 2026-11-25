@@ -3,24 +3,12 @@ import { AuthStorage } from '@earendil-works/pi-coding-agent/auth-storage';
 import { LocalModelResolver, } from '../../../service/model-system/index.js';
 import { LocalGreetingSystemReminderSender } from '../host-greeting-sender.js';
 import { LocalHookService } from '../../../service/hook/index.js';
-/** Host 的模型、Hook 与 greeting 绑定共享同一 profile 和 Session 查询能力。 */
-export function createHostHookService(input) {
-    return (input.options.hookService ??
+/** Host 的 Hook 服务：测试注入的实例，或产品内置的处理器。 */
+export function createHostHookService(options) {
+    return (options.hookService ??
         new LocalHookService({
-            dataDir: input.dataDir,
-            nowMs: input.nowMs,
-            resolveWorkspaceDir: input.resolveWorkspaceDir,
-            resolveSessionWorkspaceDir: async (sessionId) => {
-                try {
-                    const session = await input.getSessionById(sessionId);
-                    return session?.runLocation?.resolvedDir ?? session?.workspaceDir;
-                }
-                catch {
-                    // 查询失败时跳过记录，避免将分支 Session 的记录归到 Host 默认目录。
-                    return undefined;
-                }
-            },
-            ...(input.options.metricsReporter ? { metricsReporter: input.options.metricsReporter } : {}),
+            ...(options.mergeRequests ? { mergeRequests: options.mergeRequests } : {}),
+            ...(options.metricsReporter ? { metricsReporter: options.metricsReporter } : {}),
         }));
 }
 export function createLocalModelResolver(input) {

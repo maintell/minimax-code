@@ -33,7 +33,7 @@ export class HttpCloudGatewayClient {
         const startedAtMs = Date.now();
         const url = this.endpointOverride ?? this.resolveUrl();
         if (!url) {
-            return fallbackTimeout('cloud gateway URL not configured');
+            return fallbackTimeout('cloud gateway URL not configured', 'no_url');
         }
         const body = {
             tool_name: req.toolName,
@@ -62,7 +62,7 @@ export class HttpCloudGatewayClient {
             const durationMs = Date.now() - startedAtMs;
             if (!resp.ok) {
                 logger.warn(backgroundCtx(), `[cloud-gateway-v2] non-2xx: status=${resp.status} body=${respText.slice(0, 200)}`);
-                return fallbackTimeout(`permission/check returned ${resp.status}`, durationMs);
+                return fallbackTimeout(`permission/check returned ${resp.status}`, httpFailureReason(resp.status), durationMs);
             }
             let data;
             try {
@@ -70,7 +70,7 @@ export class HttpCloudGatewayClient {
             }
             catch {
                 logger.warn(backgroundCtx(), `[cloud-gateway-v2] non-JSON body=${respText.slice(0, 200)}`);
-                return fallbackTimeout('permission/check returned non-JSON', durationMs);
+                return fallbackTimeout('permission/check returned non-JSON', 'non_json', durationMs);
             }
             const statusCode = data.base_resp?.status_code;
             if (typeof statusCode === 'number' && statusCode !== 0) {
@@ -78,12 +78,12 @@ export class HttpCloudGatewayClient {
                     ? data.base_resp.status_msg
                     : `status_code=${statusCode}`;
                 logger.warn(backgroundCtx(), `[cloud-gateway-v2] biz error: ${msg}`);
-                return fallbackTimeout(`permission/check biz error: ${msg}`, durationMs);
+                return fallbackTimeout(`permission/check biz error: ${msg}`, 'biz_error', durationMs);
             }
             const verdict = data.verdict;
             if (verdict !== 'allow' && verdict !== 'confirm' && verdict !== 'block') {
                 logger.warn(backgroundCtx(), `[cloud-gateway-v2] invalid verdict=${String(verdict)} body=${respText.slice(0, 200)}`);
-                return fallbackTimeout('permission/check returned invalid verdict', durationMs);
+                return fallbackTimeout('permission/check returned invalid verdict', 'invalid_verdict', durationMs);
             }
             const reason = typeof data.reason === 'string' && data.reason.length > 0
                 ? data.reason
@@ -104,7 +104,7 @@ export class HttpCloudGatewayClient {
                 ? `timed out after ${this.timeoutMs}ms`
                 : `network error: ${err instanceof Error ? err.message : String(err)}`;
             logger.warn(backgroundCtx(), `[cloud-gateway-v2] call failed: ${String(err)}`);
-            return fallbackTimeout(reason, durationMs);
+            return fallbackTimeout(reason, isAbort ? 'timeout' : 'network', durationMs);
         }
     }
     resolveUrl() {
@@ -117,10 +117,18 @@ export class HttpCloudGatewayClient {
         }
     }
 }
-function fallbackTimeout(reason, durationMs) {
+function httpFailureReason(status) {
+    if (status === 401)
+        return 'http_401';
+    if (status === 403)
+        return 'http_403';
+    return status >= 500 ? 'http_5xx' : 'http_4xx';
+}
+function fallbackTimeout(reason, failureReason, durationMs) {
     return {
         kind: 'timeout',
         reasonLocalized: reason,
+        failureReason,
         model: 'cloud:unavailable',
         ...(durationMs !== undefined ? { durationMs } : {}),
     };

@@ -1,7 +1,5 @@
 import { SegmentCheckpointConflictError, } from '../../session-system/index.js';
-import { readCompactionCommitMetadata } from '../agent-host/compaction/compaction-commit-metadata.js';
-import { validateCanonicalHistoryMessages } from '../agent-host/history/canonical-history-validation.js';
-import { SegmentPlanRefusedError } from '../agent-host/history/committed-history-writer.js';
+import { readCompactionCommitMetadata, SegmentPlanRefusedError, validateCanonicalHistoryMessages, } from '@mavis/harness';
 /**
  * Serves the Session System's canonical history to the AgentHost as its durable
  * history provider: every read and commit is validated, and typed compactions,

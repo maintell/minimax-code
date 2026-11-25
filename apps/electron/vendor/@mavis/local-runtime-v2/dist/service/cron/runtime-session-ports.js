@@ -81,24 +81,39 @@ export function createRuntimeCronSessionPorts(options) {
             ownerReleased: (sessionId) => turns.dispatchQueue(sessionId),
         },
         delivery: {
-            deliver: async (request) => deliverRuntimeCron(turns, {
-                ...request,
-                text: options.mainConversationText && mainConversationAgents(request.agentName)
-                    ? options.mainConversationText(request.text)
-                    : request.text,
-                // A schedule into the busy main conversation waits for the running Turn.
-                deferWhileBusy: mainConversationAgents(request.agentName) &&
-                    request.sessionId ===
-                        (await sessions.sessions.root.getRootSessionByAgent(request.agentName)).sessionId,
-                beforeDelivery: async () => {
-                    await request.beforeDelivery?.();
-                    const snapshot = await sessions.queue.committed.snapshot(request.sessionId);
-                    if (snapshot.pause)
-                        throw new CronDeliveryDeferredError('CRON_DELIVERY_QUEUE_PAUSED');
-                },
-            }, reportFailure),
+            deliver: async (request) => {
+                const replyChannel = mainConversationAgents(request.agentName)
+                    ? readScheduleOrigin(options.scheduleOrigin, request.cronId)
+                    : undefined;
+                return deliverRuntimeCron(turns, {
+                    ...request,
+                    ...(replyChannel ? { replyChannel } : {}),
+                    text: options.mainConversationText && mainConversationAgents(request.agentName)
+                        ? options.mainConversationText(request.text)
+                        : request.text,
+                    // A schedule into the busy main conversation waits for the running Turn.
+                    deferWhileBusy: mainConversationAgents(request.agentName) &&
+                        request.sessionId ===
+                            (await sessions.sessions.root.getRootSessionByAgent(request.agentName)).sessionId,
+                    beforeDelivery: async () => {
+                        await request.beforeDelivery?.();
+                        const snapshot = await sessions.queue.committed.snapshot(request.sessionId);
+                        if (snapshot.pause)
+                            throw new CronDeliveryDeferredError('CRON_DELIVERY_QUEUE_PAUSED');
+                    },
+                }, reportFailure);
+            },
         },
     };
+}
+/** A lookup failure only keeps the run on the desktop. */
+function readScheduleOrigin(lookup, cronId) {
+    try {
+        return lookup?.(cronId);
+    }
+    catch {
+        return undefined;
+    }
 }
 /** New configurations replace all parameters; legacy keys keep the previous same-model policy. */
 function sessionModelFields(model) {

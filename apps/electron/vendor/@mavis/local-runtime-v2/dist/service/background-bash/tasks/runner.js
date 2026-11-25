@@ -53,8 +53,15 @@ async function prepareAdmittedTask(input, admission, shutdownSignal) {
         parentSessionId: input.parentSession.sessionId,
         requestedAgentName: target.requestedName,
     });
-    if (precheckFailure)
-        return { result: { status: 'failed', ...precheckFailure } };
+    if (precheckFailure) {
+        return {
+            result: {
+                status: 'failed',
+                ...precheckFailure,
+                ...(target.agentDisplayName ? { agentDisplayName: target.agentDisplayName } : {}),
+            },
+        };
+    }
     const taskId = createBackgroundTaskId();
     admission.identify(taskId);
     const turnId = taskTurnId(taskId);
@@ -67,6 +74,7 @@ async function prepareAdmittedTask(input, admission, shutdownSignal) {
         toolCtx: input.toolCtx,
         taskInput,
         target,
+        ...(input.spawnedBy ? { spawnedBy: input.spawnedBy } : {}),
     });
     if (shutdownSignal.aborted) {
         return {
@@ -137,7 +145,7 @@ async function createAdmittedTaskSession(input) {
  * instead of waiting for a background delivery that will never run.
  */
 async function failAdmittedTaskSetup(input) {
-    const { taskId, turnId, childSession, error } = input;
+    const { target, taskId, turnId, childSession, error } = input;
     await persistLocalSubagentTaskTerminal({
         host: input.input.host,
         taskId,
@@ -146,6 +154,7 @@ async function failAdmittedTaskSetup(input) {
     });
     return {
         status: 'failed',
+        ...(target.agentDisplayName ? { agentDisplayName: target.agentDisplayName } : {}),
         taskId,
         ...(childSession ? { subSessionId: childSession.sessionId } : {}),
         subTurnId: turnId,
@@ -214,6 +223,7 @@ async function startTaskTurn(setup, admission) {
     const concurrency = await readTaskOccupancy(input.host.runtimeConversation, input.parentSession.sessionId);
     return {
         status: 'started',
+        ...(target.agentDisplayName ? { agentDisplayName: target.agentDisplayName } : {}),
         taskId,
         subSessionId: startedChildSession.sessionId,
         subTurnId: turnId,
@@ -265,6 +275,7 @@ async function failTaskAdmission(setup, error) {
     });
     return {
         status: 'failed',
+        ...(target.agentDisplayName ? { agentDisplayName: target.agentDisplayName } : {}),
         taskId,
         subSessionId: childSession.sessionId,
         subTurnId: turnId,
@@ -290,6 +301,7 @@ async function cancelAdmittedTaskSetup(input) {
     });
     return {
         status: 'failed',
+        ...(input.target.agentDisplayName ? { agentDisplayName: input.target.agentDisplayName } : {}),
         taskId: input.taskId,
         subTurnId: input.turnId,
         ...(input.childSession ? { subSessionId: input.childSession.sessionId } : {}),

@@ -8,6 +8,7 @@
  * 按方案要求，`code_location` 固定使用“文件路径 + 函数名”，不含行号，并指向
  * agent-core 中实际观测失败的位置。
  */
+import { parseContentReviewError, } from '@mavis/agent-core/pi-turn-runner';
 import { formatErrorLog } from './reporter.js';
 /** 首期 LLM provider 失败日志的事件类型。 */
 const LLM_REQUEST_FAILURE_EVENT_TYPE = 'llm_request_failure';
@@ -23,6 +24,9 @@ const LLM_REQUEST_FAILURE_CODE_LOCATION = 'packages/agent-core/src/pi-turn-runne
 export function createLLMFailureReportHook(reporter, options = {}) {
     const appVersion = options.appVersion?.trim();
     return (info) => {
+        // 网关打回内容（content_error）是正常的业务结果，不是 provider 故障，不上报。
+        if (isContentReviewFailure(info))
+            return;
         reporter.report({
             event_type: LLM_REQUEST_FAILURE_EVENT_TYPE,
             event_log: formatErrorLog({
@@ -37,5 +41,12 @@ export function createLLMFailureReportHook(reporter, options = {}) {
             code_location: LLM_REQUEST_FAILURE_CODE_LOCATION,
         });
     };
+}
+/**
+ * 经 composeStreamFn 的 content_error 由 agent-core 认出后不会调这个 hook；这里再按解析结果兜一层
+ * （原始 400 响应体、错误对象等形态），不比对文案字符串。
+ */
+function isContentReviewFailure(info) {
+    return [info.error, info.providerError, info.errorMessage].some((source) => source !== undefined && parseContentReviewError(source) !== undefined);
 }
 //# sourceMappingURL=llm-integration.js.map

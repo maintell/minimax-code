@@ -1,6 +1,7 @@
 import { createContentSafetyChecker } from './transport/checker.js';
 import { callSafetyApi } from './transport/api.js';
 import { callLocalSafetyCheckV2 } from './transport/api-v2.js';
+import { createContentReviewModeProbe } from './transport/review-mode.js';
 import { ContentSafetyService, } from './content-safety.service.js';
 function initializeContentSafetyService(options) {
     return new ContentSafetyService(options);
@@ -22,8 +23,11 @@ export function initializeManagedContentSafetyService(options) {
         }
     };
     const checker = createContentSafetyChecker(options);
+    // 开关读 common_config；读不到或不是 true 时按本地送审处理。
+    const reviewMode = createContentReviewModeProbe();
     const service = initializeContentSafetyService({
         review: (content, scene) => run(() => checker(content, scene)),
+        serverReviewEnabled: reviewMode.serverReviewEnabled,
         close: async () => {
             closed = true;
             unbind?.();

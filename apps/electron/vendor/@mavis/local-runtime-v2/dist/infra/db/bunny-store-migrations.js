@@ -349,6 +349,68 @@ const indexReviewFinishedTurn = {
       WHERE type = 'review.finished';
   `,
 };
+/**
+ * Bunny 独立库 v13：默认空间不再特殊。旧版本自动建的 `id='default'` 那一行改名为「默认事项」，
+ * 此后是普通事项；没有归属的导入资料归入这一行。没有这一行时什么都不做。目录和文件不动。
+ */
+const retireDefaultSpace = {
+    version: 13,
+    name: 'retire_default_space',
+    up: (database) => {
+        const row = database
+            .prepare('SELECT 1 FROM local_runtime_task_spaces WHERE id = ?')
+            .all('default');
+        if (row.length === 0)
+            return;
+        const now = Date.now();
+        database
+            .prepare('UPDATE local_runtime_task_spaces SET name = ?, updated_at_ms = ? WHERE id = ?')
+            .run('默认事项', now, 'default');
+        database
+            .prepare('UPDATE local_runtime_artifact_library SET space_id = ?, updated_at_ms = ? WHERE space_id IS NULL')
+            .run('default', now);
+    },
+};
+/**
+ * Bunny 独立库 v14：任务记下派发它的 IM 会话地址（只存地址，不存微信 context token），
+ * 回传和核对结论由此回推原渠道。老任务这一列为空，行为不变。
+ */
+const addAssignmentOriginChannel = {
+    version: 14,
+    name: 'add_assignment_origin_channel',
+    up: (database) => {
+        if (!hasColumn(database, 'local_runtime_assignment_tasks', 'origin_channel_json'))
+            database.exec('ALTER TABLE local_runtime_assignment_tasks ADD COLUMN origin_channel_json TEXT');
+    },
+};
+/**
+ * Bunny 独立库 v15：Bunny 从 IM 会话里建的定时任务和自我提醒，记下那个会话地址
+ * （只存地址，不存微信 context token），每次运行的结果由此回推原渠道。
+ */
+const createScheduleOrigins = {
+    version: 15,
+    name: 'create_bunny_schedule_origins',
+    up: (database) => {
+        database.exec(`CREATE TABLE IF NOT EXISTS local_runtime_bunny_schedule_origins (
+      cron_id TEXT PRIMARY KEY NOT NULL,
+      origin_channel_json TEXT NOT NULL,
+      recorded_at_ms INTEGER NOT NULL
+    )`);
+    },
+};
+/**
+ * Bunny 独立库 v16：排队任务开始时要附带的文件。`pending_start` 原先只存任务说明，排队的任务
+ * 开始时附件全丢；这一列存派出时算好的本地路径（JSON 数组）。老任务这一列为空，即没有附件。只补列，
+ * 可以重复执行。
+ */
+const addPendingStartAttachments = {
+    version: 16,
+    name: 'add_pending_start_attachments',
+    up: (database) => {
+        if (!hasColumn(database, 'local_runtime_assignment_tasks', 'pending_start_attachments_json'))
+            database.exec('ALTER TABLE local_runtime_assignment_tasks ADD COLUMN pending_start_attachments_json TEXT');
+    },
+};
 /** Bunny 独立库的迁移链，版本从 1 开始，与大库版本号无关。 */
 export const BUNNY_STORE_MIGRATIONS = [
     createBunnyStore,
@@ -363,5 +425,9 @@ export const BUNNY_STORE_MIGRATIONS = [
     dropTelemetryOutbox,
     createTaskTelemetry,
     indexReviewFinishedTurn,
+    retireDefaultSpace,
+    addAssignmentOriginChannel,
+    createScheduleOrigins,
+    addPendingStartAttachments,
 ];
 //# sourceMappingURL=bunny-store-migrations.js.map

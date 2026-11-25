@@ -70,6 +70,7 @@ async function routeConfigurationApi({ host, request, method, parts, url, }) {
             configUpdater: host.configUpdater,
             ptcDefault: host.ptcDefault,
             publishGlobalEvent: host.publishGlobalEvent,
+            metricsClient: host.metricsClient,
             permissionSeedRunner: async (body) => {
                 if (mayHaveSetAcceptEditsMode(body))
                     await host.syncAcceptEditsSeed();

@@ -36,7 +36,7 @@ export function initializeSkillSystem(options) {
     const registry = {
         listSkills: (...args) => run(() => provider.listSkills(...args)),
         listRuntimeSkills: (...args) => run(() => provider.listRuntimeSkills(...args)),
-        renderCatalog: (...args) => run(() => provider.renderCatalog(...args)),
+        listCatalogEntries: (...args) => run(() => provider.listCatalogEntries(...args)),
         readSkillByName: (...args) => run(() => provider.readSkillByName(...args)),
         getSkillDetail: (...args) => run(() => provider.getSkillDetail(...args)),
         listSkillFiles: (...args) => run(() => provider.listSkillFiles(...args)),
@@ -54,9 +54,9 @@ export function initializeSkillSystem(options) {
         resolveBuiltinSkillNames: resolveFeatureAwareBuiltinSkillNames,
         readNativeSkill: (input) => run(() => readNativeSkill(reads, input)),
         listHostedRuntimeSkills: (...args) => run(() => hostedReads.listHostedRuntimeSkills(...args)),
-        renderHostedCatalog: (...args) => run(() => hostedReads.renderHostedCatalog(...args)),
+        listHostedCatalogEntries: (...args) => run(() => hostedReads.listHostedCatalogEntries(...args)),
         listRuntimeSkills: (...args) => run(() => reads.listRuntimeSkills(...args)),
-        renderCatalog: (...args) => run(() => reads.renderCatalog(...args)),
+        listCatalogEntries: (...args) => run(() => reads.listCatalogEntries(...args)),
         readSkillByName: (...args) => run(() => reads.readSkillByName(...args)),
         setSkillEnabled: (input, enabled) => run(async () => {
             const result = await provider.setSkillEnabled(input, enabled);

@@ -92,6 +92,14 @@ export function mapTurnRejection(error) {
             reason: error.reason,
         });
     }
+    if (error.reason === 'policy:worktree:cleaned') {
+        return sessionSendError(`The worktree of Session ${error.sessionId} was cleaned up automatically. The user must restore it in MiniMax Code Desktop; do not retry.`, {
+            status: 409,
+            code: 'SESSION_WORKTREE_CLEANED',
+            sessionId: error.sessionId,
+            reason: error.reason,
+        });
+    }
     if (error.reason === 'invalid-session') {
         return sessionSendError(`Session not found: ${error.sessionId}`, {
             status: 404,

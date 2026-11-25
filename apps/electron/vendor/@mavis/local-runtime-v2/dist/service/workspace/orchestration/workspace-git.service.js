@@ -3,7 +3,8 @@ import { observeGitRead } from '../git-read-observation.js';
 import { captureGitChangesBase, classifyWorkspacePathsIgnored, enrichGitChanges, getDefaultBranch, getGitBranches, listRecentGitBranches, searchGitBranches, getGitMetadata, isGitRepo, } from '../operations/changes.js';
 import { getWorkspaceDiffContext, getWorkspaceFileDiff, listWorkspaceFileDiffs, } from '../operations/diffs.js';
 import { applyFileChangeAction, checkoutBranch, commit, commitAndPush, createBranch, push, saveWorkspaceFile, } from '../operations/mutations.js';
-import { createWorkspaceGitWorktree, listWorkspaceGitWorktrees, removeManagedWorkspaceGitWorktree, removeManagedWorkspaceGitWorktreesBatch, removeWorkspaceGitWorktree, } from '../operations/worktrees.js';
+import { createWorkspaceGitWorktree, listWorkspaceGitWorktrees } from '../operations/worktrees.js';
+import { removeManagedWorktree, removeManagedWorktreesBatch } from '../git/managed-worktrees.js';
 import { getWorkspaceReviewFileContent, getWorkspaceReviewSummary, listWorkspaceReviewCommits, listWorkspaceReviewFileDiffs, searchWorkspaceReviewDiffs, } from '../operations/review.js';
 import { WorkspaceGitGraphReader } from '../operations/graph.js';
 import { WorkspaceReviewSearchIndexCache } from '../operations/review-search.js';
@@ -113,19 +114,25 @@ export class WorkspaceGitService {
         const identity = await this.resolveWorkspaceIdentity(workspace);
         return listWorkspaceGitWorktrees(identity);
     }
+    /** Settings needs the repository's real main worktree, even from a linked worktree. */
+    async listManagedWorktrees(workspace) {
+        const identity = await this.resolveWorkspaceIdentity(workspace);
+        return listWorkspaceGitWorktrees(identity, { usePrimaryWorktree: true });
+    }
     createWorktree(workspace, options) {
         return createWorkspaceGitWorktree(workspace, options);
     }
     removeWorktree(workspace, worktreeDir) {
-        return removeWorkspaceGitWorktree(workspace, worktreeDir);
+        return this.removeManagedWorktree(workspace, worktreeDir);
     }
     async removeManagedWorktree(workspace, worktreeDir, activeWorktreeDir) {
         const running = (await this.listRunningWorktreeDirs?.()) ?? [];
-        return removeManagedWorkspaceGitWorktree(workspace, worktreeDir, activeWorktreeDir, running);
+        const { status, body } = await removeManagedWorktree(workspace, worktreeDir, activeWorktreeDir, running);
+        return { status, ...body };
     }
     async removeManagedWorktreesBatch(items, activeWorktreeDir) {
         const running = (await this.listRunningWorktreeDirs?.()) ?? [];
-        return removeManagedWorkspaceGitWorktreesBatch(items, activeWorktreeDir, running);
+        return removeManagedWorktreesBatch([...items], activeWorktreeDir, running);
     }
     async getFileDiff(workspace, filePath, options) {
         const identity = await this.resolveSnapshotIdentity(workspace);

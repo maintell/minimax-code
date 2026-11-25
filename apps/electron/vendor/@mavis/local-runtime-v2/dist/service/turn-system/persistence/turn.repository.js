@@ -124,6 +124,9 @@ export function createTurnRepository(options) {
             return result;
         },
         readSessionDeletion: async (sessionId) => readSessionDeletionState(options.db, sessionId),
+        abandonSessionDeletion: async (sessionId) => options.db.transaction((tx) => abandonSessionDeletionInTransaction(tx, sessionId), {
+            behavior: 'immediate',
+        }),
         isSessionDeleting: async (sessionId) => options.sessionAdmission.rejectionInTransaction(options.db, { sessionId }) ===
             'session-deleting' ||
             isDeletionOwnerKind(findSessionLock(options.db, sessionId)?.ownerKind),
@@ -627,6 +630,17 @@ function recoverExpiredDeletionTurnInTransaction(tx, sessionId, completedAtMs) {
         throw new Error(`Expired Session deletion Turn lost ownership: ${sessionId}/${turnId}`);
     }
 }
+function abandonSessionDeletionInTransaction(tx, sessionId) {
+    const lock = findSessionLock(tx, sessionId);
+    const ownerKind = lock ? fencedOwnerKind(lock.ownerKind) : undefined;
+    if (lock && ownerKind) {
+        tx.update(sessionLocks)
+            .set({ ownerKind })
+            .where(and(eq(sessionLocks.sessionId, sessionId), eq(sessionLocks.ownerId, lock.ownerId)))
+            .run();
+    }
+    return readSessionDeletionState(tx, sessionId);
+}
 function readSessionDeletionState(db, sessionId) {
     const lock = findSessionLock(db, sessionId);
     if (!lock || !isDeletionOwnerKind(lock.ownerKind))
@@ -661,6 +675,15 @@ function deletionPendingOwnerKind(ownerKind) {
     if (ownerKind === MAINTENANCE_OWNER_KIND || ownerKind === MAINTENANCE_DELETING_OWNER_KIND) {
         return MAINTENANCE_DELETING_OWNER_KIND;
     }
+    return undefined;
+}
+function fencedOwnerKind(ownerKind) {
+    if (ownerKind === TURN_DELETING_OWNER_KIND)
+        return 'turn';
+    if (ownerKind === COMPACTION_DELETING_OWNER_KIND)
+        return 'compaction';
+    if (ownerKind === MAINTENANCE_DELETING_OWNER_KIND)
+        return MAINTENANCE_OWNER_KIND;
     return undefined;
 }
 function findAcceptedQueueTurn(db, query) {

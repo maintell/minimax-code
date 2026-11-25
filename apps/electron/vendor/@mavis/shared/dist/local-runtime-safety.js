@@ -7,10 +7,26 @@ export const SAFETY_SCENE = {
     AgentConfigName: 'agent-config-name',
     AgentConfigAvatar: 'agent-config-avatar',
     CronTitle: 'cron-title',
+    ProjectName: 'project-name',
     UserInput: 300,
 };
 export function reviewBlocks(result) {
     return !result.pass && result.errorKind !== 'api_error';
+}
+/**
+ * Dialog review (user input, assistant output, thinking) fails closed: a review that
+ * gave no verdict blocks like a rejection, `api_error` included. Other callers keep
+ * `reviewBlocks`.
+ */
+export function dialogReviewBlocks(result) {
+    return !result.pass;
+}
+/** The review service gave no verdict: transport, auth or gateway failure. */
+export function dialogReviewUnavailable(result) {
+    return (!result.pass &&
+        (result.errorKind === 'local_error' ||
+            result.errorKind === 'auth_error' ||
+            result.errorKind === 'api_error'));
 }
 export function createDeferredContentSafetyCapability() {
     let current;

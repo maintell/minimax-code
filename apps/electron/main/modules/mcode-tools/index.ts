@@ -34,6 +34,12 @@ export async function clearMcodeToolsAuthorization() {
     if (initialization)
         await initialization;
 }
+/** Launcher for main-process callers; null while the integration is disabled or failed. */
+export async function resolveMcodeToolsLauncherPath() {
+    if (initialization)
+        await initialization.catch(() => undefined);
+    return activeIntegration?.launcherPath ?? null;
+}
 export function disposeMcodeToolsIntegration() {
     if (disposal)
         return disposal;

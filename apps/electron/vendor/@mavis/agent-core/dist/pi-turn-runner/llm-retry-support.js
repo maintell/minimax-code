@@ -1,5 +1,48 @@
-import { isLLMTransportRetryReason, normalizeLLMError, toLLMFailureErrorKind, toLLMMetricErrorKind, } from '@mavis/shared/llm-error-classifier';
+import { isLLMTransportRetryReason, normalizeLLMError, toLLMFailureErrorKind, toLLMMetricErrorKind, toLLMProtocolClassification, } from '@mavis/shared/llm-error-classifier';
 import { isLocalResourceErrorKind } from '@mavis/shared/local-resource-errors';
+import { parseByokErrorAttribution } from '@mavis/shared/byok-error-attribution';
+export const PUBLIC_ERROR_MESSAGES = {
+    abort: 'LLM request was cancelled',
+    timeout: 'LLM request timed out',
+    rate_limited: 'LLM provider rate limited the request',
+    tpm_rate_limited: 'LLM provider token rate limit reached',
+    usage_limit: 'LLM usage limit reached',
+    credits_exhausted: 'LLM credits exhausted',
+    auth: 'LLM provider authentication failed',
+    bad_request: 'LLM provider rejected the request',
+    not_found: 'LLM provider resource not found',
+    content_filter: 'LLM provider blocked the response',
+    server_error: 'LLM provider request failed',
+    overloaded: 'LLM provider is overloaded',
+    network: 'LLM network connection failed',
+    empty_response: 'LLM provider returned an empty response',
+    unknown: 'LLM request failed',
+    length: 'LLM response reached the length limit',
+};
+/**
+ * The custom provider a BYOK-attributed failure names. The host's BYOK error
+ * attribution writes it into the failure text whatever `model.provider` an
+ * OAuth route resolved to, and the shared parser reads it the same way the
+ * final error does, so the retry event names the same provider.
+ */
+function byokCustomProviderId(message) {
+    const providerId = parseByokErrorAttribution(message)?.errorProviderId;
+    return providerId?.startsWith('custom_provider:') ? providerId : undefined;
+}
+/**
+ * The fixed public error for a failed attempt: no request content or provider
+ * text, only the user's own custom provider id when the failure names one.
+ */
+export function publicRetryError(normalized, reason) {
+    const protocol = toLLMProtocolClassification(normalized);
+    const providerId = byokCustomProviderId(normalized.sanitizedMessage);
+    return {
+        reason,
+        ...(protocol ? { code: protocol.code } : {}),
+        message: PUBLIC_ERROR_MESSAGES[reason],
+        ...(providerId ? { providerId } : {}),
+    };
+}
 /** Ask the inner stream to stop without waiting on one that may never settle. */
 export function releaseIterator(iterator) {
     void Promise.resolve()

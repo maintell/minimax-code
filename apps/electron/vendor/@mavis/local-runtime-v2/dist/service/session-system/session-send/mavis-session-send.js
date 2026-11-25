@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { callbackify } from 'node:util';
 import { ConversationTurnRejectedError, isRuntimeConversationShutdownError, isRuntimeConversationUnavailableError, } from '@mavis/conversation-contract';
 import { queuesPeerDelivery } from '@mavis/shared/agent-coordination';
+import { dispatchAttachments } from '../../../infra/conversation/dispatch-attachments.js';
 import { logger } from '../../../infra/logging/logger.js';
 import { peerSessionSendOrigin, resolveSessionSendOrigin } from './mavis-session-send-origin.js';
 import { reclaimAdmittedSessionSend } from './mavis-session-send-completion.js';
@@ -57,7 +58,7 @@ export async function sendToLocalSession(deps, req, signal) {
         // caller no longer wants.
         if (signal?.aborted)
             throw abortAdmittedSessionSend(deps, req, admission);
-        return acknowledgeSessionSend(req, admission);
+        return acknowledgeSessionSend(req, admission, target);
     }
     catch (error) {
         // Already-shaped rejections were logged where they were built; the two
@@ -92,7 +93,10 @@ export async function sendToLocalSession(deps, req, signal) {
 async function buildSessionSendMessage(deps, req) {
     const sideChatOrigin = req.assignmentOrigin === undefined ? await resolveSessionSendOrigin(deps, req) : undefined;
     const origin = req.assignmentOrigin ?? sideChatOrigin ?? (await peerSessionSendOrigin(deps, req));
-    return { message: { content: req.content, attachments: [], origin }, sideChatOrigin };
+    return {
+        message: { content: req.content, attachments: dispatchAttachments(req.attachments), origin },
+        sideChatOrigin,
+    };
 }
 async function validateSessionSendTarget(deps, sessionId) {
     const target = await deps.conversation.query.getSession(sessionId);
@@ -245,13 +249,26 @@ function originLogFields(req, sideChatOrigin) {
  * with the message rather than what the Agent replied, so the model never
  * mistakes an admission for an answer.
  */
-function acknowledgeSessionSend(req, admission) {
+function acknowledgeSessionSend(req, admission, target) {
     observeAbandonedSessionSendTurn(req, admission);
     return {
         sessionId: req.sessionId,
         turnId: admission.turnId,
         status: 'accepted',
         mode: admission.mode,
+        ...(target.parentSessionId === req.callerSessionId
+            ? {
+                subagent_executions: [
+                    {
+                        agent_name: target.agentName,
+                        sub_session_id: target.sessionId,
+                        sub_turn_id: admission.turnId,
+                        parent_session_id: req.callerSessionId,
+                        status: admission.mode === 'activated' ? 'started' : admission.mode,
+                    },
+                ],
+            }
+            : {}),
         ...(admission.queue ? { queue: admission.queue } : {}),
         note: describeSessionSendAdmission(admission.mode),
     };

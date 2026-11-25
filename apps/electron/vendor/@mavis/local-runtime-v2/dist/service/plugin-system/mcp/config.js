@@ -23,6 +23,8 @@ const OFFICIAL_REMOTE_FIELDS = new Set([
 ]);
 const COMPATIBLE_FIELDS = new Set([...OFFICIAL_STDIO_FIELDS, ...OFFICIAL_REMOTE_FIELDS, 'oauth']);
 const CODEX_FIELDS = new Set([...COMPATIBLE_FIELDS, 'scopes']);
+/** Declaration fields that describe a server without changing what is started. */
+const NON_LAUNCH_FIELDS = new Set(['description', 'timeout', 'tools']);
 /** Credential-bearing or non-standard auth fields a server entry may never declare. */
 const LEGACY_AUTH_FIELDS = new Set([
     'auth',
@@ -63,6 +65,14 @@ export async function readOfficialMcpFile(root, relativePath) {
         servers.push(await normalizeServer(root, name, raw, 'official'));
     }
     return { servers, diagnostics: [] };
+}
+/**
+ * What a declared server starts: its validated declaration without the descriptive fields.
+ * Root-relative values stay as declared, so the same package in another directory compares equal.
+ */
+export function mcpServerLaunchConfig(server) {
+    const declared = JSON.parse(server.configJson);
+    return Object.fromEntries(Object.entries(declared).filter(([field]) => !NON_LAUNCH_FIELDS.has(field)));
 }
 export async function parseCompatibleMcpObject(root, value, format) {
     const map = isRecord(value.mcpServers) ? value.mcpServers : value;

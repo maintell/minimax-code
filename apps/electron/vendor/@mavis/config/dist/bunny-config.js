@@ -30,8 +30,19 @@ export function getBunnyReleaseBuildDefault(context = {}) {
         return false;
     return undefined;
 }
+/** The Apollo key of {@link BunnyRemotePolicy.forceDisabledExemptUserIds}. */
+export const BUNNY_FORCE_DISABLED_EXEMPT_FIELD = 'force_disabled_exempt_user_ids';
 /**
- * Accepts the Apollo object (`force_disabled`, `default_enabled`,
+ * The policy a host holds before Apollo answered (signed out, starting up, or the fetch failed).
+ * Packages that ship Bunny off — inside and public prod — fail closed: the kill switch is on, so a
+ * local `bunny.enabled: true` cannot turn Bunny on until a real policy arrives. Internal and
+ * test/dev/staging packages keep the empty policy and their old behaviour.
+ */
+export function getBunnyMissingPolicy(context = {}) {
+    return getBunnyReleaseBuildDefault(context) === false ? { forceDisabled: true } : {};
+}
+/**
+ * Accepts the Apollo object (`force_disabled`, `force_disabled_exempt_user_ids`, `default_enabled`,
  * `userIdHashEndNumbers`, `userIds`, `disabledUserIds`, `default_model`, `default_task_model`; the
  * two model defaults take a `"<providerId>/<modelId>"` string or an object with `model`,
  * `effort` and `context_window`).
@@ -72,6 +83,11 @@ export function parseBunnyRemotePolicy(raw, warn = defaultWarn) {
     const disabledUserIds = parseUserIdList(record.disabledUserIds ?? record.disabled_user_ids, 'disabledUserIds', warn);
     if (disabledUserIds)
         policy.disabledUserIds = disabledUserIds;
+    // snake_case only, like the `force_disabled` the renderer reads to hide the Settings row: a
+    // camelCase spelling would exempt the user here while the renderer still hid their row.
+    const exemptUserIds = parseUserIdList(record[BUNNY_FORCE_DISABLED_EXEMPT_FIELD], BUNNY_FORCE_DISABLED_EXEMPT_FIELD, warn);
+    if (exemptUserIds)
+        policy.forceDisabledExemptUserIds = exemptUserIds;
     const defaultModel = parseModelDefault(record.default_model ?? record.defaultModel, 'default_model', warn);
     if (defaultModel)
         policy.defaultModel = defaultModel;
@@ -160,30 +176,44 @@ function parseUserIdList(value, name, warn) {
     warn(`${name} must be an array of non-empty strings; ignoring it`);
     return undefined;
 }
-/** Whether Apollo targets this user through the UID allowlist or the rollout buckets. */
+/** Whether this signed-in user is in `force_disabled_exempt_user_ids`; never without a user ID. */
+export function isBunnyForceDisabledExempt(remote, userId) {
+    const id = userId?.trim();
+    if (!id || !remote)
+        return false;
+    return remote.forceDisabledExemptUserIds?.includes(id) === true;
+}
+/**
+ * Whether Apollo targets this user through the UID allowlist, the `force_disabled` exemption
+ * list, or the rollout buckets.
+ */
 export function isBunnyRolloutTarget(remote, userId) {
     const id = userId?.trim();
     if (!id || !remote)
         return false;
     return (remote.userIds?.includes(id) === true ||
+        isBunnyForceDisabledExempt(remote, id) ||
         remote.userIdHashEndNumbers?.includes(getBucketDigit(id)) === true);
 }
 /**
- * Apollo `force_disabled: true` turns Bunny off above everything, and
- * `disabledUserIds` does the same for the listed users; then an
- * explicit local choice wins; then the Apollo allowlist or bucket turns Bunny
- * on; then a release package's build variant (internal on, inside/prod off);
- * then the Apollo default; then the build environment default. A missing
- * remote policy (fetch failed) never forces Bunny off.
+ * Apollo `force_disabled: true` turns Bunny off above everything for every user
+ * outside `force_disabled_exempt_user_ids` (a signed-out user is never exempt),
+ * and `disabledUserIds` does the same for the listed users, exempt or not; then
+ * an explicit local choice wins; then the Apollo allowlist, exemption list or
+ * bucket turns Bunny on; then a release package's build variant (internal on,
+ * inside/prod off); then the Apollo default; then the build environment default.
+ * A missing remote policy never forces Bunny off here; hosts of inside/prod
+ * packages hold {@link getBunnyMissingPolicy} until Apollo answers instead.
  */
 export function resolveBunnyEnabled(explicit, remote, context = {}) {
     return resolveBunnyEnabledState(explicit, remote, context).enabled;
 }
 /** Same precedence as `resolveBunnyEnabled`, also naming the rule that decided it. */
 export function resolveBunnyEnabledState(explicit, remote, context = {}) {
-    if (remote?.forceDisabled === true)
-        return { enabled: false, source: 'force_disabled' };
     const userId = context.userId?.trim();
+    if (remote?.forceDisabled === true && !isBunnyForceDisabledExempt(remote, userId)) {
+        return { enabled: false, source: 'force_disabled' };
+    }
     if (userId && remote?.disabledUserIds?.includes(userId) === true) {
         return { enabled: false, source: 'force_disabled' };
     }
@@ -222,5 +252,18 @@ export function isBunnyEnabledInConfig(config) {
  */
 export function isBunnyMemoryEnabledInConfig(config) {
     return isBunnyEnabledInConfig(config) && config?.bunny?.memory?.enabled === true;
+}
+/**
+ * Whether config.yaml turns Bunny's async review gate on.
+ *
+ * The one reader of `bunny.verdictGate`, for the same reason
+ * {@link isBunnyMemoryEnabledInConfig} is the one reader of `bunny.memory`: the switch is read
+ * from three places that hold three different views of the config (the model-system view does
+ * not declare `bunny` at all), and a gate that reads as off in one of them while the prompt and
+ * the tool annotations still read as on is worse than no gate. Only an explicit `true` turns it
+ * on, so a config written before the switch existed reads as off.
+ */
+export function isBunnyVerdictGateEnabledInConfig(config) {
+    return config?.bunny?.verdictGate === true;
 }
 //# sourceMappingURL=bunny-config.js.map

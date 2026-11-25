@@ -3,6 +3,7 @@ import { isCoordinatorAgent, schedulesTargetMainConversation, } from '@mavis/sha
 import { Value } from '@sinclair/typebox/value';
 import { cronCommand, cronToolDefinitions, cronToolFailure, LocalSelfReminderToolDef, } from '../cron/tool-defs.js';
 import { DESKTOP_MANAGEMENT_MAX_TOKENS, currentLocalCronModel, dispatchLocalMavis, isCronCallableInRunCode, limitLocalManagementOutput, } from './local-mavis.js';
+import { assignmentOriginChannel } from './local-assignment-tools.js';
 import { withDesktopCompletenessReport } from './ptc-result-projection.js';
 export function buildLocalCronTools(deps) {
     const crud = cronToolDefinitions('cron_id').map((def) => defineRuntimeTool({
@@ -52,6 +53,8 @@ export function buildLocalCronTools(deps) {
                     currentSessionId: ctx.sessionId,
                     currentModel: currentLocalCronModel(ctx),
                 }, command, args, signal);
+                if (def.name === 'cron_create' && output.ok)
+                    await recordScheduleOrigin(deps.cronAdapter, ctx, createdCronId(output));
                 const recovery = isCronCallableInRunCode(ctx)
                     ? 'Call tools.cron_read again inside run_code with a smaller limit or exact task ID. Do not repeat successful creation or updates.'
                     : 'Use mcp_invoke with cron_read and a smaller limit or exact task ID. Do not repeat successful creation or updates.';
@@ -127,6 +130,9 @@ export function buildLocalCronTools(deps) {
                             prompt: args.prompt,
                             delaySeconds: args.delay_seconds,
                         }, signal);
+                        const reminderId = response.reminder_id;
+                        if (typeof reminderId === 'string')
+                            await recordScheduleOrigin(adapter, ctx, reminderId);
                     }
                     const text = JSON.stringify({ ok: true, response });
                     return withDesktopCompletenessReport('self_reminder', {
@@ -144,6 +150,36 @@ export function buildLocalCronTools(deps) {
             },
         }),
     ];
+}
+/**
+ * A schedule a main-conversation Agent (Bunny) creates from an IM chat keeps that chat's
+ * address, so each run's final reply also goes back there. Best-effort: a failure only
+ * keeps the runs on the desktop and never changes the creation result.
+ */
+async function recordScheduleOrigin(adapter, ctx, cronId) {
+    if (!cronId || !ctx.agentName || !adapter.recordScheduleOrigin)
+        return;
+    if (!schedulesTargetMainConversation(ctx.coordination))
+        return;
+    const originChannel = assignmentOriginChannel(ctx);
+    if (!originChannel)
+        return;
+    try {
+        await adapter.recordScheduleOrigin({ cronId, agentName: ctx.agentName, originChannel });
+    }
+    catch {
+        // The schedule exists either way; only its IM reply is lost.
+    }
+}
+function createdCronId(output) {
+    const response = output.response;
+    if (typeof response !== 'object' || response === null)
+        return undefined;
+    const task = Reflect.get(response, 'task');
+    if (typeof task !== 'object' || task === null)
+        return undefined;
+    const cronId = Reflect.get(task, 'cronId');
+    return typeof cronId === 'string' && cronId ? cronId : undefined;
 }
 /** PTC failures of self_reminder keep only the outcome; the reason is r.error. */
 function selfReminderFailure(message, code) {

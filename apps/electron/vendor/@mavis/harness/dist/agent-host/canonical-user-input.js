@@ -1,0 +1,636 @@
+import { normalizeModelSelection } from './preparation/config/model-selection-input.js';
+import { isInputSafetyDecision } from './runner/input-safety.js';
+import { parsePeerSessionOrigin } from './contracts.js';
+import { captureSemanticSnapshot } from './history/semantic-identity.js';
+const USER_MESSAGE_ID_RE = /^msg-user-v1-[A-Za-z0-9_-]+$/u;
+/**
+ * 投递来源是否由用户本人撰写。它决定 genuine user query text 与 AskUser 等待是否结束。
+ *
+ * `communication` 被刻意排除：它是另一个 Agent 的 session send，不是本人；`cron`、
+ * `background-task` 与 `questionnaire` 同样不是（2026-09-24 与产品确认）。
+ *
+ * 与 `isUserQueueInput` 的差别：后者在这一条之外还排除问卷答复的 origin，那是 AskUser
+ * 等待专用——避免一句还没被消费的答复提前结束等待。答复正文确实是本人写的，所以按来源
+ * 判定时它算本人输入；以 `api` 重排的问卷答复同理。
+ */
+export function isUserAuthoredSource(source) {
+    return (source === 'api' ||
+        source === 'code_review' ||
+        source === 'channel' ||
+        source.startsWith('channel:'));
+}
+/**
+ * 这个来源发起的 Turn 是否可以授权写入用户自己的产物（目前是记忆摘要的请求行）。
+ *
+ * 在 `isUserAuthoredSource` 之外把 `conversation-mutation` 也算进来：用户编辑并重发自己
+ * 的消息走的就是这个来源，内容仍然是本人写的。`turn-execution` 的 `isForegroundTurn`
+ * 用的是同一口径。
+ */
+export function isUserAuthoredTurnSource(source) {
+    return source === 'conversation-mutation' || isUserAuthoredSource(source);
+}
+export class AgentHostUserInputValidationError extends TypeError {
+    reason;
+    name = 'AgentHostUserInputValidationError';
+    constructor(reason) {
+        super(`AgentHost canonical user input is invalid: ${reason}.`);
+        this.reason = reason;
+    }
+}
+const MESSAGE_FIELDS = [
+    'computerUse',
+    'text',
+    'attachments',
+    'origin',
+    'quotedMessage',
+    'channelContext',
+];
+const USER_INPUT_FIELDS = [...MESSAGE_FIELDS, 'queuedMessages', 'model', 'computerUse'];
+const ATTACHMENT_STRING_FIELDS = [
+    'type',
+    'filePath',
+    'fileName',
+    'mimeType',
+    'desktopPath',
+    'dataUrl',
+    'assetId',
+    'error',
+    'driveNodeId',
+    'drivePath',
+];
+const ATTACHMENT_FIELDS = [...ATTACHMENT_STRING_FIELDS, 'sizeBytes'];
+const CHANNEL_CONTEXT_FIELDS = [
+    'platform',
+    'chatType',
+    'chatId',
+    'senderId',
+    'clientName',
+    'threadId',
+    'sourceMessageId',
+    'contextToken',
+    'channel',
+    'channel_id',
+    'targetAgentId',
+];
+const MODEL_PARAMETER_SNAPSHOT_FIELDS = ['context', 'effort'];
+const ORIGIN_FIELDS = ['kind', 'taskIds', 'observedTerminalCount'];
+const PROVENANCE_FIELDS = ['source', 'sourceContext', 'routingFingerprint'];
+const REQUEST_FIELDS = [
+    'immediateSendBatch',
+    'input',
+    'outputContract',
+    'executionDeadlineAtMs',
+    'genuineUserQueryText',
+    'inputSafetyDecision',
+    'requiresInputReview',
+    'clientRequestId',
+    'userMessageId',
+    'provenance',
+    'queueItemIds',
+    'clientIntent',
+    'executionMode',
+    'continuation',
+    'continuationAfterFailedTurn',
+];
+const CONTINUATION_FIELDS = ['resumeFrom'];
+/**
+ * Establishes the one closed, detached public execution request accepted by
+ * AgentHost. Validation and every downstream consumer use this same snapshot;
+ * richer caller-owned subclasses or post-callback mutation cannot bypass the
+ * contract.
+ */
+export function captureAgentHostExecutionRequest(request) {
+    if (!isRecord(request)) {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    assertOnlyFields(request, REQUEST_FIELDS);
+    const snapshot = captureSemanticSnapshot(request).value;
+    if (!isRecord(snapshot)) {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    const immediateSendBatch = snapshotImmediateSendBatch(snapshot.immediateSendBatch);
+    const queueItemIds = snapshotQueueItemIds(snapshot.queueItemIds);
+    const input = snapshotUserInput(snapshot.input);
+    const outputContract = snapshotOutputContract(snapshot.outputContract);
+    const executionDeadline = snapshotExecutionDeadlineField(snapshot.executionDeadlineAtMs);
+    const inputSafetyDecision = snapshotInputSafetyDecision(snapshot.inputSafetyDecision);
+    const requiresInputReview = snapshotRequiresInputReview(snapshot.requiresInputReview);
+    const provenance = snapshotProvenance(snapshot.provenance);
+    const clientRequestId = optionalNonEmptyString(snapshot, 'clientRequestId', 'invalid-request');
+    const genuineUserQueryText = snapshotGenuineUserQueryText(snapshot.genuineUserQueryText);
+    const clientIntent = optionalNonEmptyString(snapshot, 'clientIntent', 'invalid-request');
+    const executionMode = snapshotExecutionModeField(snapshot.executionMode);
+    const continuation = snapshotContinuationField(snapshot.continuation, executionMode);
+    const userMessageId = snapshot.userMessageId;
+    if (userMessageId !== undefined && !isAgentHostUserMessageId(userMessageId)) {
+        invalidUserMessageId();
+    }
+    return captureSemanticSnapshot({
+        input,
+        immediateSendBatch,
+        ...(outputContract ? { outputContract } : {}),
+        ...executionDeadline,
+        genuineUserQueryText,
+        ...(inputSafetyDecision ? { inputSafetyDecision } : {}),
+        ...(requiresInputReview !== undefined ? { requiresInputReview } : {}),
+        provenance,
+        ...clientRequestId,
+        ...(userMessageId !== undefined ? { userMessageId } : {}),
+        ...(queueItemIds ? { queueItemIds } : {}),
+        ...clientIntent,
+        ...executionMode,
+        ...continuation,
+        ...snapshotContinuationAfterFailedTurn(snapshot.continuationAfterFailedTurn),
+    }).value;
+}
+function snapshotContinuationField(value, executionMode) {
+    if (value === undefined)
+        return {};
+    if (!isRecord(value) || executionMode.executionMode !== 'continuation') {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    assertOnlyFields(value, CONTINUATION_FIELDS);
+    const resumeFrom = value.resumeFrom;
+    if (resumeFrom !== 'tail' && resumeFrom !== 'pending-tool-calls') {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    return { continuation: { resumeFrom } };
+}
+function snapshotExecutionDeadlineField(value) {
+    if (value === undefined)
+        return {};
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    return { executionDeadlineAtMs: value };
+}
+function snapshotImmediateSendBatch(value) {
+    if (value === undefined)
+        return undefined;
+    if (!isRecord(value) ||
+        !isNonEmptyString(value.id) ||
+        !Array.isArray(value.members) ||
+        value.members.length === 0) {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    assertOnlyFields(value, ['id', 'members']);
+    const identities = new Set();
+    const members = value.members.map((member) => {
+        if (!isRecord(member) ||
+            !isAgentHostUserMessageId(member.userMessageId) ||
+            identities.has(member.userMessageId) ||
+            !isNonEmptyString(member.messageKey) ||
+            typeof member.createdAt !== 'number' ||
+            !Number.isFinite(member.createdAt)) {
+            throw new AgentHostUserInputValidationError('invalid-request');
+        }
+        assertOnlyFields(member, [
+            'input',
+            'genuineUserQueryText',
+            'userMessageId',
+            'messageKey',
+            'createdAt',
+            'provenance',
+        ]);
+        identities.add(member.userMessageId);
+        return {
+            input: snapshotBatchMemberInput(member.input),
+            genuineUserQueryText: snapshotGenuineUserQueryText(member.genuineUserQueryText),
+            userMessageId: member.userMessageId,
+            messageKey: member.messageKey,
+            createdAt: member.createdAt,
+            provenance: snapshotProvenance(member.provenance),
+        };
+    });
+    return { id: value.id, members };
+}
+function snapshotBatchMemberInput(value) {
+    if (!isRecord(value))
+        throw new AgentHostUserInputValidationError('invalid-request');
+    assertOnlyFields(value, MESSAGE_FIELDS);
+    return snapshotMessage(value);
+}
+function snapshotExecutionModeField(value) {
+    const executionMode = snapshotExecutionMode(value);
+    return executionMode ? { executionMode } : {};
+}
+function snapshotExecutionMode(value) {
+    if (value === undefined)
+        return undefined;
+    if (value !== 'continuation') {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    return value;
+}
+function snapshotContinuationAfterFailedTurn(value) {
+    if (value === undefined)
+        return {};
+    if (value !== true)
+        throw new AgentHostUserInputValidationError('invalid-request');
+    return { continuationAfterFailedTurn: true };
+}
+function snapshotGenuineUserQueryText(value) {
+    if (typeof value !== 'string') {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    return value;
+}
+/** Captures active steering facts without pretending they are a new execution request. */
+export function captureAgentHostSteeringInput(input) {
+    if (!isRecord(input)) {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    assertOnlyFields(input, ['input', 'provenance', 'userMessageId']);
+    if (input.userMessageId !== undefined && !isAgentHostUserMessageId(input.userMessageId)) {
+        invalidUserMessageId();
+    }
+    return captureSemanticSnapshot({
+        input: snapshotUserInput(input.input),
+        provenance: snapshotProvenance(input.provenance),
+        ...(input.userMessageId !== undefined ? { userMessageId: input.userMessageId } : {}),
+    }).value;
+}
+function invalidUserMessageId() {
+    throw new AgentHostUserInputValidationError('invalid-request');
+}
+function isAgentHostUserMessageId(value) {
+    return typeof value === 'string' && USER_MESSAGE_ID_RE.test(value);
+}
+function snapshotRequiresInputReview(value) {
+    if (value === undefined)
+        return undefined;
+    if (typeof value !== 'boolean') {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    return value;
+}
+function snapshotInputSafetyDecision(value) {
+    if (value === undefined)
+        return undefined;
+    if (!isInputSafetyDecision(value)) {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    return { ...value };
+}
+/**
+ * Renders the primary input and every admitted queued message once, in FIFO
+ * order. AgentRuntime assembly and the local executor share this exact value.
+ */
+export function createCanonicalAgentHostUserInput(unsafeRequest) {
+    const request = captureAgentHostExecutionRequest(unsafeRequest);
+    return createCanonicalUserInput(request);
+}
+/** Renders an active steering message without requiring a new-Turn query identity. */
+export function createCanonicalAgentHostSteeringInput(input) {
+    return createCanonicalUserInput(captureAgentHostSteeringInput(input));
+}
+function createCanonicalUserInput(input) {
+    // Companions in `queuedMessages` keep no peer origin: no v2 path builds them
+    // for a session send, and attributing them would need their own provenance.
+    const messages = [
+        peerAttributedMessage(snapshotMessage(input.input), input.provenance),
+        ...(input.input.queuedMessages ?? []),
+    ];
+    return captureSemanticSnapshot({
+        text: renderCanonicalText(messages, input.provenance.source),
+        messages,
+    }).value;
+}
+/**
+ * The one place a peer origin becomes model-visible.
+ *
+ * Trust comes from the producer, not the payload: `source: 'communication'`
+ * is written only by the runtime's own session send. The legacy
+ * `/communication/send` route refuses every command except `prompt`, and the
+ * parser requires `command: 'session send'`, so that route never qualifies.
+ * Every other source drops the peer origin, which is what stops an external
+ * caller from forging an envelope through sourceContext. Queued companions of
+ * one request share that request's provenance; v2 queue drains carry each row
+ * on its own request instead.
+ */
+function peerAttributedMessage(message, provenance) {
+    if (provenance.source !== 'communication')
+        return message;
+    const origin = parsePeerSessionOrigin(provenance.sourceContext?.['origin']);
+    if (!origin)
+        return message;
+    return { ...message, origin };
+}
+function snapshotUserInput(value) {
+    if (!isRecord(value)) {
+        throw new AgentHostUserInputValidationError('invalid-structure');
+    }
+    assertOnlyFields(value, USER_INPUT_FIELDS);
+    const message = snapshotMessage(value);
+    const queuedMessages = snapshotQueue(value.queuedMessages);
+    const model = snapshotModel(value.model);
+    const computerUse = snapshotComputerUse(value.computerUse);
+    return {
+        ...message,
+        ...(queuedMessages ? { queuedMessages } : {}),
+        ...(model ? { model } : {}),
+        ...(computerUse ? { computerUse } : {}),
+    };
+}
+function snapshotComputerUse(value) {
+    if (value === undefined)
+        return undefined;
+    if (!isRecord(value) || Object.keys(value).some((key) => key !== 'enable')) {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    if (typeof value.enable !== 'boolean') {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    return { enable: value.enable };
+}
+function snapshotOutputContract(value) {
+    if (value === undefined)
+        return undefined;
+    if (!isRecord(value)) {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    if (value.type === 'json_object') {
+        assertOnlyFields(value, ['type']);
+        return { type: 'json_object' };
+    }
+    assertOnlyFields(value, ['type', 'schema']);
+    if (value.type !== 'json_schema' || !isRecord(value.schema)) {
+        throw new AgentHostUserInputValidationError('invalid-request');
+    }
+    return { type: 'json_schema', schema: value.schema };
+}
+function snapshotQueue(value) {
+    if (value === undefined)
+        return undefined;
+    if (!Array.isArray(value)) {
+        throw new AgentHostUserInputValidationError('invalid-queue');
+    }
+    return value.map((message) => {
+        if (!isRecord(message)) {
+            throw new AgentHostUserInputValidationError('invalid-structure');
+        }
+        assertOnlyFields(message, MESSAGE_FIELDS);
+        return snapshotMessage(message);
+    });
+}
+function snapshotMessage(input) {
+    if (typeof input.text !== 'string') {
+        throw new AgentHostUserInputValidationError('invalid-text');
+    }
+    const computerUse = input.computerUse;
+    if (computerUse !== undefined &&
+        (!isRecord(computerUse) || typeof computerUse.enable !== 'boolean'))
+        throw new AgentHostUserInputValidationError('invalid-structure');
+    const attachments = snapshotAttachments(input.attachments);
+    const origin = snapshotOrigin(input.origin);
+    const quotedMessage = snapshotQuotedMessage(input.quotedMessage);
+    const channelContext = snapshotChannelContext(input.channelContext);
+    return {
+        text: input.text,
+        ...(computerUse ? { computerUse: structuredClone(computerUse) } : {}),
+        ...(attachments ? { attachments } : {}),
+        ...(origin ? { origin } : {}),
+        ...(quotedMessage ? { quotedMessage } : {}),
+        ...(channelContext ? { channelContext } : {}),
+    };
+}
+function snapshotAttachments(value) {
+    if (value === undefined)
+        return undefined;
+    if (!Array.isArray(value)) {
+        throw new AgentHostUserInputValidationError('invalid-structure');
+    }
+    return value.map((attachment) => {
+        if (!isRecord(attachment)) {
+            throw new AgentHostUserInputValidationError('invalid-structure');
+        }
+        assertOnlyFields(attachment, ATTACHMENT_FIELDS);
+        assertOptionalStringFields(attachment, ATTACHMENT_STRING_FIELDS, 'invalid-structure');
+        const sizeBytes = attachment.sizeBytes;
+        if (sizeBytes !== undefined &&
+            (typeof sizeBytes !== 'number' || !Number.isSafeInteger(sizeBytes) || sizeBytes < 0)) {
+            throw new AgentHostUserInputValidationError('invalid-structure');
+        }
+        return { ...attachment };
+    });
+}
+function snapshotOrigin(value) {
+    if (value === undefined)
+        return undefined;
+    if (!isRecord(value)) {
+        throw new AgentHostUserInputValidationError('invalid-structure');
+    }
+    assertOnlyFields(value, ORIGIN_FIELDS);
+    const observedTerminalCount = value.observedTerminalCount;
+    if (value.kind !== 'background-task-terminal' ||
+        !Array.isArray(value.taskIds) ||
+        value.taskIds.some((taskId) => !isNonEmptyString(taskId)) ||
+        (observedTerminalCount !== undefined &&
+            (!Number.isSafeInteger(observedTerminalCount) || Number(observedTerminalCount) < 0))) {
+        throw new AgentHostUserInputValidationError('invalid-structure');
+    }
+    return {
+        kind: value.kind,
+        taskIds: [...value.taskIds],
+        ...(observedTerminalCount === undefined
+            ? {}
+            : { observedTerminalCount: Number(observedTerminalCount) }),
+    };
+}
+function snapshotQuotedMessage(value) {
+    if (value === undefined)
+        return undefined;
+    if (!isRecord(value)) {
+        throw new AgentHostUserInputValidationError('invalid-structure');
+    }
+    assertOnlyFields(value, ['text', 'senderName']);
+    if (typeof value.text !== 'string' ||
+        (value.senderName !== undefined && typeof value.senderName !== 'string')) {
+        throw new AgentHostUserInputValidationError('invalid-structure');
+    }
+    return {
+        text: value.text,
+        ...(value.senderName ? { senderName: value.senderName } : {}),
+    };
+}
+function snapshotChannelContext(value) {
+    if (value === undefined)
+        return undefined;
+    if (!isRecord(value)) {
+        throw new AgentHostUserInputValidationError('invalid-structure');
+    }
+    assertOnlyFields(value, CHANNEL_CONTEXT_FIELDS);
+    assertOptionalStringFields(value, CHANNEL_CONTEXT_FIELDS, 'invalid-structure');
+    if (!isNonEmptyString(value.platform) ||
+        !isNonEmptyString(value.chatId) ||
+        !isNonEmptyString(value.senderId)) {
+        throw new AgentHostUserInputValidationError('invalid-structure');
+    }
+    return {
+        platform: value.platform,
+        chatId: value.chatId,
+        senderId: value.senderId,
+        ...optionalString(value, 'chatType'),
+        ...optionalString(value, 'clientName'),
+        ...optionalString(value, 'threadId'),
+        ...optionalString(value, 'sourceMessageId'),
+        ...optionalString(value, 'contextToken'),
+        ...optionalString(value, 'channel'),
+        ...optionalString(value, 'channel_id'),
+        ...optionalString(value, 'targetAgentId'),
+    };
+}
+function snapshotModel(value) {
+    if (value === undefined)
+        return undefined;
+    if (!isRecord(value)) {
+        throw new AgentHostUserInputValidationError('invalid-model');
+    }
+    let selection;
+    try {
+        selection = normalizeModelSelection(value);
+    }
+    catch {
+        throw new AgentHostUserInputValidationError('invalid-model');
+    }
+    return {
+        ...selection,
+        ...(value.parameterSnapshot !== undefined
+            ? { parameterSnapshot: snapshotModelParameterSnapshot(value.parameterSnapshot) }
+            : {}),
+        ...snapshotInternalModelMetadata(value),
+    };
+}
+function snapshotInternalModelMetadata(value) {
+    const maxOutputTokens = snapshotMaxOutputTokens(value.maxOutputTokens);
+    const frozen = snapshotFrozenModel(value.frozen);
+    const modelSource = snapshotModelSource(value.modelSource);
+    return {
+        ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
+        ...(frozen === true ? { frozen: true } : {}),
+        ...(modelSource === undefined ? {} : { modelSource }),
+    };
+}
+function snapshotMaxOutputTokens(value) {
+    if (value === undefined)
+        return undefined;
+    if (typeof value !== 'number' ||
+        !Number.isSafeInteger(value) ||
+        value <= 0 ||
+        value > 2_147_483_647) {
+        throw new AgentHostUserInputValidationError('invalid-model');
+    }
+    return value;
+}
+function snapshotFrozenModel(value) {
+    if (value === undefined || value === true)
+        return value;
+    throw new AgentHostUserInputValidationError('invalid-model');
+}
+function snapshotModelSource(value) {
+    if (value === undefined)
+        return undefined;
+    if (value === 'agent' || value === 'runtime-default')
+        return value;
+    throw new AgentHostUserInputValidationError('invalid-model');
+}
+function snapshotModelParameterSnapshot(value) {
+    if (!isRecord(value)) {
+        throw new AgentHostUserInputValidationError('invalid-model');
+    }
+    assertOnlyFields(value, MODEL_PARAMETER_SNAPSHOT_FIELDS);
+    if ((value.context !== 'default' && value.context !== 'selection' && value.context !== 'legacy') ||
+        (value.effort !== 'default' && value.effort !== 'selection' && value.effort !== 'legacy')) {
+        throw new AgentHostUserInputValidationError('invalid-model');
+    }
+    return { context: value.context, effort: value.effort };
+}
+function snapshotQueueItemIds(value) {
+    if (value === undefined)
+        return undefined;
+    if (!Array.isArray(value) ||
+        value.length === 0 ||
+        value.some((itemId) => !isNonEmptyString(itemId))) {
+        throw new AgentHostUserInputValidationError('invalid-ingress');
+    }
+    return [...value];
+}
+function snapshotProvenance(value) {
+    if (!isRecord(value)) {
+        throw new AgentHostUserInputValidationError('invalid-provenance');
+    }
+    assertOnlyFields(value, PROVENANCE_FIELDS);
+    if (!isNonEmptyString(value.source) ||
+        !isNonEmptyString(value.routingFingerprint) ||
+        (value.sourceContext !== undefined && !isRecord(value.sourceContext))) {
+        throw new AgentHostUserInputValidationError('invalid-provenance');
+    }
+    return {
+        source: value.source,
+        routingFingerprint: value.routingFingerprint,
+        ...(value.sourceContext ? { sourceContext: value.sourceContext } : {}),
+    };
+}
+function optionalNonEmptyString(value, key, reason) {
+    const candidate = value[key];
+    if (candidate === undefined)
+        return {};
+    if (!isNonEmptyString(candidate))
+        throw new AgentHostUserInputValidationError(reason);
+    return { [key]: candidate };
+}
+function optionalString(value, key) {
+    const candidate = value[key];
+    return typeof candidate === 'string' ? { [key]: candidate } : {};
+}
+function assertOptionalStringFields(value, fields, reason) {
+    if (fields.some((field) => value[field] !== undefined && typeof value[field] !== 'string')) {
+        throw new AgentHostUserInputValidationError(reason);
+    }
+}
+function assertOnlyFields(value, fields) {
+    const allowed = new Set(fields);
+    if (Object.keys(value).some((key) => !allowed.has(key))) {
+        throw new AgentHostUserInputValidationError('unsupported-field');
+    }
+}
+function isRecord(value) {
+    return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+function isNonEmptyString(value) {
+    return typeof value === 'string' && value.length > 0;
+}
+function renderCanonicalText(messages, source) {
+    const first = messages[0];
+    if (!first)
+        throw new AgentHostUserInputValidationError('invalid-text');
+    if (messages.length === 1)
+        return renderMessage(first, source);
+    const rendered = messages.map((message, index) => {
+        const label = index === 0 ? 'User message 1' : `Queued user message ${index + 1}`;
+        return `${label}:\n${renderMessage(message, source)}`;
+    });
+    return [
+        'The user sent these local queued messages as one ordered batch. Process them in order.',
+        '',
+        ...rendered,
+    ].join('\n\n');
+}
+function renderMessage(message, source) {
+    const quoted = message.quotedMessage;
+    const content = quoted?.text
+        ? [
+            quoted.senderName
+                ? `[User replied to a message from ${quoted.senderName}]:`
+                : '[User replied to a previous message]:',
+            quoted.text
+                .split('\n')
+                .map((line) => `> ${line}`)
+                .join('\n'),
+            '',
+            message.text,
+        ].join('\n')
+        : message.text;
+    return source === 'cron' ? `[System CronTask]\n${content}` : content;
+}
+//# sourceMappingURL=canonical-user-input.js.map

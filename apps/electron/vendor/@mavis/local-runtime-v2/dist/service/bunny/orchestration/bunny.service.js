@@ -40,7 +40,6 @@ export class BunnyService {
             await this.options.preferences.set('bunny.initializedAtMs', date.getTime());
             const homeDir = resolveBunnyHomeDir(this.options.dataDir);
             await this.initializeDirectory(homeDir);
-            await this.options.ensureDefaultSpace();
             const root = await this.options.roots.replaceRoot(BUNNY_AGENT_NAME);
             return { bunny: await this.state(root.sessionId), backupDir };
         }));
@@ -66,7 +65,6 @@ export class BunnyService {
             for (const routine of skippedRoutines)
                 this.options.logger.warn({ backupId, routine }, 'Bunny restore could not recreate a routine from the backup');
             await this.initializeDirectory(homeDir);
-            await this.options.ensureDefaultSpace();
             const root = await this.options.roots.adoptRoot(BUNNY_AGENT_NAME, backup.manifest.mainSessionId);
             return { bunny: await this.state(root.sessionId), backupDir };
         }));
@@ -175,7 +173,6 @@ export class BunnyService {
             await this.initializeDirectory(homeDir);
             created = true;
         }
-        await this.options.ensureDefaultSpace();
         if (!(await this.options.roots.hasRoot(BUNNY_AGENT_NAME)))
             created = true;
         const root = await this.options.roots.getRootSessionByAgent(BUNNY_AGENT_NAME);
@@ -195,7 +192,6 @@ export class BunnyService {
     }
     async initializeDirectory(homeDir) {
         await mkdir(join(homeDir, 'memory'), { recursive: true });
-        await mkdir(join(homeDir, 'spaces', 'default'), { recursive: true });
     }
 }
 async function hasEntriesBesidesDatabase(homeDir) {

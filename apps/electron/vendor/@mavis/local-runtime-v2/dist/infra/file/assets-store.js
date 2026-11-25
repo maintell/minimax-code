@@ -61,30 +61,29 @@ export class LocalAssetManifestDiagnosticSource {
     }
 }
 /**
- * O(1) check whether `filePath` resolves to a valid registered file inside
- * `<dataDir>/v2/assets`, returning its sidecar metadata without walking the
- * asset store. Ordinary workspace paths return `undefined`.
+ * Names a registered v2 asset for display and citation: the recorded file name plus the
+ * original local source path when its sidecar kept one.
+ *
+ * This is deliberately not an authorization boundary. The permission gate has already decided
+ * whether the caller may read `filePath`; this only turns a path the caller already holds into
+ * the name a human recognises — including for an asset another Session registered, which is how
+ * a SideChat cites what it inherited from Main. Ownership-checked lookups stay in
+ * {@link resolveSessionLocalAsset} and {@link resolveSessionLocalAssetSource}.
  */
-export function inspectRegisteredV2Asset(input) {
+export function resolveRegisteredV2AssetSource(input) {
     const expanded = expandHomePath(input.filePath.trim());
     if (!expanded || !isV2AssetPath(input.dataDir, expanded))
         return undefined;
     try {
         const assetPath = realpathSync(expanded);
-        const sidecarPath = `${assetPath}.asset.json`;
-        const sidecarInfo = lstatSync(sidecarPath);
-        if (sidecarInfo.isSymbolicLink() || !sidecarInfo.isFile())
-            return undefined;
-        const [record] = readAssetSidecar(sidecarPath);
+        const [record] = readAssetSidecar(`${assetPath}.asset.json`);
         if (!record || !isRegisteredV2AssetPath(input.dataDir, assetPath, record.assetId)) {
             return undefined;
         }
         return {
-            assetId: record.assetId,
-            filePath: assetPath,
+            filePath: (record.sourcePath && canonicalExistingPath(record.sourcePath)) || assetPath,
             fileName: record.fileName,
-            mimeType: record.mimeType,
-            kind: record.kind,
+            assetPath,
         };
     }
     catch {
@@ -329,6 +328,17 @@ function attachmentRegistrationOptions(input, attachment, source) {
             : {}),
         ...(input.remoteAssetTransport ? { remoteAssetTransport: input.remoteAssetTransport } : {}),
     };
+}
+/**
+ * The largest one file asset registration will accept for this name. Callers that pre-check a
+ * size before handing a file over must ask here rather than keep their own copy: a second
+ * constant drifts, and then the pre-check and the registration disagree — either letting a
+ * dispatch through that rolls back on arrival, or refusing a file the store would have taken.
+ */
+export function maxLocalAssetBytes(fileName) {
+    return isPptxFileName(fileName)
+        ? PPTX_PREVIEW_LIMITS_V1.maxInputBytes
+        : DEFAULT_MAX_LOCAL_ASSET_BYTES;
 }
 function isPptxFileName(fileName) {
     return path.extname(fileName).toLowerCase() === '.pptx';

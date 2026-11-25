@@ -8,8 +8,11 @@ import { digest, resolveProfileDataDir } from './component.js';
 import { privateDirectory, processAlive as alive } from './desktop-lock.js';
 import { daemonControl, validateDaemonMetadata } from './daemon-control.js';
 import { ComputerUseError, record, structured } from './contracts.js';
+import { assertComputerUseOsSupported } from './os-support.js';
 /** Standalone App owns macOS permission identity; Windows inherits the interactive user. */
 export async function startOwnedDaemon(component, dataDir, ownerId) {
+    // LaunchServices rejects the App on older macOS before it can report why.
+    assertComputerUseOsSupported();
     const root = path.join(await resolveProfileDataDir(dataDir), 'cu');
     await privateDirectory(root);
     const directory = await mkdtemp(path.join(root, `${digest(ownerId).slice(0, 8)}-`));
@@ -117,6 +120,7 @@ export async function startOwnedDaemon(component, dataDir, ownerId) {
 export async function requestComponentPermissions(component) {
     if (process.platform !== 'darwin')
         return { accessibility: true, screen_recording: true };
+    assertComputerUseOsSupported();
     // Matches the upstream __permissions-host-request's exact private file contract.
     const file = path.join(await realpath(tmpdir()), `cua-driver-permissions-${process.pid}-${randomUUID()}.json`);
     const handle = await open(file, 'wx', 0o600);

@@ -84,6 +84,7 @@ export function initializeGoalService(input) {
     const goals = service;
     return {
         service: goals,
+        isSessionBusy: (sessionId) => turnTimings.getBySession(sessionId) !== undefined,
         turnLifecycle: createGoalTurnLifecycle({ goals, turnTimings }),
         bindConversation: (runtimeConversation) => conversation.bind(runtimeConversation),
         observeLLMRequestFailure: (info) => usageRecoveryHints.observeLLMRequestFailure(info),

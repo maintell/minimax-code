@@ -194,29 +194,12 @@ export class MemoryStateRepositoryImpl {
                 .get();
             if (!scope || scope.resetEpoch !== input.expectedResetEpoch)
                 return 'stale-input';
-            const notes = tx
-                .select({
-                sessionId: memoryV2SessionStates.sessionId,
-                outputDigest: memoryV2SessionStates.outputDigest,
-            })
-                .from(memoryV2SessionStates)
-                .where(and(eq(memoryV2SessionStates.scopeKey, input.scopeKey), sql `${memoryV2SessionStates.sessionId} like 'note-%'`, gt(memoryV2SessionStates.sessionCreatedAtMs, scope.resetAtMs), isNull(memoryV2SessionStates.exclusionReason), isNotNull(memoryV2SessionStates.content), sql `${memoryV2SessionStates.content} <> ''`))
-                .all();
-            const expectedNotes = new Map(input.expectedSelection
-                .filter((row) => row.sessionId.startsWith('note-'))
-                .map((row) => [row.sessionId, row.outputDigest]));
-            if (notes.length !== expectedNotes.size ||
-                notes.some((row) => expectedNotes.get(row.sessionId) !== row.outputDigest))
+            // 续跑发布的输入冻结在保存草稿时，只要求期间没有治理变更；否则核对选集仍是当前状态。
+            const current = input.frozenGovernanceRevision !== undefined
+                ? scope.governanceRevision === input.frozenGovernanceRevision
+                : selectionIsCurrent(tx, input, scope.resetAtMs);
+            if (!current)
                 return 'stale-input';
-            for (const expected of input.expectedSelection) {
-                const row = tx
-                    .select({ outputDigest: memoryV2SessionStates.outputDigest })
-                    .from(memoryV2SessionStates)
-                    .where(and(eq(memoryV2SessionStates.scopeKey, input.scopeKey), eq(memoryV2SessionStates.sessionId, expected.sessionId)))
-                    .get();
-                if (!row || row.outputDigest !== expected.outputDigest)
-                    return 'stale-input';
-            }
             const now = this.nowMs();
             tx.update(memoryV2Scopes)
                 .set({
@@ -607,6 +590,31 @@ function decodeCaptureAttemptRow(row) {
 }
 function changes(result) {
     return result.changes;
+}
+/** 整理开始时的选集与 note 仍与当前状态一致：note 集合完全相同，每个来源的输出指纹未变。 */
+function selectionIsCurrent(db, input, resetAtMs) {
+    const notes = db
+        .select({
+        sessionId: memoryV2SessionStates.sessionId,
+        outputDigest: memoryV2SessionStates.outputDigest,
+    })
+        .from(memoryV2SessionStates)
+        .where(and(eq(memoryV2SessionStates.scopeKey, input.scopeKey), sql `${memoryV2SessionStates.sessionId} like 'note-%'`, gt(memoryV2SessionStates.sessionCreatedAtMs, resetAtMs), isNull(memoryV2SessionStates.exclusionReason), isNotNull(memoryV2SessionStates.content), sql `${memoryV2SessionStates.content} <> ''`))
+        .all();
+    const expectedNotes = new Map(input.expectedSelection
+        .filter((row) => row.sessionId.startsWith('note-'))
+        .map((row) => [row.sessionId, row.outputDigest]));
+    if (notes.length !== expectedNotes.size ||
+        notes.some((row) => expectedNotes.get(row.sessionId) !== row.outputDigest))
+        return false;
+    return input.expectedSelection.every((expected) => {
+        const row = db
+            .select({ outputDigest: memoryV2SessionStates.outputDigest })
+            .from(memoryV2SessionStates)
+            .where(and(eq(memoryV2SessionStates.scopeKey, input.scopeKey), eq(memoryV2SessionStates.sessionId, expected.sessionId)))
+            .get();
+        return row !== undefined && row.outputDigest === expected.outputDigest;
+    });
 }
 /** 治理版本与事实变更同事务推进，普通采集和使用记账保持原水位。 */
 function markGovernanceChange(db, scopeKey) {

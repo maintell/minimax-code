@@ -39,9 +39,9 @@ import { z } from 'zod';
 import { normalizeMavisCommand } from '../shared/mavis-operation-classifier.js';
 import { CRON_CREATE_ME_REJECTED_MESSAGE, isCronDedicatedSessionTarget, isCronFixedSessionId, isMeSessionSentinel, } from '../shared/cron-schedule-input.js';
 import { LocalMavisToolDef } from './builtin-defs.js';
-import { COORDINATOR_LISTED_MAVIS_COMMANDS, LOCAL_MAVIS_COMMANDS, LOCAL_CRON_COMMANDS, localMavisArchiveCall, mavisRecoveryInstruction, ptcMavisHelpOutput, ptcMavisRunCodeTool, } from './local-mavis-commands.js';
+import { LOCAL_MAVIS_COMMANDS, LOCAL_CRON_COMMANDS, localMavisArchiveCall, mavisRecoveryInstruction, ptcMavisHelpOutput, ptcMavisRunCodeTool, } from './local-mavis-commands.js';
 import { BUNNY_MAVIS_COMMAND_HANDLERS, BUNNY_MAVIS_COMMAND_SCHEMAS, coordinatorSchedulePrompt, keepScheduleSpaceMarker, } from './local-mavis-bunny.js';
-import { BUNNY_COMMAND_REPLACEMENTS, BUNNY_WITHHELD_COMMAND_REPLACEMENTS, } from './local-mavis-coordinator-text.js';
+import { coordinatorMavisCommandRefusal } from './local-mavis-coordinator-text.js';
 import { LocalMavisCronUnsupportedError, LocalMavisCronValidationError, } from './local-mavis-cron-adapter.js';
 import { failure, idString, LocalMavisRuntimeError, LocalMavisValidationError, optionalBoolean, optionalNumber, optionalString, requireSessionAdapter, success, } from './local-mavis-shared.js';
 import { sessionMessagesWindow } from './local-mavis-output-window.js';
@@ -235,6 +235,8 @@ const sessionMessagesSchema = z.object({
     // Values above SESSION_MESSAGES_MAX_OUTPUT_CHARS use the maximum.
     max_output_chars: z.number().int().positive().optional(),
     include_thinking: optionalBoolean,
+    // The coordinator reads a long page in windows; every other Agent has it stripped.
+    offset: optionalNumber,
 });
 const mcpTransportSchema = z.enum(['stdio', 'http', 'streamable-http', 'sse']);
 const mcpStringMapSchema = z.record(z.string(), z.string());
@@ -324,7 +326,6 @@ export const LOCAL_MAVIS_COMMAND_SCHEMAS = {
     'cron trigger': cronTriggerSchema,
     'cron sessions': cronSessionsSchema,
     'cron help': helpSchema,
-    ...BUNNY_MAVIS_COMMAND_SCHEMAS,
     'session list': sessionListSchema,
     'session get': sessionGetSchema,
     'session send': sessionSendSchema,
@@ -340,26 +341,6 @@ export const LOCAL_MAVIS_COMMAND_SCHEMAS = {
     'mcp help': helpSchema,
 };
 const KNOWN_COMMANDS = [...LOCAL_MAVIS_COMMANDS, ...LOCAL_CRON_COMMANDS];
-/**
- * The coordinator's whole mavis vocabulary is the `COORDINATOR_LISTED_MAVIS_COMMANDS`
- * whitelist: its own space, project and task model commands plus the read-only session
- * reads. Everything else is withheld, and mavis answers it with what to use instead.
- *
- * `COORDINATOR_KNOWN_COMMANDS` is what `dispatchLocalMavis` accepts, and the coordinator's own
- * cron_* tools call it with `currentCoordinator`; it keeps the internal cron vocabulary for that
- * path. No cron command appears in any mavis definition, and `LocalMavisTool.execute` answers
- * every `cron ` command with CRON_TOOL_MOVED before dispatch, so this adds nothing a model reaches.
- */
-const COORDINATOR_MAVIS_COMMANDS = COORDINATOR_LISTED_MAVIS_COMMANDS;
-const COORDINATOR_KNOWN_COMMANDS = [...COORDINATOR_LISTED_MAVIS_COMMANDS, ...LOCAL_CRON_COMMANDS];
-/**
- * The coordinator's own arguments of shared commands: `offset` reads a long
- * `session messages` page in windows (see `sessionMessagesWindow`). Every other
- * Agent validates against the shared schema, where the argument does not exist.
- */
-export const COORDINATOR_COMMAND_SCHEMAS = {
-    'session messages': sessionMessagesSchema.extend({ offset: optionalNumber }),
-};
 const HANDLERS = {
     'agent list': handleAgentList,
     'agent get': handleAgentGet,
@@ -378,7 +359,6 @@ const HANDLERS = {
     'cron trigger': handleCronTrigger,
     'cron sessions': handleCronSessions,
     'cron help': handleCronHelp,
-    ...BUNNY_MAVIS_COMMAND_HANDLERS,
     'session list': handleSessionList,
     'session get': handleSessionGet,
     'session send': handleSessionSend,
@@ -420,32 +400,9 @@ let LocalMavisTool = (() => {
         async execute(ctx, input, signal) {
             const coordinator = isCoordinatorAgent(ctx.coordination);
             const command = normalizeCommand(input.command);
-            const withheld = BUNNY_WITHHELD_COMMAND_REPLACEMENTS[command];
-            if (coordinator && withheld) {
-                const text = JSON.stringify({
-                    ok: false,
-                    command,
-                    error: {
-                        kind: 'validation',
-                        code: 'BUNNY_COMMAND_NOT_AVAILABLE',
-                        message: withheld,
-                    },
-                });
-                return mavisRefusal(text);
-            }
-            const bunnyReplacement = BUNNY_COMMAND_REPLACEMENTS[command];
-            if (coordinator && bunnyReplacement) {
-                const text = JSON.stringify({
-                    ok: false,
-                    command,
-                    error: {
-                        kind: 'validation',
-                        code: 'BUNNY_ASSIGNMENT_TOOL_REQUIRED',
-                        message: bunnyReplacement,
-                    },
-                });
-                return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
-            }
+            const coordinatorRefusal = coordinator ? coordinatorMavisCommandRefusal(command) : undefined;
+            if (coordinatorRefusal)
+                return coordinatorRefusal;
             if (command === 'session create')
                 return sessionCreateMoved(ctx, this.sessionAdapter);
             if (command === 'session delete') {
@@ -475,7 +432,7 @@ let LocalMavisTool = (() => {
                 });
                 return mavisRefusal(text);
             }
-            const commands = coordinator ? COORDINATOR_MAVIS_COMMANDS : LOCAL_MAVIS_COMMANDS;
+            const commands = LOCAL_MAVIS_COMMANDS;
             if (!commands.includes(command)) {
                 const text = JSON.stringify({
                     ok: false,
@@ -522,40 +479,31 @@ let LocalMavisTool = (() => {
                     ...(uncappedOutput ? { uncappedOutput } : {}),
                 });
             }
-            const recovery = mavisRecoveryInstruction(output.command, ptcMavisRunCodeTool(ctx, output.command), coordinator);
-            const limited = limitLocalManagementOutput(ctx, text, output, 'mavis', recovery);
+            const callerToolName = input.callerToolName;
+            // A namespaced caller is a run_code child under its own name; the legacy
+            // mavis_* child name belongs to a call that arrived as the composite tool.
+            const runCodeTool = callerToolName
+                ? isCallableInRunCode(ctx, callerToolName)
+                    ? callerToolName
+                    : undefined
+                : ptcMavisRunCodeTool(ctx, output.command);
+            const recovery = mavisRecoveryInstruction(output.command, runCodeTool, coordinator, callerToolName);
+            const limited = limitMavisToolResult(ctx, result, output, {
+                toolName: callerToolName ?? 'mavis',
+                // The namespaced caller's own arguments are flat, so the args to keep
+                // are the ones the model passed; the composite shape keeps command+args.
+                preserveArgs: callerToolName ? Object.keys(input.args ?? {}) : ['command', 'args'],
+                recovery,
+            });
             const finish = (reported) => coordinator && output.ok && endsTurnAfterWrite(command, input.args)
                 ? endTurn(reported)
                 : reported;
             // PTC data is the object the text serializes; a head+tail preview cannot
             // be matched by a partial object, so a cut keeps only ok and command.
-            if (!limited.truncated) {
-                return finish(withDesktopCompletenessReport(LocalMavisToolDef.name, result, { data: historyOutput }));
-            }
-            const continuation = createDesktopOutputContinuation({
-                continuation_hint: {
-                    tool: 'mavis',
-                    preserve_args: ['command', 'args'],
-                    instruction: recovery,
-                },
-            });
-            return finish(withDesktopCompletenessReport(LocalMavisToolDef.name, {
-                ...result,
-                text: limited.text,
-                content: [{ type: 'text', text: limited.text }],
-                details: {
-                    ...result.details,
-                    desktop_output_truncation: {
-                        truncated: true,
-                        has_more: true,
-                        strategy: 'head_tail_tokens',
-                        original_estimated_tokens: limited.originalTokens,
-                        returned_estimated_tokens: limited.returnedTokens,
-                        max_tokens: DESKTOP_MANAGEMENT_MAX_TOKENS,
-                    },
-                    desktop_output_continuation: continuation,
-                },
-            }, { data: { ok: output.ok, command: output.command } }));
+            const truncated = limited.text !== text;
+            return finish(withDesktopCompletenessReport(LocalMavisToolDef.name, limited, {
+                data: truncated ? { ok: output.ok, command: output.command } : historyOutput,
+            }));
         }
     };
     return LocalMavisTool = _classThis;
@@ -585,16 +533,56 @@ async function sessionCreateMoved(ctx, sessionAdapter) {
 /**
  * A coordinator's top-level `space context write` with `end_turn: true` ends the Turn
  * once the write succeeds, so writing context.md after the answer needs no closing reply.
+ * Shared with the coordinator's own `bunny_task_space_context_write` tool, which runs the same
+ * operation without passing through this executor.
  */
-function endsTurnAfterWrite(command, args) {
-    return command === 'space context write' && Reflect.get(args ?? {}, 'end_turn') === true;
+export function endsTurnAfterWrite(command, args) {
+    return (command === 'space context write' &&
+        typeof args === 'object' &&
+        args !== null &&
+        Reflect.get(args, 'end_turn') === true);
 }
 /** Same marker as send_to_user's end_turn: the agent loop consumes `terminate`. */
-function endTurn(result) {
+export function endTurn(result) {
     return {
         ...result,
         details: { ...result.details, [TURN_TERMINATING_TOOL_RESULT_DETAIL]: true },
         terminate: true,
+    };
+}
+/**
+ * Bounds an already-built command result for the model and adds what a cut
+ * needs: the truncation facts and the way to continue. Returns the result
+ * unchanged when it fits, so a changed text means a cut. The mavis executor
+ * reads it that way to choose its PTC data; the coordinator's own space tools
+ * use it as is.
+ */
+export function limitMavisToolResult(ctx, result, output, options) {
+    const limited = limitLocalManagementOutput(ctx, result.text, output, options.toolName, options.recovery);
+    if (!limited.truncated)
+        return result;
+    return {
+        ...result,
+        text: limited.text,
+        content: [{ type: 'text', text: limited.text }],
+        details: {
+            ...(result.details ?? {}),
+            desktop_output_truncation: {
+                truncated: true,
+                has_more: true,
+                strategy: 'head_tail_tokens',
+                original_estimated_tokens: limited.originalTokens,
+                returned_estimated_tokens: limited.returnedTokens,
+                max_tokens: DESKTOP_MANAGEMENT_MAX_TOKENS,
+            },
+            desktop_output_continuation: createDesktopOutputContinuation({
+                continuation_hint: {
+                    tool: options.toolName,
+                    preserve_args: options.preserveArgs,
+                    instruction: options.recovery,
+                },
+            }),
+        },
     };
 }
 function mavisRefusal(text) {
@@ -693,12 +681,11 @@ export async function dispatchLocalMavis(ctx, rawCommand, rawArgs, signal) {
     const sourceFailure = validateSessionSourceArgs(command, rawArgs);
     if (sourceFailure)
         return sourceFailure;
-    const knownCommands = ctx.currentCoordinator ? COORDINATOR_KNOWN_COMMANDS : KNOWN_COMMANDS;
-    if (!isKnownCommand(command, knownCommands)) {
+    if (!isKnownCommand(command, KNOWN_COMMANDS)) {
         if (command === 'help' || command.endsWith(' help')) {
             return failure(command, 'validation', 'Unknown help target. Valid help commands: agent help, cron help, session help, mcp help.', { valid_help_commands: ['agent help', 'cron help', 'session help', 'mcp help'] });
         }
-        return failure(command, 'validation', `unknown command: ${JSON.stringify(rawCommand)}. Did you mean one of: ${suggestCommands(command, knownCommands).join(', ')}?`, { known_commands: knownCommands });
+        return failure(command, 'validation', `unknown command: ${JSON.stringify(rawCommand)}. Did you mean one of: ${suggestCommands(command, KNOWN_COMMANDS).join(', ')}?`, { known_commands: KNOWN_COMMANDS });
     }
     // Answered before arg validation and before any other adapter lookup. A host
     // without a Cron adapter can never run these, so reporting a missing
@@ -722,8 +709,7 @@ export async function dispatchLocalMavis(ctx, rawCommand, rawArgs, signal) {
         !ctx.currentCoordinator) {
         return failure(command, 'validation', 'Unknown argument: space');
     }
-    const schema = (ctx.currentCoordinator ? COORDINATOR_COMMAND_SCHEMAS[command] : undefined) ??
-        LOCAL_MAVIS_COMMAND_SCHEMAS[command];
+    const schema = LOCAL_MAVIS_COMMAND_SCHEMAS[command];
     let substitutedArgs;
     try {
         substitutedArgs = substituteMe(rawArgs ?? {}, ctx.currentAgentName, ctx.currentSessionId);
@@ -742,6 +728,26 @@ export async function dispatchLocalMavis(ctx, rawCommand, rawArgs, signal) {
     }
     try {
         return await HANDLERS[command]({ ...ctx, command }, parsed.data, signal);
+    }
+    catch (error) {
+        return errorToFailure(command, error);
+    }
+}
+/**
+ * One of the coordinator's own operations, run by the top-level tool that
+ * replaced its mavis subcommand (`local-bunny-space-tools.ts`). Same zod
+ * schema, same handler and same failure shape as the dispatcher above, with
+ * only the coordinator's command table.
+ */
+export async function dispatchBunnyCommand(ctx, command, rawArgs, signal) {
+    const parsed = BUNNY_MAVIS_COMMAND_SCHEMAS[command].safeParse(rawArgs ?? {});
+    if (!parsed.success) {
+        return failure(command, 'validation', formatZodError(parsed.error), {
+            issues: parsed.error.issues,
+        });
+    }
+    try {
+        return await BUNNY_MAVIS_COMMAND_HANDLERS[command]({ ...ctx, command }, parsed.data, signal);
     }
     catch (error) {
         return errorToFailure(command, error);
@@ -779,6 +785,8 @@ async function handleAgentCreate(ctx, args, signal) {
         ...(Object.hasOwn(args, 'persona') ? { persona: args.persona } : {}),
         ...(Object.hasOwn(args, 'system_prompt') ? { systemPrompt: args.system_prompt } : {}),
         ...(Object.hasOwn(args, 'description') ? { description: args.description } : {}),
+        // An omitted avatar is defaulted at the Runtime create boundary, so every
+        // entry point shares one policy; this tool only forwards an explicit value.
         ...(Object.hasOwn(args, 'avatar') ? { avatar: args.avatar } : {}),
         ...(Object.hasOwn(args, 'default_workspace_dir')
             ? { defaultWorkspaceDir: args.default_workspace_dir }
@@ -1265,7 +1273,6 @@ const SESSION_HELP = {
     ],
 };
 async function handleSessionHelp(ctx) {
-    // The coordinator's mavis withholds `session help`, so this only answers other Agents.
     return success(ctx.command, SESSION_HELP);
 }
 async function handleMcpList(ctx, args, signal) {
@@ -1650,6 +1657,8 @@ const INPUT_CONDITION_ERROR_CODES = new Set([
     'SESSION_CREATE_UNKNOWN_AGENT',
     'SESSION_CREATE_INVALID_WORKSPACE',
     'SESSION_CREATE_INVALID_LOCATION',
+    'SESSION_CREATE_INVALID_ARGUMENT',
+    'SESSION_CREATE_UNKNOWN_PROJECT',
     'SESSION_CREATE_MODEL_UNRESOLVED',
     'SESSION_ID_AMBIGUOUS',
     'INVALID_DEVICE_ID',

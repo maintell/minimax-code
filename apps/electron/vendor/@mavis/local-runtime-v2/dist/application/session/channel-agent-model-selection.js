@@ -1,7 +1,7 @@
 import yaml from 'yaml';
 import { logger } from '@mavis/shared/local-runtime-logging';
 import { AgentServiceError, } from '../../service/agent/index.js';
-import { AgentModelSelectionError, freezeManagedQueueModel, formatModelKey, isMiniMaxM3ModelId, LocalModelProviderError, modelConfigForRef, normalizeModelThinkingEffort, normalizeModelThinkingEffortOptions, parseSourceQualifiedModelKey, previewAgentModelSelection, resolveModelThinkingMiddleEffort, resolveEffectiveAgentModelSelection, } from '../../service/model-system/index.js';
+import { AgentModelSelectionError, freezeManagedQueueModel, formatModelKey, isMiniMaxM3ModelId, LocalModelProviderError, modelConfigForRef, normalizeModelThinkingEffort, normalizeModelThinkingEffortOptions, parseSourceQualifiedModelKey, previewAgentModelSelection, resolveDefaultThinkingEffort, resolveEffectiveAgentModelSelection, } from '../../service/model-system/index.js';
 /** Stable rejection that the Queue boundary can project without exposing an internal cause. */
 export class ChannelAgentModelSelectionError extends Error {
     details;
@@ -312,7 +312,7 @@ function enabledThinkingEffort(model) {
     if (configured && efforts.includes(configured) && !isDisabledThinkingEffort(configured)) {
         return configured;
     }
-    const middle = resolveModelThinkingMiddleEffort(efforts);
+    const middle = resolveDefaultThinkingEffort(efforts, undefined);
     if (middle && !isDisabledThinkingEffort(middle))
         return middle;
     return efforts.find((effort) => !isDisabledThinkingEffort(effort));

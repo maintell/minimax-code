@@ -9,6 +9,12 @@ export class LocalPermissionApprovalService {
     pendingPermissionRequests = new Map();
     requestStates = new Map();
     origins = new Map();
+    /**
+     * Metrics-only Session kind per pending request, supplied by the caller at
+     * begin. The shown, reply and wait metrics all read this one entry, so one
+     * card never carries two kinds; an ask without it reports `unknown`.
+     */
+    sessionKinds = new Map();
     constructor(deps) {
         this.deps = deps;
     }
@@ -26,16 +32,12 @@ export class LocalPermissionApprovalService {
         const requestId = makeId('perm');
         const record = {
             requestId,
+            ...askFields(input),
             sessionId: input.sessionId,
             turnId: input.turnId,
             agentName: input.agentName || this.deps.agentName,
             toolName: input.toolName,
             ruleContents: [...input.ruleContents],
-            ...(input.ruleMatchers ? { ruleMatchers: input.ruleMatchers.map(cloneRuleMatcher) } : {}),
-            ...(input.persistWholeToolRuleOnReply
-                ? { persistWholeToolRuleOnReply: input.persistWholeToolRuleOnReply }
-                : {}),
-            ...(input.toolInput ? { toolInput: input.toolInput } : {}),
             toolDescription: input.toolDescription ?? input.toolName,
             ...ptcRequestFields(input),
             reason: input.reason,
@@ -53,10 +55,13 @@ export class LocalPermissionApprovalService {
         this.pendingPermissionRequests.set(requestId, record);
         this.requestStates.set(requestId, 'pending');
         this.origins.set(requestId, input.origin);
+        if (input.sessionKind)
+            this.sessionKinds.set(requestId, input.sessionKind);
         const promise = this.attachWaiter(record, signal);
         // An already-aborted signal removes the record before this point.
-        if (this.pendingPermissionRequests.has(requestId))
-            this.announce(record);
+        if (this.pendingPermissionRequests.has(requestId)) {
+            this.announce(record, input.permissionMode);
+        }
         logger.info({
             request_id: requestId,
             session_id: record.sessionId,
@@ -87,9 +92,9 @@ export class LocalPermissionApprovalService {
             }
             try {
                 await this.persistReplyRules(record, decision);
-                emitAskReplyMetric(this.deps.metricsClient, decision);
+                emitAskReplyMetric(this.deps.metricsClient, decision, this.sessionKinds.get(requestId));
                 if (record.announced)
-                    emitAskWaitMetric(this.deps.metricsClient, this.deps.nowMs, record, 'replied');
+                    this.emitWait(record, 'replied');
                 this.settle(record, decision);
                 processed.push(requestId);
                 logger.info({
@@ -149,6 +154,8 @@ export class LocalPermissionApprovalService {
             return false;
         }
         record.cleanup();
+        if (record.announced)
+            this.emitWait(record, 'abandoned');
         logger.info({ request_id: requestId, session_id: record.sessionId, lifecycle: 'dismissed' }, 'permission.lifecycle');
         this.settle(record, 'deny');
         return true;
@@ -161,13 +168,22 @@ export class LocalPermissionApprovalService {
             abortedCount += 1;
             record.cleanup();
             if (record.announced)
-                emitAskWaitMetric(this.deps.metricsClient, this.deps.nowMs, record, 'abandoned');
+                this.emitWait(record, 'abandoned');
             this.settle(record, 'deny');
         }
         logger.info({ session_id: sessionId, lifecycle: 'session_aborted', aborted_count: abortedCount }, 'permission.lifecycle');
     }
-    announce(record) {
+    emitWait(record, outcome) {
+        emitAskWaitMetric(this.deps.metricsClient, {
+            waitMs: this.deps.nowMs() - record.createdAt,
+            toolName: record.toolName,
+            outcome,
+            sessionKind: this.sessionKinds.get(record.requestId),
+        });
+    }
+    announce(record, permissionMode) {
         record.announced = true;
+        const mode = permissionMode ?? this.deps.permissionModeGetter?.() ?? 'default';
         logger.info({
             request_id: record.requestId,
             session_id: record.sessionId,
@@ -179,7 +195,11 @@ export class LocalPermissionApprovalService {
             type: 'permission.ask',
             payload: serializePermissionRequest(record),
         });
-        emitAskShownMetric(this.deps.metricsClient, this.deps.permissionMode ?? 'default');
+        emitAskShownMetric(this.deps.metricsClient, {
+            mode,
+            toolName: record.toolName,
+            sessionKind: this.sessionKinds.get(record.requestId),
+        });
         const outbound = this.deps.channelPermissionOutbound;
         const origin = this.origins.get(record.requestId);
         if (outbound) {
@@ -238,6 +258,7 @@ export class LocalPermissionApprovalService {
         this.requestStates.delete(record.requestId);
         this.pendingPermissionRequests.delete(record.requestId);
         this.origins.delete(record.requestId);
+        this.sessionKinds.delete(record.requestId);
         for (const waiter of [...record.waiters])
             waiter.settle(decision);
         logger.info({ request_id: record.requestId, session_id: record.sessionId, decision }, 'permission.resolved');
@@ -265,7 +286,7 @@ export class LocalPermissionApprovalService {
                 waiter.settle('deny');
                 if (record.waiters.size === 0 && this.pendingPermissionRequests.has(record.requestId)) {
                     if (record.announced)
-                        emitAskWaitMetric(this.deps.metricsClient, this.deps.nowMs, record, 'abandoned');
+                        this.emitWait(record, 'abandoned');
                     record.resolve('deny');
                 }
             };
@@ -281,6 +302,17 @@ function cloneRuleMatcher(matcher) {
     return {
         ...matcher,
         ...(matcher.kind === 'path' && matcher.actions ? { actions: [...matcher.actions] } : {}),
+    };
+}
+/** Optional fields of an ask, present only when the caller supplied them. */
+function askFields(input) {
+    return {
+        ...(input.requester !== undefined ? { requester: input.requester } : {}),
+        ...(input.ruleMatchers ? { ruleMatchers: input.ruleMatchers.map(cloneRuleMatcher) } : {}),
+        ...(input.persistWholeToolRuleOnReply
+            ? { persistWholeToolRuleOnReply: input.persistWholeToolRuleOnReply }
+            : {}),
+        ...(input.toolInput ? { toolInput: input.toolInput } : {}),
     };
 }
 /** Fields present only when the ask comes from a trusted PTC child call. */

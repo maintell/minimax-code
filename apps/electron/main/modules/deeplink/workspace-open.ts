@@ -29,7 +29,7 @@ export function isAcceptableWorkspacePath(rawPath, platform = process.platform) 
     return path.posix.isAbsolute(rawPath);
 }
 /** Only the main (archon) window can open a project; the others mean signed out. */
-function isSignedOutWindow(type) {
+export function isSignedOutWindow(type) {
     return type === 'login' || type === 'onboarding';
 }
 async function isDirectory(target) {

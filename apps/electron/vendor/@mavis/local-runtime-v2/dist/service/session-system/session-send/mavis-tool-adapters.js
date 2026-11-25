@@ -3,6 +3,7 @@ import { logger } from '../../../infra/logging/logger.js';
 import { NESTED_TASK_REFUSAL, SESSION_FOREIGN_TARGET, TASK_TO_COORDINATOR_REFUSAL, } from '../../coordinator-text/index.js';
 import { createSessionWithFirstMessage } from './mavis-session-create.js';
 import { interruptLocalSession } from './mavis-session-interrupt.js';
+import { unreadableDispatchAttachments } from '../../../infra/conversation/dispatch-attachments.js';
 import { sendToLocalSession } from './mavis-session-send.js';
 import { sessionSendError } from './mavis-session-send-errors.js';
 import { isAbortError } from './remote-sessions/device-source.js';
@@ -126,6 +127,10 @@ export function buildMavisSessionAdapter(deps) {
             await requireNotToBunny(req.callerSessionId, req.sessionId);
             if (isRemoteSource(req.source)) {
                 const source = req.source;
+                // Attachments are this device's local paths; a remote target cannot read them, and
+                // silently dropping them would report a delivery that lost its files.
+                if (req.attachments?.length)
+                    throw Object.assign(new Error('attachments cannot be sent to a Session on another device'), { status: 400, code: 'SESSION_SEND_ATTACHMENTS_UNSUPPORTED' });
                 return countRemoteOp(deps, { op: 'send', source, signal }, async () => {
                     const remote = requireRemote(deps, source);
                     return sendToRemoteSession({ remote, ...(deps.metrics ? { metrics: deps.metrics } : {}) }, {
@@ -138,6 +143,17 @@ export function buildMavisSessionAdapter(deps) {
                     }, signal);
                 });
             }
+            // Refused before delivery, so a bad path is a clear error instead of a failed admission
+            // that rolls the assignment back.
+            // Readability only, the pre-existing behaviour, and deliberately so: this entry cannot
+            // tell a path the user attached in this Turn from one the model picked off disk, and
+            // `assignment_send` has no auto-inherit, so the model has to name even the user's own file.
+            // Applying the secret deny-list here refused a user's `.key` or 100 MiB recording outright
+            // (F-05d60f). Wiring the deny-list in needs a Turn reader first; until then the tool
+            // description says readability only rather than promising a defence that is not here.
+            const unreadable = await unreadableDispatchAttachments(req.attachments);
+            if (unreadable.length)
+                throw Object.assign(new Error(`attachments must be readable files: ${unreadable.join(', ')}`), { status: 400, code: 'SESSION_SEND_ATTACHMENT_UNREADABLE' });
             if (req.reportBack !== true)
                 return sendToLocalSession(deps, req, signal);
             if (!assignmentTools.prepareAssignment)

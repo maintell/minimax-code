@@ -126,8 +126,8 @@ function readTransport(value) {
         ? value
         : undefined;
 }
-export function stdioDiscoveryTimeoutFromEnv() {
-    const value = process.env.MCODE_MCP_STDIO_DISCOVERY_TIMEOUT_MS?.trim() ?? '';
+function discoveryTimeoutFromEnv(name, fallback) {
+    const value = process.env[name]?.trim() ?? '';
     const timeout = Number(value);
     // Node timers overflow beyond signed int32 and would fire after 1 ms instead.
     return /^\d+$/.test(value) &&
@@ -135,7 +135,18 @@ export function stdioDiscoveryTimeoutFromEnv() {
         timeout > 0 &&
         timeout <= 2_147_483_647
         ? timeout
-        : 30_000;
+        : fallback;
+}
+export function stdioDiscoveryTimeoutFromEnv() {
+    return discoveryTimeoutFromEnv('MCODE_MCP_STDIO_DISCOVERY_TIMEOUT_MS', 30_000);
+}
+/**
+ * Turn discovery budget for http/sse/streamable-http servers. A cold remote
+ * handshake (connect + initialize + tools/list) routinely takes 1-3.5 s and can
+ * be much slower behind proxies or OAuth, so the default matches stdio.
+ */
+export function remoteDiscoveryTimeoutFromEnv() {
+    return discoveryTimeoutFromEnv('MCODE_MCP_REMOTE_DISCOVERY_TIMEOUT_MS', 30_000);
 }
 export function configuredTimeout(config) {
     return config.timeout && config.timeout > 0 ? config.timeout : MCP_DEFAULTS.timeout;

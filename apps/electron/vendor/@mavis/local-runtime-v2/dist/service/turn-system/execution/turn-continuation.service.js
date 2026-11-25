@@ -1,40 +1,37 @@
-import { continuationTailTurnId, continuationTailWait, inspectContinuationHistory, } from '../agent-host/history/continuation-history.js';
 export function createTurnContinuationService(options) {
+    const history = { inspect: (sessionId) => options.history.inspectActive(sessionId) };
     const decide = async (sessionId) => {
         if (options.execution.activeTurnId(sessionId)) {
             return { state: 'running', previousTurnFailed: false };
         }
-        const history = await options.history.inspectActive(sessionId);
         const terminal = await options.previousTurn.readTerminal(sessionId);
-        const previousTurnFailed = terminal?.outcome === 'failed';
-        const tailTurnId = continuationTailTurnId(history.messages, history.turnIdVector);
-        const state = inspectContinuationHistory(history.messages, {
-            previousTurnFailed,
-            ...(terminal ? { failedTurnId: terminal.turnId } : {}),
-            ...(tailTurnId ? { tailTurnId } : {}),
-        });
-        logWaitDecision(options.logger, {
+        const failedTurnId = terminal?.outcome === 'failed' ? terminal.turnId : undefined;
+        const inspection = await options.harness.inspectContinuation({
             sessionId,
-            messages: history.messages,
-            terminal,
-            previousTurnFailed,
-            tailTurnId,
-            state,
+            history,
+            ...(failedTurnId !== undefined ? { failedTurnId } : {}),
         });
+        const previousTurnFailed = failedTurnId !== undefined;
+        logWaitDecision(options.logger, { sessionId, terminal, previousTurnFailed, inspection });
         // Keep the source of the input being resumed, never the last IM chat used
         // by this Session. Repeated retries may have no new user message.
+        const snapshot = await options.history.inspectActive(sessionId);
         let continuedFromTurnId;
-        for (let index = history.messages.length - 1; index >= 0; index -= 1) {
-            const message = history.messages[index];
+        for (let index = snapshot.messages.length - 1; index >= 0; index -= 1) {
+            const message = snapshot.messages[index];
             if (typeof message === 'object' &&
                 message !== null &&
                 'role' in message &&
                 message.role === 'user') {
-                continuedFromTurnId = history.turnIdVector?.[index];
+                continuedFromTurnId = snapshot.turnIdVector?.[index];
                 break;
             }
         }
-        return { state, previousTurnFailed, ...(continuedFromTurnId ? { continuedFromTurnId } : {}) };
+        return {
+            state: inspection.state,
+            previousTurnFailed,
+            ...(continuedFromTurnId ? { continuedFromTurnId } : {}),
+        };
     };
     return {
         inspect: async (sessionId) => ({ state: (await decide(sessionId)).state }),
@@ -86,17 +83,17 @@ export function createTurnContinuationService(options) {
 function logWaitDecision(logger, input) {
     if (!logger)
         return;
-    const tail = continuationTailWait(input.messages);
+    const tail = input.inspection.tailWait;
     const fields = {
         session_id: input.sessionId,
         tail_tool_name: tail?.toolName,
         waiting_for_user: tail?.waitingForUser,
         // The previous Turn's terminal outcome, not the Session status field.
         previous_turn_outcome: input.terminal?.outcome ?? 'unknown',
-        tail_turn_id: input.tailTurnId,
+        tail_turn_id: input.inspection.tailTurnId,
         previous_turn_id: input.terminal?.turnId,
     };
-    if (input.state === 'waiting-for-user') {
+    if (input.inspection.state === 'waiting-for-user') {
         logger.info(fields, 'Turn continuation is waiting for the user');
         return;
     }

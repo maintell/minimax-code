@@ -19,6 +19,9 @@ export { hostCaptureWorkspaceRevisionAfterTurn } from './indexing/scan/index.js'
 export { hostLogWorkspaceSemanticSearchUnavailable } from './indexing/scan/index.js';
 export { hostPrewarmWorkspaceIndexingForWorkspace } from './indexing/scan/index.js';
 export { hostPrepareWorkspaceIndexingForSessionStart } from './indexing/scan/index.js';
-export { git } from './operations/git-process.js';
+export { git, gitRoot } from './operations/git-process.js';
+export { addWorktreeWithNewBranch, canonicalWorktreePath, resolveExistingWorktreeRepository, } from './operations/worktree-registry.js';
 export { generateDefaultWorktreeBranch } from './worktree-branch.js';
+export * from './git/worktree-snapshots.js';
+export * from './git/worktree-cleanup-records.js';
 //# sourceMappingURL=index.js.map

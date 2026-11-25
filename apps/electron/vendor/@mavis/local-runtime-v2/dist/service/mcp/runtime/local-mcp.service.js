@@ -14,7 +14,7 @@ import { readLocalMcpFile, writeLocalMcpFile, writeLocalMcpRawDocument, } from '
 import { configuredConnectionFailure, configuredDetail, configuredInputFromStored, ConfiguredMcpConnectionTimeoutError, configuredSummary, isUserConfiguredServer, publicTransport, requireConfiguredInput, requireUserConfiguredServer, storedConfigFromInput, toTypeSchema, toManagedServerSummary, validateConfiguredServerName, withValidatedOAuth, } from './settings-config.js';
 import { authFailureMessage, CONNECTION_FAILED_ERROR, McpServerAuth } from '../auth/server-auth.js';
 import { buildBuiltinMatrixServerConfig, BUILTIN_MATRIX_SERVER_NAME, isBuiltinMatrixConfig, isRetiredLegacyMatrixMcpServerConfig, listBuiltinMatrixMcpToolDescriptors, matrixTokenOverrides, } from './builtin-matrix.js';
-import { configToTransportConfig, configuredTimeout, stdioDiscoveryTimeoutFromEnv, hasLocalCallAdapter, inferTransport, normalizeServerConfig, normalizeServerName, readConfiguredTools, readRecord, } from './config.js';
+import { configToTransportConfig, configuredTimeout, remoteDiscoveryTimeoutFromEnv, stdioDiscoveryTimeoutFromEnv, hasLocalCallAdapter, inferTransport, normalizeServerConfig, normalizeServerName, readConfiguredTools, readRecord, } from './config.js';
 import { isRetiredLegacyCuMcpServerConfig } from './retired-cu.js';
 import { LocalMcpSettingsError } from '../errors.js';
 const CONNECTION_TIMEOUT_ERROR = 'MCP server connection timed out. Retry or check its configuration.';
@@ -589,12 +589,11 @@ export class LocalMcpService {
         const transport = configToTransportConfig(config);
         if (!pool || !transport)
             return [];
-        const turnDiscoveryTimeoutMs = this.options.turnDiscoveryTimeoutMs ?? 2_000;
         const discoveryTimeoutMs = transport.type === 'stdio'
             ? (this.options.turnStdioDiscoveryTimeoutMs ??
                 this.options.turnDiscoveryTimeoutMs ??
                 stdioDiscoveryTimeoutFromEnv())
-            : turnDiscoveryTimeoutMs;
+            : (this.options.turnDiscoveryTimeoutMs ?? remoteDiscoveryTimeoutFromEnv());
         const timeoutMs = Math.min(configuredTimeout(config), discoveryTimeoutMs);
         const controller = new AbortController();
         try {

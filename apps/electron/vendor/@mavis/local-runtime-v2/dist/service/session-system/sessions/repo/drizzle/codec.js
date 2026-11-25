@@ -103,6 +103,7 @@ export function sessionExtraDataFromRecord(record) {
         titleSource: record.titleSource,
         titleReviewState: record.titleReviewState,
         titleReviewTurnId: record.titleReviewTurnId,
+        titleReviewAttempts: record.titleReviewAttempts,
         projectWorkspaceDir: record.projectWorkspaceDir,
         runLocation: record.runLocation,
         appMode: record.sessionType === 'branch' ? record.appMode : undefined,
@@ -147,8 +148,9 @@ export function parseSessionExtraData(raw) {
         runLocation,
         projectWorkspaceDir: readOptionalString(record, 'projectWorkspaceDir', 'extra_data_json'),
         sideChatOrigin: readSideChatOrigin(record),
-        titleReviewState: readOptionalEnum(record, 'titleReviewState', ['pending', 'deferred', 'completed'], 'extra_data_json'),
+        titleReviewState: readTitleReviewState(record),
         titleReviewTurnId: readOptionalString(record, 'titleReviewTurnId', 'extra_data_json'),
+        titleReviewAttempts: readOptionalSafeInteger(record, 'titleReviewAttempts', 'extra_data_json'),
         titleSource: readOptionalEnum(record, 'titleSource', ['default', 'auto', 'manual'], 'extra_data_json'),
         appMode: readOptionalEnum(record, 'appMode', ['coding', 'work'], 'extra_data_json'),
         interactionMode: readOptionalEnum(record, 'interactionMode', ['plan', 'goal'], 'extra_data_json'),
@@ -273,6 +275,9 @@ function isPositiveSafeInteger(value) {
 function validateExtraData(data) {
     if (data.runLocation) {
         assertSafeInteger(data.runLocation.createdAt, 'extra_data_json.runLocation.createdAt');
+        if (data.runLocation.cleanedAt !== undefined) {
+            assertSafeInteger(data.runLocation.cleanedAt, 'extra_data_json.runLocation.cleanedAt');
+        }
     }
     if (data.sessionDataVersion !== undefined) {
         assertSafeInteger(data.sessionDataVersion, 'extra_data_json.sessionDataVersion');
@@ -371,12 +376,18 @@ function readRunLocation(record) {
         return undefined;
     const resolvedBranch = readOptionalString(value, 'resolvedBranch', 'extra_data_json.runLocation');
     const parentRepoDir = readOptionalString(value, 'parentRepoDir', 'extra_data_json.runLocation');
+    const cleanedAt = readOptionalSafeInteger(value, 'cleanedAt', 'extra_data_json.runLocation');
     return {
         mode: requireEnum(readRequiredString(value, 'mode', 'extra_data_json.runLocation'), SESSION_RUN_LOCATION_MODES, 'extra_data_json.runLocation.mode'),
         resolvedDir: readRequiredString(value, 'resolvedDir', 'extra_data_json.runLocation'),
         ...(resolvedBranch !== undefined ? { resolvedBranch } : {}),
         ...(parentRepoDir !== undefined ? { parentRepoDir } : {}),
         createdAt: requireSafeInteger(value.createdAt, 'extra_data_json.runLocation.createdAt'),
+        ...(cleanedAt !== undefined ? { cleanedAt } : {}),
+        // Only an explicit false is meaningful; anything else reads as restorable.
+        ...(cleanedAt !== undefined && value.restorable === false
+            ? { restorable: false }
+            : {}),
     };
 }
 function validateSessionRecord(record) {
@@ -474,6 +485,14 @@ function readOptionalObject(record, key, field) {
     if (!isPlainObject(value))
         throw new Error(`${field}.${key} must be an object`);
     return value;
+}
+/**
+ * `deferred` was written by the first reply review before clarification deferral was removed;
+ * such a Session still waits for its one review, which is what `pending` means now.
+ */
+function readTitleReviewState(record) {
+    const state = readOptionalEnum(record, 'titleReviewState', ['pending', 'deferred', 'completed'], 'extra_data_json');
+    return state === 'deferred' ? 'pending' : state;
 }
 function readOptionalEnum(record, key, allowed, field) {
     const value = readOptionalString(record, key, field);

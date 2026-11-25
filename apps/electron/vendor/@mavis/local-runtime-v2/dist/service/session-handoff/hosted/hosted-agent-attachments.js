@@ -1,5 +1,5 @@
 import { basename, extname } from 'node:path';
-import { createSessionAssetPathIndex, discardLocalAssetRegistrations, inspectRegisteredV2Asset, registerMessageAttachments, resolveSessionLocalAssetSource, } from '../../../infra/file/assets-store.js';
+import { createSessionAssetPathIndex, discardLocalAssetRegistrations, registerMessageAttachments, resolveRegisteredV2AssetSource, resolveSessionLocalAssetSource, } from '../../../infra/file/assets-store.js';
 import { loadUserMediaCandidatesForMessages } from '../../../infra/conversation/input.js';
 export function createHostedAttachmentCapabilities(host) {
     const sessionAssets = createSessionAssetPathIndex(() => host.configGetter().dataDir);
@@ -20,9 +20,9 @@ export function createHostedAttachmentCapabilities(host) {
             sessionId: input.sessionId,
             filePath: input.filePath,
         }),
-        inspectStoredAsset: (filePath) => inspectRegisteredV2Asset({
+        resolveRegisteredSource: (input) => resolveRegisteredV2AssetSource({
             dataDir: host.configGetter().dataDir,
-            filePath,
+            filePath: input.filePath,
         }),
         materialize: (input) => materializeAttachment(host, input),
     };

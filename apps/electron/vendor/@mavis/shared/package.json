@@ -80,6 +80,9 @@
     "./llm-retry-event": {
       "import": "./dist/llm-retry-event.js"
     },
+    "./byok-error-attribution": {
+      "import": "./dist/byok-error-attribution.js"
+    },
     "./questionnaire": {
       "import": "./dist/questionnaire.js"
     },
@@ -109,6 +112,10 @@
     "./global-events": {
       "import": "./dist/global-events.js"
     },
+    "./plugin-extension": {
+      "import": "./dist/plugin-extension/index.js",
+      "default": "./dist/plugin-extension/index.js"
+    },
     "./cron-model": {
       "import": "./dist/cron-model.js"
     },
@@ -120,6 +127,9 @@
     },
     "./bunny-assignment-purpose": {
       "import": "./dist/bunny-assignment-purpose.js"
+    },
+    "./drive-assets": {
+      "import": "./dist/drive-assets.js"
     },
     "./mcode-context-mode": {
       "import": "./dist/mcode-context-mode.js"
@@ -170,6 +180,10 @@
     "./desktop-authorization-url": {
       "import": "./dist/desktop-authorization-url.js",
       "default": "./dist/desktop-authorization-url.js"
+    },
+    "./desktop-project-workspace-key": {
+      "import": "./dist/desktop-project-workspace-key.js",
+      "default": "./dist/desktop-project-workspace-key.js"
     },
     "./desktop-runtime": {
       "import": "./dist/desktop-runtime.js",
@@ -329,6 +343,9 @@
     "./local-runtime-skills": {
       "import": "./dist/local-runtime-skills.js"
     },
+    "./local-runtime-managed-skills": {
+      "import": "./dist/local-runtime-managed-skills.js"
+    },
     "./data-dir-variables": {
       "import": "./dist/data-dir-variables.js"
     },
@@ -404,6 +421,9 @@
       "global-events": [
         "src/global-events.ts"
       ],
+      "plugin-extension": [
+        "src/plugin-extension/index.ts"
+      ],
       "cron-model": [
         "src/cron-model.ts"
       ],
@@ -415,6 +435,9 @@
       ],
       "bunny-assignment-purpose": [
         "src/bunny-assignment-purpose.ts"
+      ],
+      "drive-assets": [
+        "src/drive-assets.ts"
       ],
       "mcode-context-mode": [
         "src/mcode-context-mode.ts"
@@ -544,6 +567,9 @@
       ],
       "local-runtime-skills": [
         "src/local-runtime-skills.ts"
+      ],
+      "local-runtime-managed-skills": [
+        "src/local-runtime-managed-skills.ts"
       ],
       "data-dir-variables": [
         "src/data-dir-variables.ts"

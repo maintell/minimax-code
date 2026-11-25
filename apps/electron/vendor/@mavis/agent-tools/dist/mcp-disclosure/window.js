@@ -1,5 +1,6 @@
 import { Type } from '@sinclair/typebox';
 import { buildOrReuseIndex, mcpServerOfToolName, serverOfToolEntry } from './search-index.js';
+import { noticeDue } from './window-notice.js';
 const NO_DEVIATION = new Map();
 /** What a declaration depends on; any difference is a changed definition. */
 export function toolDefinitionSignature(def) {
@@ -49,10 +50,9 @@ export function startToolSearchWindow(plan, input) {
  * Tool Search is off), so nothing can revert to a catalog the model never saw.
  */
 export function toolAvailabilityNotice(told, deviation, outside, entries, changedInWindow) {
-    const last = told.snapshot;
-    const due = last ? !sameDeviations(last, deviation) : deviation.size > 0 || told.everTold;
-    if (!due)
+    if (!noticeDue(told, deviation))
         return undefined;
+    const last = told.snapshot;
     const named = (status) => [...deviation].flatMap(([name, entry]) => (entry.status === status ? [name] : [])).sort();
     const present = new Set(entries.map((entry) => entry.tool.def.name));
     const unavailable = named('removed');
@@ -92,16 +92,6 @@ function wholeServersGone(unavailable, deviation, entries) {
         gone.set(server, [...(gone.get(server) ?? []), name]);
     }
     return new Map([...gone].filter(([, names]) => names.length > 1));
-}
-function sameDeviations(a, b) {
-    if (a.size !== b.size)
-        return false;
-    for (const [name, entry] of a) {
-        const other = b.get(name);
-        if (other?.status !== entry.status || other.signature !== entry.signature)
-            return false;
-    }
-    return true;
 }
 /**
  * A present tool outside the window: added, or changed when the last told

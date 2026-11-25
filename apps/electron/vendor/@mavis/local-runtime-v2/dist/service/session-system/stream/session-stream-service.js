@@ -1,5 +1,40 @@
+import { MsgType } from '@mavis/agent-core/protocol/agent-message';
 import { BoundedRing, SubscriberRegistry, measureValue, } from '../../../infra/sse/index.js';
 import { SessionFrameRetention, sessionRingOptions, } from './session-frame-retention.js';
+import { parseSubagentExecutionFact } from './subagent-execution-fact.js';
+/** Unscoped runtime/system messages cannot opt themselves into a bound Turn stream. */
+function isSessionSubagentExecution(frame) {
+    if (frame.sessionEventType !== 'subagent.execution' ||
+        frame.kind !== 'message-committed' ||
+        frame.turnId !== undefined)
+        return false;
+    const content = singleSystemEventContent(frame.data);
+    return content !== undefined && isParentExecutionFact(parseJson(content), frame.sessionId);
+}
+/** The frame must commit exactly one SystemEvent message with text content. */
+function singleSystemEventContent(data) {
+    if (!data ||
+        typeof data !== 'object' ||
+        !('messages' in data) ||
+        !Array.isArray(data.messages) ||
+        data.messages.length !== 1)
+        return undefined;
+    const message = data.messages[0];
+    return message?.msg_type === MsgType.SystemEvent && typeof message.msg_content === 'string'
+        ? message.msg_content
+        : undefined;
+}
+function parseJson(text) {
+    try {
+        return JSON.parse(text);
+    }
+    catch {
+        return undefined;
+    }
+}
+function isParentExecutionFact(value, sessionId) {
+    return parseSubagentExecutionFact(value)?.parent_session_id === sessionId;
+}
 export class SessionStreamService {
     options;
     states = new Map();
@@ -17,6 +52,7 @@ export class SessionStreamService {
             data: input.data,
             createdAtMs: input.createdAtMs ?? this.nowMs(),
             ...(input.turnId ? { turnId: input.turnId } : {}),
+            ...(input.sessionEventType ? { sessionEventType: input.sessionEventType } : {}),
             ...(input.messageActionDeltas ? { messageActionDeltas: input.messageActionDeltas } : {}),
         };
         const retained = state.retention.classify(value);
@@ -55,7 +91,8 @@ export class SessionStreamService {
         };
         return {
             source: subscription,
-            bindTurn: (turnId) => subscription.setFilter((frame) => frame.turnId === turnId),
+            bindTurn: (turnId) => subscription.setFilter((frame) => frame.sessionId === sessionId &&
+                (frame.turnId === turnId || isSessionSubagentExecution(frame))),
             complete,
             close,
             discardIfEmpty: () => {

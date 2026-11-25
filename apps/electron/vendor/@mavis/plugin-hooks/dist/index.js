@@ -3,5 +3,5 @@ export { composePluginHookToolResultContent, isAllowedPluginHookTerminalSequence
 export { PluginHookCoordinator, } from './coordinator.js';
 export { cleanupPluginHookSessionArtifacts } from './output-artifacts.js';
 export { pluginHookEffort } from './effort.js';
-export { PLUGIN_HOOK_EVENTS, } from './contracts.js';
+export { HOOK_MODULES_INVALID_FIX, PLUGIN_HOOK_EVENTS, } from './contracts.js';
 //# sourceMappingURL=index.js.map

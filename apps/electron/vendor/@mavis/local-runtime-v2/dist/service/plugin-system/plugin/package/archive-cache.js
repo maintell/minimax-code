@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { lstat, mkdir, mkdtemp, open, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { parsePluginArchive, PluginArchiveError } from './archive-format.js';
-import { computePluginDirectoryDigest, PLUGIN_PACKAGE_V1_LIMITS, pluginDigestCacheKey, } from './package-contract.js';
+import { computePluginDirectoryDigest, materializeContentAddressedDirectory, PLUGIN_PACKAGE_V1_LIMITS, pluginDigestCacheKey, } from './package-contract.js';
 export async function materializeOfficialPluginArchive(input) {
     assertSha256(input.expectedArchiveSha256);
     const cacheKey = pluginDigestCacheKey(input.expectedContentDigest);
@@ -19,44 +19,28 @@ export async function materializeOfficialPluginArchive(input) {
     if (parsed.digest.contentDigest !== input.expectedContentDigest) {
         throw new PluginArchiveError('CONTENT_DIGEST_MISMATCH', 'archive content tree does not match the package reference');
     }
-    const packageRoot = join(input.cacheRoot, cacheKey);
-    if (await isExistingValidCache(packageRoot, input.expectedContentDigest)) {
-        return { cacheKey, packageRoot, reused: true };
-    }
-    const stagingRoot = await mkdtemp(join(input.cacheRoot, `.${cacheKey}.tmp-`));
-    let published = false;
-    try {
-        for (const entry of parsed.entries) {
-            assertNotAborted(input.signal);
-            const target = join(stagingRoot, ...entry.path.split('/'));
-            if (entry.kind === 'directory') {
-                await mkdir(target, { recursive: true });
+    const materialized = await materializeContentAddressedDirectory({
+        parent: input.cacheRoot,
+        stagingPrefix: `.${cacheKey}.tmp-`,
+        expectedDigest: input.expectedContentDigest,
+        populate: async (stagingRoot) => {
+            for (const entry of parsed.entries) {
+                assertNotAborted(input.signal);
+                const target = join(stagingRoot, ...entry.path.split('/'));
+                if (entry.kind === 'directory') {
+                    await mkdir(target, { recursive: true });
+                }
+                else {
+                    await mkdir(dirname(target), { recursive: true });
+                    await writeFile(target, entry.content, { flag: 'wx', mode: 0o600 });
+                }
             }
-            else {
-                await mkdir(dirname(target), { recursive: true });
-                await writeFile(target, entry.content, { flag: 'wx', mode: 0o600 });
-            }
-        }
-        const stagedDigest = await computePluginDirectoryDigest(stagingRoot);
-        if (stagedDigest.contentDigest !== input.expectedContentDigest) {
-            throw new PluginArchiveError('CONTENT_DIGEST_MISMATCH', 'staged package content changed during extraction');
-        }
-        assertNotAborted(input.signal);
-        try {
-            await rename(stagingRoot, packageRoot);
-            published = true;
-            return { cacheKey, packageRoot, reused: false };
-        }
-        catch (error) {
-            if (!(await isExistingValidCache(packageRoot, input.expectedContentDigest)))
-                throw error;
-            return { cacheKey, packageRoot, reused: true };
-        }
-    }
-    finally {
-        if (!published)
-            await rm(stagingRoot, { recursive: true, force: true });
-    }
+        },
+        mismatchError: () => new PluginArchiveError('CONTENT_DIGEST_MISMATCH', 'staged package content changed during extraction'),
+        beforePublish: () => assertNotAborted(input.signal),
+        holds: isExistingValidCache,
+    });
+    return { cacheKey, packageRoot: materialized.root, reused: materialized.reused };
 }
 async function readRegularArchive(archivePath, signal) {
     const initial = await inspectArchivePath(archivePath);

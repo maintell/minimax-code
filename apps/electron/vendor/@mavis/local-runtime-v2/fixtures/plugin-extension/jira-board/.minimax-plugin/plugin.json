@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "name": "jira-board",
+  "version": "0.1.0",
+  "description": "Jira board header actions",
+  "author": "fixture",
+  "icon": "icon.png",
+  "category": "Other",
+  "exampleQueries": [],
+  "apps": [],
+  "mcpServers": [],
+  "skills": [],
+  "hooks": ["hooks/hooks.json"]
+}

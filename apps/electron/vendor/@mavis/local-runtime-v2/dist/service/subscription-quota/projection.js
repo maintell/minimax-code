@@ -9,13 +9,32 @@ export function text(value) {
 function finite(value) {
     return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
+const PLAN_FIELD_SOURCES = {
+    subscriptionType: 'subscription_type',
+    tier: 'token_plan_tier',
+    comboId: 'token_plan_combo_id',
+};
 export function membership(value) {
     const data = record(value.data) ?? value;
     const subscribed = value.has_token_plan ?? data.has_token_plan;
     return {
         hasTokenPlan: typeof subscribed === 'boolean' ? subscribed : undefined,
         groupId: text(value.op_group_id ?? data.op_group_id),
+        ...mergePlanFields(Object.fromEntries(Object.entries(PLAN_FIELD_SOURCES).map(([key, source]) => [
+            key,
+            text(value[source] ?? data[source]),
+        ]))),
     };
+}
+/** 订阅类型、档位与 combo ID 逐项取第一个非空来源；都缺失的字段不出现在结果里。 */
+export function mergePlanFields(...sources) {
+    const fields = {};
+    for (const key of Object.keys(PLAN_FIELD_SOURCES)) {
+        const found = sources.find((source) => source[key])?.[key];
+        if (found)
+            fields[key] = found;
+    }
+    return fields;
 }
 export function personalWorkspace(value) {
     const data = record(value.data) ?? value;

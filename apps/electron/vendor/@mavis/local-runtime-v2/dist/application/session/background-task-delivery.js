@@ -99,11 +99,13 @@ async function deliverBatch(host, ownerSessionId, previews, taskIds) {
             logDeliverySuppressed(ownerSessionId, taskIds, 'user_stop_window_recheck');
             return 'busy';
         }
+        const reply = await resolveReplyChannel(host, ownerSessionId, candidates, unreadIds);
         const result = await startConversationBackgroundTaskDeliveryTurn({
             host,
             conversation: requireBackgroundTaskConversation(host),
             ownerSessionId,
             tasks,
+            ...reply,
             // `batchTaskIds` only forms the retry-stable idempotency key; the message's
             // `origin.taskIds` is built from `tasks`, so suppressed siblings are never
             // named to the model even though they still key this batch.
@@ -143,6 +145,21 @@ async function routeToClosedTask(host, ownerSessionId, previews, candidates) {
     // Consumed: the task Session's next round does not report them again.
     await host.backgroundTaskService.markDelivered(ownerSessionId, tasks.map((task) => task.taskId));
     return true;
+}
+/** Best-effort: a lookup failure only keeps the wake's reply on the desktop. */
+async function resolveReplyChannel(host, ownerSessionId, candidates, unreadIds) {
+    const route = closedTaskRoutes.get(host);
+    const tasks = candidates.filter((task) => !!task && unreadIds.has(task.taskId));
+    if (!route?.replyChannel || tasks.length === 0)
+        return {};
+    try {
+        const replyChannel = await route.replyChannel(ownerSessionId, tasks);
+        return replyChannel ? { replyChannel } : {};
+    }
+    catch (error) {
+        logger.warn({ sessionId: ownerSessionId, error: error instanceof Error ? error.message : String(error) }, 'Background task reply channel lookup failed; the reply stays on the desktop');
+        return {};
+    }
 }
 function recordDeliverySuppressed(host, reason, count = 1) {
     try {

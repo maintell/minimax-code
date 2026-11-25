@@ -1,5 +1,6 @@
 import { buildSemanticPageTree } from './browser-semantic-tree.js';
 import { BROWSER_TIMEOUTS, isBrowserOperationInterruption, throwIfAborted, withTimeout, } from './operation-timeout.js';
+import { exposedFormState, isCredentialControl, readSnapshotFormStates, } from './browser-form-state.js';
 import { CONTAINER_TAGS, INTERACTIVE_ROLES, INTERACTIVE_TAGS, REQUIRED_COMPUTED_STYLES, SKIP_TAGS, SVG_ELEMENTS, } from './cdp-helper-contracts.js';
 export const DEFAULT_VIEWPORT = { width: 800, height: 600 };
 const browserInputDiagnosticLogger = {
@@ -24,6 +25,9 @@ export class CDPPageScanner {
     ensurePageAttached;
     command;
     lastSemanticPageTree = null;
+    /** Set per scan; like the semantic tree, one scan owns the scanner at a time. */
+    collectFormState = false;
+    passwordFields;
     constructor(transport, ensurePageAttached, command) {
         this.transport = transport;
         this.ensurePageAttached = ensurePageAttached;
@@ -86,8 +90,10 @@ export class CDPPageScanner {
         }
         return resolved;
     }
-    async scan(signal) {
+    async scan(signal, options = {}) {
         throwIfAborted(signal);
+        this.collectFormState = options.formState === true;
+        this.passwordFields = options.passwordFields;
         const startedAt = Date.now();
         const logPhase = (phase, extra = {}) => {
             browserInputDiagnosticLogger.info({
@@ -197,7 +203,7 @@ export class CDPPageScanner {
             });
             // 2. DOMSnapshot bounds 是各 Document 的文档坐标；统一 legacy 单位、滚动量和 viewport。
             const mainFrameId = domTreeResult?.root?.frameId ?? 'main';
-            const snapshotLookup = this.buildSnapshotLookup(snapshotResult, mainFrameId, snapshotToCssScale);
+            const snapshotLookup = this.buildSnapshotLookup(snapshotResult, mainFrameId, snapshotToCssScale, this.collectFormState);
             // 3. 构建 AX tree lookup（backendDOMNodeId -> AX 节点）
             const axTreeLookup = new Map();
             if (axTreeResult?.nodes) {
@@ -319,7 +325,7 @@ export class CDPPageScanner {
      * @param snapshot DOMSnapshot 结果
      * @param mainFrameId 主 Frame CDP id
      */
-    buildSnapshotLookup(snapshot, mainFrameId, snapshotToCssScale = 1) {
+    buildSnapshotLookup(snapshot, mainFrameId, snapshotToCssScale = 1, collectFormState = false) {
         const lookup = new Map();
         if (!snapshot?.documents)
             return lookup;
@@ -342,6 +348,7 @@ export class CDPPageScanner {
             const coordinateSpace = isMainDocument ? 'main-frame-viewport' : 'frame-local';
             if (!nodes?.backendNodeId)
                 continue;
+            const formStates = collectFormState ? readSnapshotFormStates(nodes, strings) : undefined;
             // 构建 nodeIndex -> layoutIndex 映射
             const layoutIndexMap = new Map();
             if (layout?.nodeIndex) {
@@ -402,6 +409,7 @@ export class CDPPageScanner {
                 }
                 if (backendNodeId === undefined)
                     continue;
+                const formState = formStates?.get(i);
                 lookup.set(backendNodeId, {
                     bounds,
                     coordinateSpace,
@@ -409,6 +417,7 @@ export class CDPPageScanner {
                     isClickable,
                     paintOrder,
                     frameId: documentFrameId || mainFrameId,
+                    ...(formState ? { formState } : {}),
                 });
             }
         }
@@ -1136,6 +1145,25 @@ export class CDPPageScanner {
         // 检查是否禁用
         const isDisabled = this.getNodeAttribute(node, 'disabled') !== null ||
             this.getNodeAttribute(node, 'aria-disabled') === 'true';
+        let formState;
+        if (this.collectFormState) {
+            const inputType = this.getNodeAttribute(node, 'type');
+            if (tagName.toLowerCase() === 'input' && inputType?.trim().toLowerCase() === 'password') {
+                this.passwordFields?.add(node.backendNodeId);
+            }
+            const credential = isCredentialControl({
+                tag: tagName,
+                type: inputType,
+                name: this.getNodeAttribute(node, 'name'),
+                id: this.getNodeAttribute(node, 'id'),
+                autocomplete: this.getNodeAttribute(node, 'autocomplete'),
+                observedAsPassword: this.passwordFields?.has(node.backendNodeId) === true,
+            });
+            // A credential shows neither its live value nor its serialized default.
+            if (credential)
+                delete attributes.value;
+            formState = exposedFormState(tagName, inputType, credential, snapshotNode?.formState);
+        }
         return {
             index,
             backendNodeId: node.backendNodeId,
@@ -1157,6 +1185,7 @@ export class CDPPageScanner {
             attributes,
             paintOrder: snapshotNode?.paintOrder ?? undefined,
             ...(textEntryActivationSurface ? { inputStrategy: 'focused-keyboard' } : {}),
+            ...(formState ? { formState } : {}),
         };
     }
     getDescendantText(node) {

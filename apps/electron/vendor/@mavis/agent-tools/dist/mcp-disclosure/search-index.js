@@ -1,3 +1,4 @@
+import { skillForNamespace, summaryForNamespace } from '../shared/builtin-tool-namespaces.js';
 import { tokenize } from './tokenize.js';
 const BM25_K1 = 1.5;
 const BM25_B = 0.75;
@@ -14,7 +15,7 @@ function flattenSchema(schema, max) {
         if (Array.isArray(o.enum))
             parts.push(o.enum.map(String).join(' '));
         if (Array.isArray(o.required))
-            parts.push(o.required.map(String).join(' '));
+            parts.push(o.required.join(' '));
         if (o.properties && typeof o.properties === 'object') {
             for (const [k, v] of Object.entries(o.properties)) {
                 parts.push(k);
@@ -37,14 +38,16 @@ function fnv1a(s) {
 }
 /**
  * Pure, stable content signature for a candidate set. Hashes the sorted
- * `name:fnv1a(schema):fnv1a(description)` triples — it intentionally does NOT
- * depend on `maxSchemaTextLen`, so two indexes built from the same candidates
+ * `name:namespace:fnv1a(schema):fnv1a(description)` tuples — it intentionally does
+ * NOT depend on `maxSchemaTextLen`, so two indexes built from the same candidates
  * (regardless of schema-text truncation) share a signature. `buildIndex` and
  * `buildOrReuseIndex` both route through this so their signatures always agree.
+ * The namespace is part of the signature: without it a cache hit could hand back
+ * an index built before the tool was namespaced.
  */
 export function computeIndexSignature(candidates) {
     return fnv1a([...candidates]
-        .map((e) => `${e.tool.def.name}:${fnv1a(JSON.stringify(e.tool.def.schema ?? {}))}:${fnv1a(e.tool.def.description ?? '')}`)
+        .map((e) => `${e.tool.def.name}:${e.tool.def.namespace ?? ''}:${fnv1a(JSON.stringify(e.tool.def.schema ?? {}))}:${fnv1a(e.tool.def.description ?? '')}`)
         .sort()
         .join('|'));
 }
@@ -89,6 +92,11 @@ export function buildTextSearchIndex(items, textOf, opts = {}) {
     }
     function search(input) {
         let pool = docs;
+        const namespace = input.namespace?.trim();
+        if (namespace && opts.namespaceOf) {
+            const namespaceOf = opts.namespaceOf;
+            pool = pool.filter((d) => matchesNamespace(namespaceOf(d.item), namespace));
+        }
         if (input.regex) {
             const re = new RegExp(input.regex, 'i');
             pool = pool.filter((d) => re.test(d.raw));
@@ -116,14 +124,14 @@ export function buildTextSearchIndex(items, textOf, opts = {}) {
                 return { d, score };
             })
                 .filter((x) => x.score > 0);
-            // `regex` is a hard filter; `query` only ranks within it. When the query
-            // adds no BM25 signal but a regex narrowed the pool, still return that pool
-            // (flat score) so a narrowing regex never silently yields nothing. With no
-            // regex in play, a zero-hit query means no match. `topK` (or the caller's
-            // paging, as in `tool_search`) bounds the result, so the fallback cannot
+            // `regex` and `namespace` are hard filters; `query` only ranks within
+            // them. When the query adds no BM25 signal but a filter narrowed the pool,
+            // still return that pool (flat score) so a narrowing filter never silently
+            // yields nothing. With no filter in play, a zero-hit query means no match.
+            // Either way the caller's paging bounds the result, so the fallback cannot
             // flood the context.
             if (scored.length === 0) {
-                if (!input.regex)
+                if (!input.regex && !namespace)
                     return [];
                 scored = pool.map((d) => ({ d, score: 1 }));
             }
@@ -138,23 +146,49 @@ export function buildTextSearchIndex(items, textOf, opts = {}) {
     return { search, size: N };
 }
 function toolHit(tool, score) {
-    return { name: tool.name, description: tool.description, input_schema: tool.input_schema, score };
+    return {
+        name: tool.name,
+        description: tool.description,
+        input_schema: tool.input_schema,
+        score,
+        ...(tool.namespace === undefined
+            ? {}
+            : {
+                namespace: tool.namespace,
+                skill_required: tool.skillRequired,
+                ...(tool.skill === undefined ? {} : { skill: tool.skill }),
+            }),
+    };
 }
 export function buildIndex(candidates, opts) {
     const tools = candidates.map((e) => {
         const def = e.tool.def;
         const schemaText = flattenSchema(def.schema, opts.maxSchemaTextLen);
+        const namespace = def.namespace;
         return {
             name: def.name,
             description: def.description ?? '',
             input_schema: def.schema,
-            raw: `${def.name} ${def.description ?? ''} ${schemaText}`,
+            ...(namespace === undefined
+                ? { skillRequired: false }
+                : {
+                    namespace,
+                    skill: skillForNamespace(namespace),
+                    // The gate only wraps `on_demand` tools, so a default-loaded namespaced
+                    // tool must not be advertised as needing its Skill first.
+                    skillRequired: def.loading === 'on_demand',
+                }),
+            // The namespace is indexed text as well as a filter, so a keyword search
+            // for "sidebar" reaches the tools it groups. A tool without one keeps the
+            // original text, so an anchored regex such as `^github_` still matches.
+            raw: `${namespace === undefined ? '' : `${namespace} `}${def.name} ${def.description ?? ''} ${schemaText}`,
             lowerName: def.name.toLowerCase(),
             bareName: bareToolName(def.name).toLowerCase(),
         };
     });
     const index = buildTextSearchIndex(tools, (tool) => tool.raw, {
         exactNamesOf: (tool) => [tool.lowerName, tool.bareName],
+        namespaceOf: (tool) => tool.namespace,
     });
     const byName = new Map(tools.map((t) => [t.name, t]));
     const byLowerName = new Map();
@@ -198,7 +232,26 @@ export function buildIndex(candidates, opts) {
         names: () => tools.map((t) => t.name),
         size: index.size,
         signature: computeIndexSignature(candidates),
+        namespaces: collectNamespaces(tools),
     };
+}
+function collectNamespaces(entries) {
+    const names = [...new Set(entries.map((e) => e.namespace).filter((n) => n !== undefined))];
+    return names.sort().map((namespace) => {
+        const summary = summaryForNamespace(namespace);
+        return summary === undefined ? { namespace } : { namespace, summary };
+    });
+}
+/**
+ * A namespace query with a dot is exact; one without a dot also matches every
+ * namespace below it, so `sidebar` reaches `sidebar.project`.
+ */
+function matchesNamespace(value, query) {
+    if (value === undefined)
+        return false;
+    if (query.includes('.'))
+        return value === query;
+    return value === query || value.startsWith(`${query}.`);
 }
 /** `mcp__server__tool` → `tool`; names without the MCP prefix are returned unchanged. */
 export function bareToolName(name) {

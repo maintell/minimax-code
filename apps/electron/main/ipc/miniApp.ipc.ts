@@ -4,7 +4,7 @@ import { getRuntimeRegion, getRuntimeBuildEnv } from "@mavis/config";
 import { resolveLocalRuntimeDataDir } from "../modules/local-runtime/data-dir";
 import { miniAppPreviewCache } from "../modules/browser/miniapp-preview-cache";
 import { beginMiniAppNavigationRevocation } from "../modules/browser/miniapp-host-navigation-permissions.js";
-import { parseMiniAppPermissionId, parseMiniAppPermissionList, parseMiniAppWindowPatch } from "@mavis/shared/miniapp-surface";
+import { parseMiniAppPermissionId, parseMiniAppPermissionList, parseMiniAppWindowPatch, readMiniAppFileOpenInput } from "@mavis/shared/miniapp-surface";
 import { windowManager } from "../windows/manager";
 import { getMainWindow } from "../windows/mainWindow";
 import { IPC_CHANNELS } from "../config/constants";
@@ -96,9 +96,10 @@ export function setupMiniAppIPC() {
         }
     });
     ipcMain.handle(IPC_CHANNELS.MINIAPP_OPEN, (_event, params) => openMiniApp(params));
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_PRESENT, (_event, params) => presentMiniApp(params));
     ipcMain.handle(IPC_CHANNELS.MINIAPP_REFRESH, (_event, params) => controlMiniApp('refresh', params));
     ipcMain.handle(IPC_CHANNELS.MINIAPP_STOP, (_event, params) => controlMiniApp('stop', params));
-    ipcMain.handle(IPC_CHANNELS.MINIAPP_CLOSE, (_event, params) => closeMiniApp(params));
+    ipcMain.handle(IPC_CHANNELS.MINIAPP_CLOSE, (_event, params) => closeMiniApp(params, { closedBy: 'user' }));
     ipcMain.handle(IPC_CHANNELS.MINIAPP_DETACH, (_event, params) => controlMiniApp('detach', params));
     ipcMain.handle(IPC_CHANNELS.MINIAPP_ATTACH, (_event, params) => controlMiniApp('attach', params));
     ipcMain.handle(IPC_CHANNELS.MINIAPP_APPLY_UPDATE, (_event, params) => applyMiniAppUpdate(params));
@@ -223,11 +224,18 @@ const CONTROL_FAILURE_CODES = {
     detach: 'detach_failed',
     attach: 'attach_failed',
 };
-async function closeMiniApp(params) {
+/**
+ * Closes every page of a Mini App and stops it. The user's close of the tab the
+ * Agent controls is a takeover; the Agent's `close_tab` already prepared its close.
+ */
+export async function closeMiniApp(params, options = { closedBy: 'user' }) {
     const sessionId = normalizeIdentifier(params?.sessionId);
     const pluginId = normalizeIdentifier(params?.pluginId);
     if (!sessionId || !pluginId)
         return { success: false, code: 'invalid_request' };
+    if (options.closedBy === 'user') {
+        getEmbeddedBrowserManager().prepareMiniAppClose(pluginId, 'user', sessionId);
+    }
     const startedAt = Date.now();
     try {
         const closedTabIds = closeManagedMiniAppPages(pluginId, {
@@ -269,6 +277,24 @@ async function closeMiniApp(params) {
             surfaceCode: 'close_failed',
         });
         return { success: false, code: 'close_failed' };
+    }
+}
+/** Presents a tab a file open made without presenting; the tab must be this session's Mini App. */
+function presentMiniApp(params) {
+    if (!isRecordWithOnlyKeys(params, ['sessionId', 'tabId'])) {
+        return { success: false, code: 'invalid_request' };
+    }
+    const sessionId = normalizeIdentifier(params.sessionId);
+    const { tabId } = params;
+    if (!sessionId || typeof tabId !== 'number' || !Number.isInteger(tabId) || tabId < 0) {
+        return { success: false, code: 'invalid_request' };
+    }
+    try {
+        getEmbeddedBrowserManager().presentMiniAppTab({ sessionId, tabId });
+        return { success: true };
+    }
+    catch (error) {
+        return { success: false, code: normalizeErrorCode(error, 'not_found') };
     }
 }
 async function controlMiniApp(method, params) {
@@ -479,16 +505,23 @@ function failureResponse(code, error) {
 }
 /** The optional page-open fields, or `undefined` when one is malformed. */
 function normalizePageOpenOptions(params) {
-    const { restoreTabId, keepSleepingTab } = params;
+    const { restoreTabId, keepSleepingTab, present, fileOpen } = params;
     if (restoreTabId !== undefined &&
         (typeof restoreTabId !== 'number' || !Number.isInteger(restoreTabId) || restoreTabId < 0)) {
         return undefined;
     }
     if (keepSleepingTab !== undefined && keepSleepingTab !== true)
         return undefined;
+    if (present !== undefined && present !== false)
+        return undefined;
+    const parsedFileOpen = fileOpen === undefined ? undefined : readMiniAppFileOpenInput(fileOpen);
+    if (fileOpen !== undefined && !parsedFileOpen)
+        return undefined;
     return {
         ...(restoreTabId !== undefined ? { restoreTabId } : {}),
         ...(keepSleepingTab ? { keepSleepingTab } : {}),
+        ...(present === false ? { present } : {}),
+        ...(parsedFileOpen ? { fileOpen: parsedFileOpen } : {}),
     };
 }
 function recordManualOpenFailure(input) {

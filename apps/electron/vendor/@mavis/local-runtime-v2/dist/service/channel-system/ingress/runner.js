@@ -46,6 +46,32 @@ function formatQueueReasonNoticeText(reason, queuedMessagesAhead) {
     const text = QUEUE_REASON_NOTICE_TEXT[reason];
     return queuedMessagesAhead > 0 ? `${text}前方还有 ${queuedMessagesAhead} 条消息。` : text;
 }
+/**
+ * Rebase relative media paths to `<workspace>/<path>` so IM senders don't ENOENT
+ * on bare basenames. `undefined` when the turn failed or carried no media.
+ */
+function collectedMedia(collected, workspaceDir) {
+    if (collected.error || !collected.media || collected.media.length === 0)
+        return undefined;
+    return collected.media.map((ref) => rebaseMediaPath(ref, workspaceDir));
+}
+/** The outbound message a collected turn response becomes, or nothing to send. */
+function buildCollectedOutbound(send) {
+    const { ctx, sessionId, queueItemId, collected } = send;
+    const text = collected.error ? '' : collected.text.trim();
+    const media = collectedMedia(collected, send.workspaceDir);
+    if (!text && !media && !collected.error)
+        return undefined;
+    return {
+        ctx,
+        text,
+        ...(media ? { media } : {}),
+        sessionId,
+        queueItemId,
+        ...(collected.error ? { error: collected.error } : {}),
+        ...(send.replyScope ? { replyScope: send.replyScope } : {}),
+    };
+}
 /** Persisted outbound audit history used by real platform clients. */
 export class LocalChannelOutboundStore {
     dataDir;
@@ -286,11 +312,17 @@ export class LocalChannelRunner {
         // Permission reply interception — MUST run BEFORE the questionnaire
         // interception (see tryInterceptPermissionReply for the full rationale).
         const permission = await this.tryInterceptPermissionReply(input);
-        if (permission)
+        if (permission) {
+            // The answer WAS accepted — only its own reply is missing, so the
+            // placeholder must not read as "this message got nothing".
+            await this.settleUnansweredInbound(input.ctx, 'answered');
             return permission;
+        }
         const questionnaire = await this.tryInterceptQuestionnaireReply(input);
-        if (questionnaire)
+        if (questionnaire) {
+            await this.settleUnansweredInbound(input.ctx, 'answered');
             return questionnaire;
+        }
         const inbound = await this.options.infra.handleInbound({
             ctx: input.ctx,
             text: input.text,
@@ -326,10 +358,19 @@ export class LocalChannelRunner {
         }
         if (inbound.reply && !inbound.queueItemId) {
             await this.deliverDirectReply(ctx, inbound);
+            // The reply has been attempted, so whatever it did not consume is stale.
+            await this.settleUnansweredInbound(ctx);
             return { inbound };
         }
-        if (inbound.sessionId)
+        if (inbound.sessionId) {
+            // Admitted: a queued / merged / running message still has a notice or a
+            // Turn coming, so its placeholder must survive until that lands.
             await this.deliverAdmissionNotice(ctx, inbound);
+            return { inbound };
+        }
+        // Consumed without a session and without a reply (denied inbound): nothing
+        // else will ever answer it.
+        await this.settleUnansweredInbound(ctx);
         return { inbound };
     }
     /**
@@ -342,8 +383,9 @@ export class LocalChannelRunner {
         if (inbound.steered) {
             // Merged into the running IM Turn: its reply already lands on this chat.
             // A `duplicate` replay was acknowledged the first time, so stay quiet.
-            if (inbound.steered === 'merged')
-                await this.deliverNotice(ctx, STEERED_NOTICE_TEXT);
+            if (inbound.steered === 'merged') {
+                await this.deliverNotice(ctx, STEERED_NOTICE_TEXT, 'steered');
+            }
             return;
         }
         if (!inbound.queueItemId)
@@ -353,7 +395,7 @@ export class LocalChannelRunner {
             // `queueAhead` counts the running Turn as one; the 1-based queue
             // position does not, so position - 1 is the queued messages in front.
             const queuedMessagesAhead = Math.max(0, (inbound.queuePosition ?? 1) - 1);
-            await this.deliverNotice(ctx, formatQueueReasonNoticeText(inbound.queueReason, queuedMessagesAhead));
+            await this.deliverNotice(ctx, formatQueueReasonNoticeText(inbound.queueReason, queuedMessagesAhead), 'queued');
             return;
         }
         await this.deliverQueuedNotice(ctx, inbound.queueAhead ?? 0);
@@ -534,34 +576,45 @@ export class LocalChannelRunner {
     /** Best-effort counterpart to {@link notifyTurnStart}. */
     async notifyTurnEnd(ctx) {
         const adapter = this.options.infra.adapterRegistry?.get(ctx.platform, ctx.clientName);
-        if (!adapter?.notifyTurnEnd)
+        if (adapter?.notifyTurnEnd) {
+            try {
+                await adapter.notifyTurnEnd(ctx);
+            }
+            catch {
+                // Typing must never surface to terminal reply delivery.
+            }
+        }
+        // Terminal delivery for this Turn already ran — the reply observer awaits it
+        // before ending the lifecycle — so anything still pending here is unanswered.
+        await this.settleUnansweredInbound(ctx);
+    }
+    /**
+     * The inbound message this ctx names will get nothing else: close out any
+     * transient placeholder the transport rendered for it. The adapter-side store
+     * is the source of truth — a placeholder a reply or a notice already consumed
+     * is gone, so this is a no-op for every answered message. Best-effort: it must
+     * never affect the Turn, the inbound outcome, or another message's delivery.
+     *
+     * `kind` only tells the adapter which terminal wording fits: `'answered'`
+     * when the message was consumed as a permission / questionnaire answer,
+     * `'unanswered'` (the default) when it truly got nothing.
+     */
+    async settleUnansweredInbound(ctx, kind = 'unanswered') {
+        const adapter = this.options.infra.adapterRegistry?.get(ctx.platform, ctx.clientName);
+        if (!adapter?.settleUnansweredInbound)
             return;
         try {
-            await adapter.notifyTurnEnd(ctx);
+            await adapter.settleUnansweredInbound(ctx, kind);
         }
         catch {
-            // Typing must never surface to terminal reply delivery.
+            // Closing a placeholder is cosmetic; never surface it.
         }
     }
     sendCollected(send) {
-        const { ctx, sessionId, queueItemId, collected } = send;
-        const text = collected.error ? '' : collected.text.trim();
-        const hasMedia = !collected.error && !!collected.media && collected.media.length > 0;
-        if (!text && !hasMedia && !collected.error)
+        const outbound = buildCollectedOutbound(send);
+        if (!outbound)
             return Promise.resolve(undefined);
-        // Rebase relative media paths to <workspace>/<path> so IM senders
-        // don't ENOENT on bare basenames.
-        const media = hasMedia
-            ? collected.media.map((m) => rebaseMediaPath(m, send.workspaceDir))
-            : undefined;
-        return this.sendOutbound(ctx, {
-            ctx,
-            text,
-            ...(media ? { media } : {}),
-            sessionId,
-            queueItemId,
-            ...(collected.error ? { error: collected.error } : {}),
-        });
+        return this.sendOutbound(send.ctx, outbound);
     }
     /** Delivers a continuation from the v2 committed-message projection. */
     async deliverReplyFromMessages(deliver) {
@@ -576,6 +629,7 @@ export class LocalChannelRunner {
             queueItemId: '',
             collected,
             ...(deliver.workspaceDir ? { workspaceDir: deliver.workspaceDir } : {}),
+            ...(deliver.replyScope ? { replyScope: deliver.replyScope } : {}),
         });
     }
     /**
@@ -590,17 +644,18 @@ export class LocalChannelRunner {
     async deliverQueuedNotice(ctx, ahead) {
         if (ahead <= 0)
             return;
-        await this.deliverNotice(ctx, formatQueuedNoticeText(ahead));
+        await this.deliverNotice(ctx, formatQueuedNoticeText(ahead), 'queued');
     }
     /**
      * Best-effort admission notice (queued / queue reason / merged): the message
      * is already admitted, so a send failure is only logged and never fails it.
      */
-    async deliverNotice(ctx, text) {
+    async deliverNotice(ctx, text, noticeKind) {
         try {
             await this.sendOutbound(ctx, {
                 ctx,
                 text,
+                noticeKind,
             });
         }
         catch (err) {

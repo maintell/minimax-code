@@ -188,7 +188,28 @@ function toAgentInput(message, trustBackgroundOrigin) {
 function toAgentAttachment(attachment) {
     // 展示元数据留在 displayAttachments，执行输入只投影 AgentHost 契约字段。
     const { type, filePath, fileName, mimeType, desktopPath, dataUrl, assetId, error } = attachment;
-    return { type, filePath, fileName, mimeType, desktopPath, dataUrl, assetId, error };
+    return {
+        type,
+        filePath,
+        fileName,
+        mimeType,
+        desktopPath,
+        dataUrl,
+        assetId,
+        error,
+        ...assetReferenceFields(attachment),
+    };
+}
+function assetReferenceFields(attachment) {
+    // 资产库引用没有本地内容，节点、路径和大小就是它的执行输入。
+    const { driveNodeId, drivePath, sizeBytes } = attachment;
+    if (!driveNodeId)
+        return {};
+    return {
+        driveNodeId,
+        ...(drivePath ? { drivePath } : {}),
+        ...(sizeBytes !== undefined ? { sizeBytes } : {}),
+    };
 }
 function isTrustedBackgroundDelivery(input) {
     return input.source === 'background-task' && input.producerId === 'background-task-delivery';

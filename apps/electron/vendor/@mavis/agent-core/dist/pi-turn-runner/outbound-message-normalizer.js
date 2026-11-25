@@ -24,6 +24,12 @@ const SIBLING_NATIVE_THINKING_APIS = new Set([
 // the only job is "do not get the whole request rejected", and wrongly dropping
 // genuine content costs more than letting a small image through.
 const MIN_PROVIDER_IMAGE_EDGE_PX = 8;
+// The MiniMax gateway rejects the whole request for an image whose long edge is
+// more than 200 times its short edge (`image's aspect ratio exceeds 200:1`,
+// measured with an 8000x8 PNG; MCT-202611-E3ZW0XFK). Such a strip carries
+// almost nothing once a vision encoder resizes it, so the placeholder costs
+// little on other providers too.
+const MAX_PROVIDER_IMAGE_ASPECT_RATIO = 200;
 /**
  * Build the exact temporary message list sent to a target model.
  * Canonical Agent messages are never rewritten by this projection.
@@ -44,7 +50,7 @@ export function projectAgentMessagesForModel(messages, targetModel) {
         // non-video image block as a still image.
         .map((message) => projectNonNativeDocumentMedia(message, targetModel))
         .map((message) => projectUnsupportedMediaBlocks(message, mediaSupport))
-        .map((message) => projectUndersizedImageBlocks(message, undetermined))
+        .map((message) => projectDegenerateImageBlocks(message, undetermined))
         .map((message) => projectErrorToolResultImages(message, targetModel));
     // Last, so the ceiling counts exactly the images that would be sent: video
     // frames projected to images count, undersized placeholders do not. A model
@@ -227,8 +233,9 @@ function projectVideoBlocks(message) {
     return changed ? { ...message, content } : message;
 }
 /**
- * Replace images the provider would reject for being degenerate with a text
- * placeholder, on the temporary request copy only.
+ * Replace images the provider would reject for being degenerate (an edge below
+ * the minimum, or an aspect ratio above the maximum) with a text placeholder,
+ * on the temporary request copy only.
  *
  * Fails open in every uncertain case: an image whose size cannot be read is
  * kept untouched and only counted, because wrongly dropping real user content
@@ -236,7 +243,7 @@ function projectVideoBlocks(message) {
  * a message whose only block was an undersized image still has content — no
  * special "would this message become empty" branch is needed.
  */
-function projectUndersizedImageBlocks(message, undetermined) {
+function projectDegenerateImageBlocks(message, undetermined) {
     if (typeof message.content === 'string' || !Array.isArray(message.content))
         return message;
     let changed = false;
@@ -259,15 +266,45 @@ function projectUndersizedImageBlocks(message, undetermined) {
             }
             return block;
         }
-        if (Math.min(size.width, size.height) >= MIN_PROVIDER_IMAGE_EDGE_PX)
+        const placeholder = degenerateImagePlaceholder(size.width, size.height);
+        if (placeholder === undefined)
             return block;
         changed = true;
-        return {
-            type: 'text',
-            text: `[image omitted: ${size.width}x${size.height} px is below the ${MIN_PROVIDER_IMAGE_EDGE_PX} px minimum edge required by the model provider]`,
-        };
+        return { type: 'text', text: placeholder };
     });
     return changed ? { ...message, content } : message;
+}
+/**
+ * Why the model provider would reject this image (an edge below
+ * `MIN_PROVIDER_IMAGE_EDGE_PX` or an aspect ratio above
+ * `MAX_PROVIDER_IMAGE_ASPECT_RATIO`), in the words the request placeholder
+ * uses and without a full stop; undefined when it passes or its size cannot be
+ * read (only PNG and JPEG headers are read). `data` is base64 text or the raw
+ * bytes. User attachments and the read tool use it to refuse such an image
+ * when it comes in, so it never reaches history and only the request
+ * placeholder below would have hidden it.
+ */
+export function findDegenerateImageReason(data, mimeType) {
+    const size = imageDimensions(data, mimeType);
+    return size ? degenerateImageReason(size.width, size.height) : undefined;
+}
+function degenerateImagePlaceholder(width, height) {
+    const reason = degenerateImageReason(width, height);
+    return reason === undefined ? undefined : `[image omitted: ${reason}]`;
+}
+function degenerateImageReason(width, height) {
+    const shortEdge = Math.min(width, height);
+    if (shortEdge < MIN_PROVIDER_IMAGE_EDGE_PX) {
+        return `${width}x${height} px is below the ${MIN_PROVIDER_IMAGE_EDGE_PX} px minimum edge required by the model provider`;
+    }
+    const ratio = Math.max(width, height) / shortEdge;
+    if (ratio <= MAX_PROVIDER_IMAGE_ASPECT_RATIO)
+        return undefined;
+    return `${width}x${height} px has an aspect ratio of ${formatAspectRatio(ratio)}:1, above the ${MAX_PROVIDER_IMAGE_ASPECT_RATIO}:1 maximum the model provider accepts. Crop it into less elongated pieces to send it again`;
+}
+/** Two decimals at most, rounded down, so 200.4:1 does not read as the 200:1 limit itself. */
+function formatAspectRatio(ratio) {
+    return String(Math.floor(ratio * 100) / 100);
 }
 /** Protocols whose wire format carries audio and PDF inline (see the BYOK capability gate). */
 const NATIVE_DOCUMENT_MEDIA_APIS = new Set(['google-generative-ai']);

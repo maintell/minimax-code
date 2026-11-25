@@ -1,5 +1,5 @@
 import { HTTPException } from 'hono/http-exception';
-import { DesktopWebsiteServiceBase } from './desktop-website-service-base.js';
+import { DesktopMergeRequestServiceBase } from './desktop-merge-request-service-base.js';
 import { CronContractError } from '../../service/cron/index.js'; // desktop-service-boundary-skip: anchor=server-cron-contract owner=cron reason=legacy-cron-rpc-glue-before-facade; followup=desktop-service-domain-facades
 import { jsonError } from './desktop-service-support.js';
 /**
@@ -29,7 +29,7 @@ function sandboxUnsupported(method) {
     };
 }
 /** Preserves stable unavailable responses for methods owned by the V2 front door. */
-export class DesktopUnavailableServiceBase extends DesktopWebsiteServiceBase {
+export class DesktopUnavailableServiceBase extends DesktopMergeRequestServiceBase {
     ensureBunny = () => this.unimplementedGeneratedMethod('ensureBunny');
     resetBunny = () => this.unimplementedGeneratedMethod('resetBunny');
     reportBunnyViewState = () => this.unimplementedGeneratedMethod('reportBunnyViewState');
@@ -147,15 +147,14 @@ export class DesktopUnavailableServiceBase extends DesktopWebsiteServiceBase {
     getSidebarSession(..._args) {
         return this.unimplementedGeneratedMethod('GetSidebarSession');
     }
-    listManagedWorkspaceGitWorktrees(..._args) {
-        return this.unimplementedGeneratedMethod('ListManagedWorkspaceGitWorktrees');
+    moveSidebarProject(..._args) {
+        return this.unimplementedGeneratedMethod('MoveSidebarProject');
     }
-    removeManagedWorkspaceGitWorktree(..._args) {
-        return this.unimplementedGeneratedMethod('RemoveManagedWorkspaceGitWorktree');
-    }
-    removeManagedWorkspaceGitWorktreesBatch(..._args) {
-        return this.unimplementedGeneratedMethod('RemoveManagedWorkspaceGitWorktreesBatch');
-    }
+    removeWorkspaceGitWorktree = () => this.unimplementedGeneratedMethod('RemoveWorkspaceGitWorktree');
+    listManagedWorkspaceGitWorktrees = () => this.unimplementedGeneratedMethod('ListManagedWorkspaceGitWorktrees');
+    removeManagedWorkspaceGitWorktree = () => this.unimplementedGeneratedMethod('RemoveManagedWorkspaceGitWorktree');
+    removeManagedWorkspaceGitWorktreesBatch = () => this.unimplementedGeneratedMethod('RemoveManagedWorkspaceGitWorktreesBatch');
+    restoreSessionWorktree = () => this.unimplementedGeneratedMethod('RestoreSessionWorktree');
     // Workspace Git Snapshot ownership lives in Local Runtime v2. These methods
     // only satisfy the generated DesktopService shape for legacy-only hosts and
     // must never recreate a second v1 Snapshot owner.
@@ -423,6 +422,9 @@ export class DesktopUnavailableServiceBase extends DesktopWebsiteServiceBase {
     // implementation lands, the generated routes stay fail closed with 501.
     getSessionFileSyncs = () => this.unimplementedGeneratedMethod('getSessionFileSyncs');
     recordSessionFileSync = () => this.unimplementedGeneratedMethod('recordSessionFileSync');
+    querySessionFileSyncSources = () => this.unimplementedGeneratedMethod('querySessionFileSyncSources');
+    invalidateSessionFileSyncSources = () => this.unimplementedGeneratedMethod('invalidateSessionFileSyncSources');
+    bindSessionFileSyncOwner = () => this.unimplementedGeneratedMethod('bindSessionFileSyncOwner');
     // Cron v2 定义和运行契约由 local-runtime-v2 前门持有。
     // 旧 v1 DesktopService 不持有 Cron v2。这些生成方法存在于共享契约基类中，
     // Cron v2 写入端和执行器只由 local-runtime-v2 宿主组合，参见

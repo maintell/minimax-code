@@ -298,7 +298,8 @@ function toQueueAttachment(input) {
         throw new TypeError('Inline attachment must be registered before Queue admission.');
     }
     const dataUrl = inlineDataUrl ? undefined : candidateDataUrl;
-    if (!hasQueueAttachmentPayload(input, filePath, dataUrl))
+    const drive = queueDriveAssetFields(input);
+    if (!hasQueueAttachmentPayload(input, filePath, dataUrl) && !drive.driveNodeId)
         return [];
     const attachment = {
         ...queueAttachmentMetadata(input, filePath),
@@ -306,11 +307,28 @@ function toQueueAttachment(input) {
         ...(dataUrl ? { dataUrl } : {}),
         ...(input.assetId ? { assetId: input.assetId } : {}),
         ...(input.error ? { error: input.error } : {}),
+        ...drive,
     };
     return [attachment];
 }
 function hasQueueAttachmentPayload(input, filePath, dataUrl) {
     return Boolean(filePath || dataUrl || input.assetId || input.error);
+}
+/**
+ * A Drive asset reference survives Queue admission even without a local source;
+ * only a Drive reference may be queued as a folder.
+ */
+function queueDriveAssetFields(input) {
+    const driveNodeId = input.driveNodeId?.trim();
+    if (!driveNodeId)
+        return {};
+    const drivePath = input.drivePath?.trim();
+    return {
+        ...(input.type === 'folder' ? { type: 'folder' } : {}),
+        driveNodeId,
+        ...(drivePath ? { drivePath } : {}),
+        ...(input.sizeBytes !== undefined ? { sizeBytes: input.sizeBytes } : {}),
+    };
 }
 function queueAttachmentMetadata(input, filePath) {
     const mimeType = input.mimeType?.trim() ?? '';

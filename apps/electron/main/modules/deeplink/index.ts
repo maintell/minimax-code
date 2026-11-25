@@ -16,6 +16,7 @@
  * - minimax://navigate?url=xxx        打开并导航到指定页面
  * - minimax://auth-callback           OAuth 完成后仅唤起应用；凭证仍由 Shared OAuth Core 读取
  * - minimax://workspace/open?path=xxx 以本机目录新建任务（`mcode app`），见 workspace-open.ts
+ * - minimax://plugin/try?name=xxx     回到首页并在输入框 @ 该插件（Chrome 扩展），见 plugin-try.ts
  */
 import * as path from "path";
 import { app } from "electron";
@@ -29,6 +30,7 @@ import { getWindowsOpenFilePaths } from "../dock/windows-file-arguments";
 import { buildSingleInstanceLockKey } from "./single-instance-lock";
 import { isSupportedDeepLinkUrl, parseDeepLink } from "./parse";
 import { WORKSPACE_OPEN_ACTION, rememberWorkspaceOpenRequest, setupWorkspaceOpen } from "./workspace-open";
+import { PLUGIN_TRY_ACTION, rememberPluginTryRequest, setupPluginTry } from "./plugin-try";
 function getProtocolEnvSuffix() {
     const domainUrl = process.env.NEXT_PUBLIC_DOMAIN_URL || '';
     if (isTest ||
@@ -59,6 +61,7 @@ function isDeepLinkUrl(url) {
 // 注册的处理器
 const handlers = new Map([
     [WORKSPACE_OPEN_ACTION, rememberWorkspaceOpenRequest],
+    [PLUGIN_TRY_ACTION, rememberPluginTryRequest],
 ]);
 let deepLinkEventHandlersInstalled = false;
 /**
@@ -75,7 +78,7 @@ async function handleDeepLink(url) {
         return;
     }
     console.log('[DeepLink] Parsed action:', parsed.action, 'params:', Object.keys(parsed.params));
-    // 只有注册了处理器的 action（目前仅 workspace/open）走下面的分支；其他深链保持原有流程。
+    // 只有注册了处理器的 action（workspace/open、plugin/try）走下面的分支；其他深链保持原有流程。
     const handler = handlers.get(parsed.action);
     if (handler) {
         // 在等待处理器之前记录：ready 前到达的深链把建窗交给启动流程。
@@ -169,7 +172,11 @@ export function setupDeepLinkEventHandlers() {
     if (deepLinkEventHandlersInstalled)
         return;
     deepLinkEventHandlersInstalled = true;
+    // Plugin processes inherit this through local-runtime. The Chrome extension bridge passes it on,
+    // so the extension's "Back to MiniMax Code" button wakes exactly this build instead of guessing.
+    process.env.MCODE_APP_SCHEME = PROTOCOL_NAME;
     setupWorkspaceOpen();
+    setupPluginTry();
     app.on('second-instance', (_event, commandLine) => {
         const url = commandLine.find(isDeepLinkUrl);
         if (url) {

@@ -5,9 +5,14 @@ public static class PptxPreviewLimitsV1
 {
     public const string Schema = "mavis.pptx_preview_limits.v1";
     public const string Version = "pptx-preview-limits.v1";
+    public static bool IsStoredMediaEntry(string partUri, int compressionMethod) =>
+        compressionMethod == 0 && partUri.StartsWith("ppt/media/", System.StringComparison.OrdinalIgnoreCase) &&
+        partUri.LastIndexOf('.') > partUri.LastIndexOf('/') + 1 &&
+        System.IO.Path.GetExtension(partUri).ToLowerInvariant() is ".mp4" or ".m4v" or ".mov" or ".webm" or ".avi" or ".wmv" or ".mpg" or ".mpeg" or ".m4a" or ".mp3" or ".wav" or ".ogg" or ".oga" or ".ogv" or ".wma";
     public const long MaxInputBytes = 134217728L;
     public const long MaxEntries = 4000L;
     public const long MaxEntryUncompressedBytes = 33554432L;
+    public const long MaxStoredMediaEntryBytes = 67108864L;
     public const long MaxTotalUncompressedBytes = 268435456L;
     public const long MaxMediaBytes = 201326592L;
     public const long MaxConcurrentEntryReads = 8L;

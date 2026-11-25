@@ -1,7 +1,9 @@
 import { formatSavedPtcScripts } from '@mavis/agent-tools/desktop';
 import { logger } from '../../../infra/logging/logger.js';
+import { readPluginSpawnOrigin } from '@mavis/background-task/local';
 import { scheduleLocalBackgroundTaskDelivery } from './delivery.js';
 import { isTerminalTaskStatus, normalizeTaskError, } from '../../../infra/legacy-db/background-task-contracts.js';
+const THROWN_OUTPUT_PREFIX = 'Background task failed: ';
 /**
  * Single terminal writer for local subagent tasks. Every producer of a subagent
  * completion — background runner, foreground runner and append — routes through
@@ -66,6 +68,10 @@ export async function persistLocalSubagentTaskTerminal(input) {
     return task;
 }
 async function deliverTerminal(host, task, delivery) {
+    if (readPluginSpawnOrigin(task)) {
+        logger.info({ taskId: task.taskId, delivery: 'skipped-plugin-owned' }, 'Plugin-spawned subagent task is not delivered to the main agent');
+        return;
+    }
     if (delivery === 'schedule') {
         scheduleLocalBackgroundTaskDelivery(host, task.taskId);
     }
@@ -82,11 +88,24 @@ async function patchTerminalTaskOutput({ host, taskId, delivery }, outputRef, no
             : {}),
     });
 }
+/**
+ * The final reply inside a subagent's output log: the inverse of the `outputText` written below,
+ * which follows a run that did not succeed with a note, or replaces it when the run threw.
+ */
+export function subagentFinalText(task, outputText) {
+    if (task.status === 'succeeded')
+        return outputText;
+    if (outputText.startsWith(THROWN_OUTPUT_PREFIX))
+        return '';
+    const notes = [...outputText.matchAll(/\n\n\[(?:failed|aborted)\] /gu)];
+    const note = notes.at(-1)?.index;
+    return note === undefined ? outputText : outputText.slice(0, note);
+}
 function toTerminalProjection(result) {
     if (isFailure(result)) {
         return {
             status: 'failed',
-            outputText: `Background task failed: ${failureMessage(result.failure)}`,
+            outputText: `${THROWN_OUTPUT_PREFIX}${failureMessage(result.failure)}`,
             lastError: normalizeTaskError(result.failure, 'TASK_FAILED'),
         };
     }

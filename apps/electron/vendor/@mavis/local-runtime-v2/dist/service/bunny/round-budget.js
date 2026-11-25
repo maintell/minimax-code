@@ -11,15 +11,16 @@ import { BUNNY_AGENT_NAME } from './contracts.js';
  *   before any earlier counted sibling finished share one round, a sub-call
  *   started after a counted sibling finished opens the next round;
  * - only the calls below are free: dispatching (`assignment_create`, also
- *   inside `run_code`), `send_to_user`, creating a task space, and the write
- *   commands for memory, the working-state ledger, schedules, space settings
- *   and context.md.
- *   Finding the command, probing paths or reading anything else for such a
- *   write still counts, a ledger `list` included.
+ *   inside `run_code`), `send_to_user`, and the writes themselves — memory,
+ *   the working-state ledger, schedules, and the coordinator's own space and
+ *   task model writes (`bunny_task_space_create`, `bunny_task_space_update`, `bunny_task_space_context_write`,
+ *   `bunny_task_model_set`).
+ *   Finding the tool, probing paths or reading anything else for such a write
+ *   still counts, a ledger `list` and every space or task model read included.
  *
- * Known approximation: the PTC scheduler runs sequential tools (bash, MCP,
- * mavis, …) one at a time even inside `Promise.all`, so independent calls to
- * such tools inside one `run_code` count as separate rounds.
+ * Known approximation: the PTC scheduler runs sequential tools (bash, MCP, …)
+ * one at a time even inside `Promise.all`, so independent calls to such tools
+ * inside one `run_code` count as separate rounds.
  */
 /**
  * Top-level tools that never count as a round and are never blocked.
@@ -29,27 +30,22 @@ export const BUNNY_UNCOUNTED_TOOLS = Object.freeze([
     'assignment_create',
     'assignment_send',
     'assignment_summary',
+    // Reading a stored verdict is the step before concluding, not a round of work: a wake Turn
+    // that has to claim before it may summarize would otherwise pay for the gate's own bookkeeping.
+    'assignment_claim_verdict',
     'send_to_user',
     'remember',
     'cron_create',
     'cron_update',
     'cron_delete',
     'self_reminder',
-]);
-/**
- * `mavis` sub-commands that are write commands themselves; reads still count.
- * @internal Exported only for focused tests.
- */
-export const BUNNY_UNCOUNTED_MAVIS_COMMANDS = Object.freeze([
-    'space create',
-    'space update',
-    'space context write',
-    'task model set',
-    'cron create',
-    'cron self',
-    'cron once',
-    'cron update',
-    'cron delete',
+    // The coordinator's own writes: the space the user just agreed to, its
+    // settings, context.md, and the task model the user just chose. Their reads
+    // (bunny_task_space_list, bunny_task_space_get, bunny_task_space_context_read, bunny_task_model_list) still count.
+    'bunny_task_space_create',
+    'bunny_task_space_update',
+    'bunny_task_space_context_write',
+    'bunny_task_model_set',
 ]);
 /** `working_state` actions that write the ledger; `list` reads it and counts. */
 const UNCOUNTED_WORKING_STATE_ACTIONS = new Set(['add', 'update', 'close']);
@@ -58,7 +54,6 @@ const BUNNY_REVIEW_ROUND_REMIND_AT = 4;
 const BUNNY_ROUND_BLOCK_AT = 6;
 const DISPATCH_TOOL = 'assignment_create';
 const RUN_CODE_TOOL = 'run_code';
-const MAVIS_TOOL = 'mavis';
 const WORKING_STATE_TOOL = 'working_state';
 /** What the user reads as this Turn's answer; a plain tool row is never one of these. */
 const SEND_TO_USER_TOOL = 'send_to_user';
@@ -73,7 +68,6 @@ const SUMMARY_SCHEMA_VERSION = 2;
  */
 const REVIEW_ROUND_READ_TIMEOUT_MS = 500;
 const uncountedTools = new Set(BUNNY_UNCOUNTED_TOOLS);
-const uncountedMavisCommands = new Set(BUNNY_UNCOUNTED_MAVIS_COMMANDS);
 /**
  * True when one direct tool call (top-level or inside `run_code`) costs a round.
  * @internal Exported only for focused tests.
@@ -83,10 +77,7 @@ export function isBunnyRoundCountedCall(toolName, args) {
         return false;
     if (toolName === WORKING_STATE_TOOL)
         return !UNCOUNTED_WORKING_STATE_ACTIONS.has(argument(args, 'action'));
-    if (toolName !== MAVIS_TOOL)
-        return true;
-    const command = mavisCommand(args);
-    return command === undefined || !uncountedMavisCommands.has(command);
+    return true;
 }
 export function createBunnyRoundBudgetExtension(options = {}) {
     const remindAt = options.remindAtRound ?? BUNNY_ROUND_REMIND_AT;
@@ -294,6 +285,12 @@ function settleCallOutcome(state, toolCallId, isError) {
  * Settles this step's deliveries and conclusions from its tool results, then releases the
  * pending ids. `after_tool_call` settles them first in production; the sweep keeps a step
  * that never reported one from carrying its ids into the next step.
+ *
+ * An id still pending after the results are read is a call that was admitted and produced no
+ * result row at all — the step was interrupted, stopped or faulted before it ran. It is
+ * dropped, never counted: `deliveredSendToUser` and `concludedSummaries` mean "settled as a
+ * success", and counting an unknown outcome as a delivery both contradicts that and suppresses
+ * the concluded-without-delivery follow-up exactly when the outcome is least known.
  */
 function settleStepToolResults(state, toolResults) {
     for (const item of toolResults) {
@@ -301,9 +298,7 @@ function settleStepToolResults(state, toolResults) {
         if (typeof id === 'string')
             settleCallOutcome(state, id, argument(item, 'isError') === true);
     }
-    state.deliveredSendToUser += state.pendingDeliveries.size;
     state.pendingDeliveries.clear();
-    state.concludedSummaries += state.pendingSummaries.size;
     state.pendingSummaries.clear();
 }
 function isStoppedByFault(message) {
@@ -491,13 +486,6 @@ function toolCalls(message) {
 }
 function argument(args, name) {
     return typeof args === 'object' && args !== null ? Reflect.get(args, name) : undefined;
-}
-function mavisCommand(args) {
-    const command = argument(args, 'command');
-    if (typeof command !== 'string')
-        return undefined;
-    const normalized = command.trim().split(/\s+/).join(' ');
-    return normalized.length > 0 ? normalized : undefined;
 }
 function turnKey(ctx) {
     return `${ctx.sessionId}\u0000${ctx.turnId}`;

@@ -8,6 +8,7 @@
  */
 export { UploadMediaType, MessageType, MessageItemType, MessageState, TypingStatus, } from './ilink-types.js';
 export { setIlinkFetch } from './ilink-fetch.js';
+export { parseIlinkJson } from './ilink-wire.js';
 // Client
 export { ILinkClient } from './ilink-client.js';
 // Auth

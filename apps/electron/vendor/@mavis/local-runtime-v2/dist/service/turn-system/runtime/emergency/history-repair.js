@@ -1,7 +1,8 @@
-import { CanonicalHistoryRepairError, isUserMessageId } from '../../../session-system/index.js';
-import { prepareSteeringTeardownCanonicalInput } from '../../agent-host/assembly/local-turn-input-preparation.js';
-import { prepareLocalInlineMedia, } from '../../agent-host/preparation/inline-media.js';
-import { forgetToolSearchAnnouncements } from '../../agent-host/tools/tool-search.js';
+import { readFile } from 'node:fs/promises';
+import { CanonicalHistoryRepairError, isUserMessageId, sessionIsCoordinator, } from '../../../session-system/index.js';
+import { forgetToolSearchAnnouncements } from '@mavis/agent-tools/mcp-disclosure';
+import { forgetSkillCatalogAnnouncements } from '@mavis/agent-tools/skill-catalog-window';
+import { prepareLocalInlineMedia, prepareSteeringTeardownCanonicalInput, } from '@mavis/harness';
 import { resolveGenuineUserQueryText, resolveMessageAuthorship, } from '../../execution/message-query-authorship.js';
 /** Display rows of user input that never reached the conversation (spec 4.3). */
 const UNDELIVERED_KINDS = new Set(['input_rejected', 'undelivered_user']);
@@ -10,6 +11,8 @@ const UNDELIVERED_KINDS = new Set(['input_rejected', 'undelivered_user']);
  * still wants a fingerprint, and without one keeps only the words.
  */
 const RECALL_ROUTING_FINGERPRINT = 'bunny-history-repair';
+/** The display keeps a user's image as a file on this machine; a recall reads it here. */
+const DISPLAY_FILES = { readFile: (path) => readFile(path) };
 /**
  * Spec 6.2: the canonical history provider backs the corrupt file up and
  * keeps its longest valid prefix, or rolls back to the newest snapshot; the
@@ -20,19 +23,24 @@ export function createHistoryRepair(sessions, getImageEncoding) {
     return {
         repair: async (sessionId, { turnId }) => {
             try {
+                // A recalled peer message carries the reply note, and a coordinator's
+                // catalog hides session_send, so the note has to be the coordinator's.
+                const coordinator = await sessionIsCoordinator(sessions, sessionId);
                 const repair = await sessions.canonicalHistory.repairCorrupted(sessionId, {
                     recall: (kept) => recallUnreplied(sessions.repositories.messages, {
                         sessionId,
                         turnId,
                         keptIds: kept.messageIds,
                         encoding: getImageEncoding?.(),
+                        coordinator,
                     }),
                 });
                 if (!repair)
                     return { status: 'intact' };
-                // The cut user messages may have carried Tool Search announcements; the
-                // recalled ones are rebuilt from the visible text and carry none.
+                // The cut user messages may have carried Tool Search or skill availability
+                // updates; the recalled ones are rebuilt from the visible text and carry none.
                 forgetToolSearchAnnouncements(sessionId);
+                forgetSkillCatalogAnnouncements(sessionId);
                 const { backupFile, kind, removedCount, keptCount, recalledCount, reason } = repair;
                 return {
                     status: 'repaired',
@@ -74,7 +82,7 @@ async function recallUnreplied(messages, input) {
         const user = usersOwnMessage(row, input.turnId, kept);
         if (!user)
             continue;
-        const message = await recalledMessage(row, user.provenance, input.encoding);
+        const message = await recalledMessage(row, user.provenance, input.encoding, input.coordinator);
         recalled.push({ messageId: user.messageId, turnId: user.turnId, message });
     }
     return recalled;
@@ -115,14 +123,18 @@ function recallable(row, messageId, kept) {
         !kept.has(messageId) &&
         !UNDELIVERED_KINDS.has(row.kind ?? ''));
 }
-async function recalledMessage(row, provenance, encoding) {
+async function recalledMessage(row, provenance, encoding, coordinator) {
     const text = stringField(row, 'editContent') ?? stringField(row, 'msg_content') ?? '';
     const attachments = await Promise.all((Array.isArray(row.attachments) ? row.attachments : []).flatMap((value) => {
         const attachment = inputAttachment(value);
         return attachment ? [inlineRecalledImage(attachment, encoding)] : [];
     }));
     const message = { text, ...(attachments.length > 0 ? { attachments } : {}) };
-    const canonical = prepareSteeringTeardownCanonicalInput({ message, provenance });
+    const canonical = prepareSteeringTeardownCanonicalInput({
+        message,
+        provenance,
+        receiverIsCoordinator: coordinator,
+    });
     return {
         role: 'user',
         content: [{ type: 'text', text: canonical.text }, ...canonical.attachments],
@@ -142,7 +154,7 @@ async function inlineRecalledImage(attachment, encoding) {
         return attachment;
     const candidate = { key: filePath, id: filePath, mime: mimeType, sizeBytes: 0, filePath };
     try {
-        const media = await prepareLocalInlineMedia([candidate], { support_image: true }, encoding);
+        const media = await prepareLocalInlineMedia([candidate], { support_image: true }, encoding, DISPLAY_FILES);
         const image = media.attachments[0];
         return image?.type === 'image'
             ? { ...attachment, dataUrl: `data:${image.mimeType};base64,${image.data}` }

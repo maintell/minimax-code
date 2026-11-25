@@ -47,8 +47,9 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     }
     return useValue ? value : void 0;
 };
-import { bindTool } from '@mavis/agent-core/tools';
+import { bindTool, withProgrammaticResult, } from '@mavis/agent-core/tools';
 import { ThinkingLevel } from '@mavis/protocol';
+import { isPtcChildCall } from '../../desktop/output-limit.js';
 import { normalizeMavisCommand } from '../../shared/mavis-operation-classifier.js';
 import { isMavisTeamCommand, teamDisabledFailure } from './commands/team.js';
 import { dispatchDofld } from './dispatcher.js';
@@ -73,6 +74,9 @@ let DofldTool = (() => {
             this.deps = deps;
         }
         async execute(ctx, input, signal) {
+            return withMavisChildData(ctx, await this.dispatch(ctx, input, signal));
+        }
+        async dispatch(ctx, input, signal) {
             const normalized = normalizeMavisCommand(input.command);
             // Trusted session policy wins before every compatibility redirect and the
             // command whitelist, so a disabled session always gets a stable TEAM_DISABLED.
@@ -90,7 +94,9 @@ let DofldTool = (() => {
                     error: {
                         kind: 'validation',
                         code: 'SESSION_TOOL_MOVED',
-                        message: 'Search for session_* with tool_search, then call mcp_invoke.',
+                        message: isCallableInRunCode(ctx, 'session_list')
+                            ? SESSION_TOOLS_RUN_CODE
+                            : SESSION_TOOLS_MCP_INVOKE,
                     },
                 });
                 return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
@@ -112,7 +118,9 @@ let DofldTool = (() => {
                     ok: false,
                     error: {
                         code: 'CRON_TOOL_MOVED',
-                        message: 'Use self_reminder for task follow-up; discover Cron CRUD through tool_search and execute through mcp_invoke.',
+                        message: isCallableInRunCode(ctx, 'cron_read')
+                            ? 'Use self_reminder for task follow-up. Search for cron_create, cron_read, cron_update or cron_delete with tool_search, then call the chosen tool inside run_code, e.g. await tools.cron_read(args).'
+                            : 'Use self_reminder for task follow-up; discover Cron CRUD through tool_search and execute through mcp_invoke.',
                     },
                 });
                 return { tool_name: 'mavis', text, content: [{ type: 'text', text }], isError: true };
@@ -147,12 +155,74 @@ let DofldTool = (() => {
                 ...(this.deps.teamRuntime ? { teamRuntime: this.deps.teamRuntime } : {}),
                 ...(teamDisabled ? { teamDisabled: true } : {}),
             }, input.command, input.args, signal);
-            return toToolResult(output);
+            return toToolResult(withRunCodeSessionHelp(ctx, command, output));
         }
     };
     return DofldTool = _classThis;
 })();
 export { DofldTool };
+/** session_* 的恢复提示。非 PTC 回合逐字保持原文案；help.ts 的 session help 摘要也含前一句。 */
+const SESSION_TOOLS_MCP_INVOKE = 'Search for session_* with tool_search, then call mcp_invoke.';
+const SESSION_TOOLS_RUN_CODE = 'Search for session_* with tool_search, then call the chosen tool inside run_code, e.g. await tools.session_list(args).';
+/**
+ * 本轮是 PTC 回合、且这个按需工具是 run_code 子工具时为 true（同桌面 local-mavis
+ * `isCallableInRunCode`）。这时 mcp_invoke 不路由它，写着 "call mcp_invoke" 的恢复提示会把模型
+ * 引向一次失败调用。ptcExecutor 只认本轮 ptcTools，非 PTC 回合恒为 false，原文案不变。
+ */
+function isCallableInRunCode(ctx, toolName) {
+    return ctx.ptcExecutor?.getToolExecutionMode(toolName) !== undefined;
+}
+/** PTC 回合的 `session help`：摘要里的 mcp_invoke 一句换成 run_code 写法，其余字段不动。 */
+function withRunCodeSessionHelp(ctx, command, output) {
+    if (!output.ok || command !== 'session help' || !isCallableInRunCode(ctx, 'session_list')) {
+        return output;
+    }
+    const response = output.response;
+    if (response === null || typeof response !== 'object')
+        return output;
+    const summary = response.summary;
+    if (typeof summary !== 'string' || !summary.includes(SESSION_TOOLS_MCP_INVOKE))
+        return output;
+    return {
+        ...output,
+        response: {
+            ...response,
+            summary: summary.replace(SESSION_TOOLS_MCP_INVOKE, SESSION_TOOLS_RUN_CODE),
+        },
+    };
+}
+/**
+ * PTC 子调用的旁路数据：`r.data` 就是 `r.output` 序列化出来的那个对象本身，
+ * 模型看到的 text 与 details 一字不改。run_code 说明给每个 mavis_* 子工具声明
+ * `MavisData`，并附 `PTC_MAVIS_RUN_CODE_NOTE` 说明 r.data 与 r.output 是同一个
+ * 对象的完整内容；云端此前没有这条旁路，程序里拿到的是 `data:{}`。
+ *
+ * 只给 run_code 子调用：顶层 mavis 不带 parentToolCallId，行为不变。text 解析失败
+ * 或不是对象时不附数据，结果照原样返回。
+ */
+function withMavisChildData(ctx, result) {
+    if (!isPtcChildCall(ctx))
+        return result;
+    const data = readMavisData(result.text);
+    // Completeness: toToolResult serializes the whole command output with no
+    // head+tail preview and no token cap, so a readable data object means the
+    // text is the complete output. Desktop cuts mavis only through its
+    // limitLocalManagementOutput head+tail, which the cloud tool never applies.
+    return data
+        ? withProgrammaticResult(result, { data, completeness: { truncated: false } })
+        : result;
+}
+function readMavisData(text) {
+    try {
+        const parsed = JSON.parse(text);
+        return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? parsed
+            : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
 /**
  * 冻结当前 Turn 的模型与思考选择。档位只有 runtime 知道，archon-server
  * 无法事后恢复；未设置 thinking_level 时不写 variant，交给服务端继承。
@@ -174,5 +244,5 @@ export function currentCloudCronModel(ctx) {
     const effort = model.thinking_effort?.trim();
     return { ...selection, variant: 'thinking', ...(effort ? { thinking: { effort } } : {}) };
 }
-export { CLOUD_MAVIS_COMMANDS, MavisBaseToolDef, MavisBaseToolDefWithoutTeam, } from './mavis-tool-def.js';
+export { CLOUD_MAVIS_COMMANDS, createMavisBaseToolDef, MavisBaseToolDef, MavisBaseToolDefWithoutTeam, } from './mavis-tool-def.js';
 //# sourceMappingURL=index.js.map

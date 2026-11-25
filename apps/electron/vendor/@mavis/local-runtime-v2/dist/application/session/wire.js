@@ -1,6 +1,6 @@
 import { SessionKind as DesktopSessionKind, SessionInteractionModeView, SessionStatusView, SessionTypeView, } from '@mavis/thrift-gen/generated/desktop-service/types';
 import { logger } from '@mavis/shared/local-runtime-logging';
-import { CURRENT_SESSION_DATA_VERSION, effectiveSessionMemoryPolicy, isConversationMutationEligibleSession, } from '../../service/session-system/index.js';
+import { CURRENT_SESSION_DATA_VERSION, effectiveSessionMemoryPolicy, isConversationMutationEligibleSession, worktreeCleanupView, } from '../../service/session-system/index.js';
 import { advisorSelectionToView } from './model-provider-advisor.js';
 const SESSION_KIND_TO_DESKTOP = {
     unknown: DesktopSessionKind.Unknown,
@@ -238,6 +238,7 @@ function toRunLocationView(location) {
         ...(location.resolvedBranch ? { resolvedBranch: location.resolvedBranch } : {}),
         ...(location.parentRepoDir ? { parentRepoDir: location.parentRepoDir } : {}),
         createdAt: location.createdAt,
+        ...worktreeCleanupView(location),
     };
 }
 //# sourceMappingURL=wire.js.map

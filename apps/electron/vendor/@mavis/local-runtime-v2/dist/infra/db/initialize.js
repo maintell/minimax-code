@@ -15,6 +15,7 @@ import { resolveAgentBashEnvPolicy } from '../process/ensure-rm-shim.js';
 import { repairCronSessionResourcesVersionCollision } from './migrations/cron/migration-0033-repair-cron-session-resources-version-collision.js';
 import { recoverLegacySessionRecordsBeforeBackfill } from './legacy-session-recovery.js';
 import { recoverProjectPreferencesBeforeBackfill, recoverSessionProjectMetadataBeforeRepair, } from './project-migration-recovery.js';
+import { repairTurnIngressAllocatorHighWater, } from './turn-ingress-allocator-recovery.js';
 // Startup reporting over the result belongs to the initializer's surface, so
 // the runtime composition root keeps depending on this module only.
 export { databaseInitializationTimingFields, migrationSafeModeWarning, } from './initialization-report.js';
@@ -110,6 +111,7 @@ export async function initializeDatabase(options) {
             skipVersions,
             quarantineCandidates,
         });
+        const turnIngressAllocator = repairTurnIngressAllocatorWithoutBlockingStartup(options.database);
         const migrationsMs = Math.max(0, Date.now() - migrationsStartedAtMs);
         // --- Quarantine persistence + safe-mode schema ensure ----------------------
         const supersededMigrations = quarantineCandidates.length > 0
@@ -143,6 +145,7 @@ export async function initializeDatabase(options) {
             degradedLegacySessionCount: sessionRecovery.degradedCount,
             recoveredProjectPreferenceCount,
             skippedSessionProjectRepairCount,
+            ...turnIngressAllocator,
             supersededMigrations,
             safeMode: schemaSafety.safeMode,
             schemaSnapshotErrorCount: schemaSafety.snapshotErrorCount,
@@ -317,6 +320,25 @@ function tableHasColumns(database, tableName, columnNames) {
         ? [row.name]
         : []));
     return columnNames.every((columnName) => columns.has(columnName));
+}
+/**
+ * Version 8 enforced the allocator invariant once; re-checking it on every
+ * boot keeps a lagging allocator from making every Turn admission collide
+ * forever. The repair is a safety net, not a migration: SQLITE_BUSY from
+ * another runtime holding the shared dataDir's write lock, or a corrupt file,
+ * degrades to a startup warning instead of keeping the whole Runtime (and the
+ * Session history it serves) down; only Turn admission stays affected, as it
+ * was before the repair existed. A failed repair rolls back and retries on the
+ * next boot.
+ */
+function repairTurnIngressAllocatorWithoutBlockingStartup(database) {
+    try {
+        const repaired = repairTurnIngressAllocatorHighWater(database);
+        return repaired ? { repairedTurnIngressAllocator: repaired } : {};
+    }
+    catch (error) {
+        return { turnIngressAllocatorRepairError: describeError(error) };
+    }
 }
 function describeError(error) {
     return error instanceof Error ? error.message : String(error);

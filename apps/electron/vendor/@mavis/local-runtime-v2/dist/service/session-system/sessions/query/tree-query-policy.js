@@ -12,6 +12,27 @@ export function sessionTreeFilterFromRequest(request, includeHidden) {
         ...literalPurposeFilters(request, includeKind, excludeKind),
     };
 }
+/**
+ * The Session filter every project surface uses: the sidebar's project list, the
+ * sidebar's own archive and the `project_archive_sessions` Agent tool.
+ *
+ * Projects include Cron roots because they are user-visible tasks associated
+ * with a workspace. Ordinary conversation lists still exclude Cron's internal
+ * execution tree through their default Session filter.
+ *
+ * It lives beside `sessionTreeFilterFromRequest` rather than in the Project
+ * Application so the sidebar tools service can select the same chats without
+ * reaching up into `application/`.
+ */
+export function projectSessionFilter(request) {
+    const { excludeSessionKinds, ...filter } = sessionTreeFilterFromRequest(request, false);
+    const excluded = excludeSessionKinds?.filter((kind) => kind !== 'cron');
+    return {
+        ...filter,
+        excludeInternalTreeSessions: false,
+        ...(excluded?.length ? { excludeSessionKinds: excluded } : {}),
+    };
+}
 function mapPurposePrefix(prefix) {
     return prefix ? sessionKindForLegacyPurposePrefix(prefix) : undefined;
 }

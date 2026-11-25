@@ -3,20 +3,28 @@ import path from "node:path";
 import electronLog from "electron-log";
 import { PAGE_URLS } from "../config/routes";
 import { DEFAULT_SECURE_WEB_PREFERENCES, registerTransparentWindow } from "./utils";
-import { isModelMenuActionAllowed, positionModelMenu } from "./model-menu-layout";
+import { isValidModelMenuCard, withRenderableModelMenu, isModelMenuActionAllowed, positionResizingModelMenu } from "./model-menu-layout";
+import { isValidModelMenuAdvisor } from "./model-menu-advisor";
 import { scheduleArchonMiniChatBlur } from "./archonMiniChatWindow";
+import { MAX_MODEL_MENU_ROWS, MAX_MODEL_MENU_TOOLTIP_LENGTH } from "./model-menu-limits";
 const CHANNEL = 'model-menu-popup';
 function validatePresentation(data) {
     if (!data ||
         (data.kind !== undefined &&
             !['asr-device', 'panel-add', 'browser-more', 'panel-tabs'].includes(data.kind)) ||
         !Array.isArray(data.rows) ||
-        data.rows.length > 500 ||
+        data.rows.length > MAX_MODEL_MENU_ROWS ||
         typeof data.locale !== 'string' ||
         typeof data.fontFamily !== 'string' ||
         !data.tokens ||
         typeof data.tokens !== 'object' ||
         JSON.stringify(data).length > 256000 ||
+        (data.modelHints !== undefined &&
+            (data.kind !== undefined ||
+                !data.modelHints ||
+                typeof data.modelHints !== 'object' ||
+                Array.isArray(data.modelHints) ||
+                Object.values(data.modelHints).some((value) => typeof value !== 'string'))) ||
         (data.search !== undefined &&
             (data.kind !== undefined ||
                 !data.search ||
@@ -24,6 +32,9 @@ function validatePresentation(data) {
                 typeof data.search.emptyLabel !== 'string' ||
                 data.search.placeholder.length > 100 ||
                 data.search.emptyLabel.length > 100)) ||
+        (data.card !== undefined && (data.kind !== undefined || !isValidModelMenuCard(data.card))) ||
+        (data.advisor !== undefined &&
+            (data.kind !== undefined || !isValidModelMenuAdvisor(data.advisor))) ||
         (data.panelAdd !== undefined &&
             (data.kind !== 'panel-add' ||
                 !data.panelAdd ||
@@ -40,6 +51,13 @@ function validatePresentation(data) {
             (row.unread !== undefined && typeof row.unread !== 'boolean') ||
             (row.separatorBefore !== undefined && typeof row.separatorBefore !== 'boolean') ||
             (row.description !== undefined && typeof row.description !== 'string') ||
+            (row.hint !== undefined && typeof row.hint !== 'string') ||
+            (row.access !== undefined &&
+                (data.kind !== undefined || !['limited', 'upgrade'].includes(row.access))) ||
+            (row.tooltip !== undefined &&
+                (data.kind !== undefined ||
+                    typeof row.tooltip !== 'string' ||
+                    row.tooltip.length > MAX_MODEL_MENU_TOOLTIP_LENGTH)) ||
             (row.shortcut !== undefined && typeof row.shortcut !== 'string') ||
             (row.icon !== undefined &&
                 ![
@@ -51,6 +69,7 @@ function validatePresentation(data) {
                     'changes',
                     'sidechat',
                     'ppt',
+                    'overview',
                 ].includes(row.icon)) ||
             (row.zoom !== undefined &&
                 (data.kind !== 'browser-more' ||
@@ -65,6 +84,18 @@ function validatePresentation(data) {
                     !row.effort.options.every((value) => typeof value === 'string'))))) {
         throw new TypeError('Invalid model menu presentation');
     }
+}
+/**
+ * A card the popup cannot render falls back to the list, and an advisor row it cannot render is
+ * left out, rather than closing the menu.
+ */
+function renderablePresentation(data) {
+    const presentation = withRenderableModelMenu(data);
+    if (presentation.card === undefined && data.card !== undefined)
+        electronLog.warn('[ModelMenuPopup] Invalid composer card; showing the list');
+    if (presentation.advisor === undefined && data.advisor !== undefined)
+        electronLog.warn('[ModelMenuPopup] Invalid composer advisor row; showing the menu without it');
+    return presentation;
 }
 function getOwner(event, menuPageRequired = true) {
     const owner = BrowserWindow.fromWebContents(event.sender);
@@ -121,6 +152,7 @@ export function setupModelMenuPopupIPC() {
                 ? {
                     id: entry.request.id,
                     presentation: entry.request.presentation,
+                    direction: entry.request.direction,
                     // Reserve shadow padding (32 DIP) plus 1 DIP for integer window rounding.
                     maxWidth: Math.max(1, (area.width - 33) / zoom / 2),
                     maxHeight: Math.max(1, Math.min(area.height - 33, entry.request.presentation.kind === 'panel-tabs'
@@ -175,7 +207,9 @@ export function setupModelMenuPopupIPC() {
             ready: false,
             measured: false,
             menuBounds: undefined,
+            overlayBounds: undefined,
             submenuBounds: undefined,
+            childBounds: undefined,
             openTimeout: undefined,
             idleTimeout: undefined,
             close: (restoreFocus = false, error = false) => {
@@ -185,7 +219,9 @@ export function setupModelMenuPopupIPC() {
                     return;
                 entry.request = undefined;
                 entry.menuBounds = undefined;
+                entry.overlayBounds = undefined;
                 entry.submenuBounds = undefined;
+                entry.childBounds = undefined;
                 if (!popup.isDestroyed())
                     popup.hide();
                 sendState(entry);
@@ -230,7 +266,10 @@ export function setupModelMenuPopupIPC() {
                 point.x < rect.x + rect.width &&
                 point.y >= rect.y &&
                 point.y < rect.y + rect.height);
-            return contains(entry.menuBounds) || contains(entry.submenuBounds);
+            return (contains(entry.menuBounds) ||
+                contains(entry.overlayBounds) ||
+                contains(entry.submenuBounds) ||
+                contains(entry.childBounds));
         };
         // ponytail: close on geometry changes; continuous tracking can be added if product needs it.
         const ownerEvents = [
@@ -354,6 +393,8 @@ export function setupModelMenuPopupIPC() {
             !['start', 'end'].includes(request.align)) {
             throw new TypeError('Invalid model menu request');
         }
+        // The request is this IPC call's own deserialized copy.
+        request.presentation = renderablePresentation(request.presentation);
         validatePresentation(request.presentation);
         if (!scopeAllows(owner, request)) {
             owner.webContents.send(`${CHANNEL}:event`, {
@@ -369,7 +410,9 @@ export function setupModelMenuPopupIPC() {
         clearTimeout(entry.idleTimeout);
         entry.measured = false;
         entry.menuBounds = undefined;
+        entry.overlayBounds = undefined;
         entry.submenuBounds = undefined;
+        entry.childBounds = undefined;
         entry.request = request;
         clearTimeout(entry.openTimeout);
         entry.openTimeout = setTimeout(() => {
@@ -388,8 +431,9 @@ export function setupModelMenuPopupIPC() {
             if (kind === 'close')
                 entry.close();
             if (kind === 'update' && data) {
-                validatePresentation(data);
-                entry.request.presentation = data;
+                const presentation = renderablePresentation(data);
+                validatePresentation(presentation);
+                entry.request.presentation = presentation;
                 sendState(entry);
             }
         }
@@ -443,18 +487,37 @@ export function setupModelMenuPopupIPC() {
             const zoom = entry.owner.webContents.getZoomFactor();
             const screenAnchor = getScreenAnchor(entry.owner, entry.request.anchor);
             const area = screen.getDisplayMatching(screenAnchor).workArea;
-            const geometry = positionModelMenu({ ...screenAnchor, x: screenAnchor.x + (entry.request.horizontalOffset ?? 0) * zoom }, entry.request.direction, entry.request.align, {
+            const fromHeight = measured.menu.fromHeight;
+            const geometry = positionResizingModelMenu({ ...screenAnchor, x: screenAnchor.x + (entry.request.horizontalOffset ?? 0) * zoom }, entry.request.direction, entry.request.align, {
                 menu: { width: measured.menu.width * zoom, height: measured.menu.height * zoom },
+                ...(measured.overlay
+                    ? {
+                        overlay: {
+                            width: measured.overlay.width * zoom,
+                            height: measured.overlay.height * zoom,
+                            bottomInset: measured.overlay.bottomInset * zoom,
+                        },
+                    }
+                    : {}),
                 ...(measured.submenu
                     ? {
                         submenu: {
                             width: measured.submenu.width * zoom,
                             height: measured.submenu.height * zoom,
                             top: measured.submenu.top * zoom,
+                            ...(measured.submenu.child
+                                ? {
+                                    child: {
+                                        width: measured.submenu.child.width * zoom,
+                                        height: measured.submenu.child.height * zoom,
+                                        top: measured.submenu.child.top * zoom,
+                                    },
+                                }
+                                : {}),
                         },
                     }
                     : {}),
-            }, area,
+            }, fromHeight === undefined ? undefined : fromHeight * zoom, area,
             // A panel can reach the display edge. Keep its 8 CSS-pixel inset
             // instead of shifting the menu left to fit the default shadow gutter.
             entry.request.presentation.kind === 'panel-tabs' ||
@@ -467,14 +530,35 @@ export function setupModelMenuPopupIPC() {
                 width: measured.menu.width * zoom,
                 height: measured.menu.height * zoom,
             };
-            entry.submenuBounds = measured.submenu && geometry.layout.submenu
-                ? {
-                    x: geometry.bounds.x + geometry.layout.submenu.x,
-                    y: geometry.bounds.y + geometry.layout.submenu.y,
-                    width: measured.submenu.width * zoom,
-                    height: measured.submenu.height * zoom,
-                }
-                : undefined;
+            entry.overlayBounds =
+                measured.overlay && geometry.layout.overlay
+                    ? {
+                        x: geometry.bounds.x + geometry.layout.overlay.x,
+                        y: geometry.bounds.y + geometry.layout.overlay.y,
+                        width: measured.overlay.width * zoom,
+                        height: measured.overlay.height * zoom,
+                    }
+                    : undefined;
+            entry.submenuBounds =
+                measured.submenu && geometry.layout.submenu
+                    ? {
+                        x: geometry.bounds.x + geometry.layout.submenu.x,
+                        y: geometry.bounds.y + geometry.layout.submenu.y,
+                        width: measured.submenu.width * zoom,
+                        height: measured.submenu.height * zoom,
+                    }
+                    : undefined;
+            const child = measured.submenu?.child;
+            const childLayout = geometry.layout.submenu?.child;
+            entry.childBounds =
+                child && childLayout
+                    ? {
+                        x: geometry.bounds.x + childLayout.x,
+                        y: geometry.bounds.y + childLayout.y,
+                        width: child.width * zoom,
+                        height: child.height * zoom,
+                    }
+                    : undefined;
             entry.popup.setBounds(geometry.bounds, false);
             entry.measured = true;
             const layout = geometry.layout;
@@ -482,6 +566,11 @@ export function setupModelMenuPopupIPC() {
                 width: layout.width / zoom,
                 height: layout.height / zoom,
                 menu: { x: layout.menu.x / zoom, y: layout.menu.y / zoom },
+                menuHeight: measured.menu.height,
+                ...(Number.isSafeInteger(measured.sequence) ? { sequence: measured.sequence } : {}),
+                ...(layout.overlay
+                    ? { overlay: { x: layout.overlay.x / zoom, y: layout.overlay.y / zoom } }
+                    : {}),
                 ...(entry.request.presentation.kind === 'panel-tabs'
                     ? {
                         trigger: {
@@ -493,7 +582,20 @@ export function setupModelMenuPopupIPC() {
                     }
                     : {}),
                 ...(layout.submenu
-                    ? { submenu: { x: layout.submenu.x / zoom, y: layout.submenu.y / zoom } }
+                    ? {
+                        submenu: {
+                            x: layout.submenu.x / zoom,
+                            y: layout.submenu.y / zoom,
+                            ...(layout.submenu.child
+                                ? {
+                                    child: {
+                                        x: layout.submenu.child.x / zoom,
+                                        y: layout.submenu.child.y / zoom,
+                                    },
+                                }
+                                : {}),
+                        },
+                    }
                     : {}),
             });
         }

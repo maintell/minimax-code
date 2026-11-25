@@ -9,6 +9,7 @@ import { filterBindings, migratedMethodsForHost, } from './routing/allowlist.js'
 import { makeBindings } from './routing/bindings.gen.js';
 import { withMcpRequestParseErrorPolicy } from './routing/mcp-request-policy.js';
 import { withModelProviderResponsePolicy } from './routing/model-provider-response-policy.js';
+import { withPluginExtensionRequestParseErrorPolicy } from './routing/plugin-extension-request-policy.js';
 import { withPreferenceRequestParseErrorPolicy } from './routing/preference-request-policy.js';
 import { mountProviderAuthRoutes } from './routing/provider-auth.js';
 import { abortAllComputerUse, snapshotComputerUseState, } from '../service/computer-use/index.js';
@@ -16,6 +17,7 @@ import { mountWorkspaceHtmlPreviewRoutes } from './routing/workspace-html-previe
 import { mountBrowserTurnContextRoutes } from './routing/browser-turn-context.js';
 import { mountQuotaAutoResumeWakeRoute, } from './routing/quota-auto-resume-wake.js';
 import { mountChannelCompatRoutes } from './routing/channel-compat.js';
+import { mountSidebarSectionsRoutes } from './routing/sidebar-sections.js';
 import { mountBunnyMemoryDebugRoutes } from './routing/bunny-memory-debug.js';
 import { mountBunnyDebugRoutes } from './routing/bunny-debug.js';
 export { createV2AgentRuntimeManagementPort } from './controllers/agent-runtime-port.js';
@@ -59,7 +61,7 @@ export function createLocalRuntimeV2FrontDoor(deps) {
 }
 function createFrontDoorAppDeps(deps, controllers, ownerCapabilities) {
     return {
-        bindings: filterBindings(withPreferenceRequestParseErrorPolicy(withModelProviderResponsePolicy(withMcpRequestParseErrorPolicy(withMiniAppLaunchpadRequestParseErrorPolicy(makeBindings(controllers))))), migratedMethodsForHost(ownerCapabilities)),
+        bindings: filterBindings(withPluginExtensionRequestParseErrorPolicy(withPreferenceRequestParseErrorPolicy(withModelProviderResponsePolicy(withMcpRequestParseErrorPolicy(withMiniAppLaunchpadRequestParseErrorPolicy(makeBindings(controllers)))))), migratedMethodsForHost(ownerCapabilities)),
         logger: deps.logger,
         metrics: deps.metrics,
         forceLegacy: () => false,
@@ -71,6 +73,8 @@ function createFrontDoorAppDeps(deps, controllers, ownerCapabilities) {
         bunnyDebug: deps.services?.bunnyDebug,
         ...(deps.services?.modelSystem?.oauth ? { codexOAuth: deps.services.modelSystem.oauth } : {}),
         ...(deps.services?.agentFavorites ? { agentFavorites: deps.services.agentFavorites } : {}),
+        ...(deps.services?.sidebarTools ? { sidebarTools: deps.services.sidebarTools } : {}),
+        ...(deps.services?.uiRequestBroker ? { uiRequests: deps.services.uiRequestBroker } : {}),
         ...(deps.services?.quotaAutoResume ? { quotaAutoResume: deps.services.quotaAutoResume } : {}),
         ...(deps.onLegacyFallback ? { onLegacyFallback: deps.onLegacyFallback } : {}),
         ...(deps.computerUseClient ? { computerUseClient: deps.computerUseClient } : {}),
@@ -107,6 +111,7 @@ export function ownerCapabilitiesForServices(services) {
         llmContextInspector: Boolean(services?.llmContextInspector),
         preference: Boolean(services?.composerSendBehavior),
         agentShell: Boolean(services?.agentShell),
+        mergeRequest: Boolean(services?.mergeRequest),
         sandbox: Boolean(services?.sandbox),
         globalInstructions: Boolean(services?.globalInstructions),
         // Channel routes mount only where the channel owner is really assembled
@@ -184,6 +189,39 @@ function buildApp(deps) {
             ? body.agents.filter((value) => typeof value === 'string')
             : [];
         return c.json({ agents: await deps.agentFavorites.put(agents) });
+    });
+    mountSidebarSectionsRoutes(app, {
+        ...(deps.sidebarTools ? { sections: deps.sidebarTools.sections } : {}),
+    });
+    // The UI's reply to one `ui.request`. Hand-written like the starred-agents
+    // routes above: it is a renderer callback, not a DesktopService method, so
+    // it stays out of the IDL. Only the first reply settles the request.
+    app.post('/mavis/api/ui-requests/:requestId/reply', async (c) => {
+        if (!deps.uiRequests) {
+            return c.json({
+                code: 503,
+                key: 'UI_REQUESTS_UNAVAILABLE',
+                message: 'UI requests are unavailable on this runtime host',
+            }, 503);
+        }
+        // Only this machine's own window may answer: the request asks the local UI
+        // to do something, and its result goes straight back into an Agent tool
+        // result. A Remote Control caller that learned a requestId must not be able
+        // to settle it first and decide what the tool reports.
+        if (isRemoteControlRequest(c.req.raw.headers)) {
+            return c.json({
+                code: 403,
+                key: 'UI_REQUEST_REPLY_FORBIDDEN',
+                message: 'A ui.request can only be answered by the local desktop window',
+            }, 403);
+        }
+        const requestId = c.req.param('requestId');
+        const body = await readJsonObject(c.req.raw);
+        const acceptance = deps.uiRequests.reply(requestId, toUiRequestReply(body));
+        if (acceptance === 'unknown') {
+            return c.json({ accepted: false, reason: 'unknown' }, 404);
+        }
+        return c.json({ accepted: acceptance === 'accepted', reason: acceptance });
     });
     app.all('/mavis/api/preferences/*', (c) => {
         const method = c.req.method.toUpperCase();
@@ -265,6 +303,36 @@ function mountComputerUseRoutes(app, client) {
         client.release?.();
         return c.json({ ok: true, aborted });
     });
+}
+/**
+ * Marks a request the Remote Control bridge forwarded from a paired controller.
+ * Set by `@mavis/remote-control-bridge`'s command router; the same header is
+ * read in `service/workspace/files/file-content.ts`.
+ */
+const RC_REQUEST_SOURCE_HEADER = 'X-MCode-Request-Source';
+const RC_REQUEST_SOURCE_VALUE = 'remote-control';
+/** Whether this request came in over Remote Control rather than from this machine. */
+function isRemoteControlRequest(headers) {
+    return headers.get(RC_REQUEST_SOURCE_HEADER) === RC_REQUEST_SOURCE_VALUE;
+}
+/**
+ * The UI's reply body. A failure keeps the code the UI reported so the tool
+ * can tell `SESSION_NOT_ACTIVE` from a generic execution failure; an
+ * unrecognized code is normalized by the broker.
+ */
+function toUiRequestReply(body) {
+    if (body.ok === true) {
+        const data = body.data;
+        return {
+            ok: true,
+            ...(data && typeof data === 'object' ? { data: data } : {}),
+        };
+    }
+    return {
+        ok: false,
+        code: typeof body.code === 'string' ? body.code : 'UI_REQUEST_FAILED',
+        ...(typeof body.message === 'string' ? { message: body.message } : {}),
+    };
 }
 async function readJsonObject(request) {
     try {

@@ -1,23 +1,19 @@
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { resolvePermissionPath, splitShellSourceSegments, stripDataHeredocBodies, } from '@mavis/permission';
+import { resolvePermissionPath, splitShellSourceSegments, stripDataHeredocBodies, TEMPLATE_SUFFIXES, } from '@mavis/permission';
 import { shellSourceStages } from '@mavis/shared/shell-source-stages';
 import { readPermissionCommand, } from './checker-input.js';
+import { sensitivePathScanSurface } from './sensitive-command-surface.js';
 import { evaluateWindowsPathSafetyCheck } from './windows/path-safety.js';
 export { evaluateWindowsPathSafetyCheck } from './windows/path-safety.js';
 const FS_PERMISSION_TOOLS = new Set(['edit', 'write', 'read', 'glob', 'grep', 'list']);
-const HUGE_SCAN_ROOTS = new Set([
-    '/',
-    '/Users',
-    '/home',
-    '/System',
-    '/Library',
-    '/Applications',
-    '/usr',
-    '/var',
-    '/opt',
-    '/private',
-]);
+/**
+ * Local-runtime-only hard checks. Every verdict is a deny: `bypass-immune`
+ * stops before the engine, `policy` is demoted to an ask by the facade
+ * under default/auto. Ordinary approval prompts (pipe to shell, shell
+ * substitution, unbounded scans, recursive rm, paths outside the workspace)
+ * are owned by the permission engine, so this checker does not produce asks.
+ */
 export function evaluateLocalPermissionCheck(input) {
     const immune = buildLocalBypassImmuneDenyReason(input.toolName, input.input, input.workspaceDir);
     if (immune)
@@ -28,15 +24,6 @@ export function evaluateLocalPermissionCheck(input) {
     const policy = buildLocalPolicyDenyReason(input.toolName, input.input);
     if (policy)
         return { behavior: 'deny', reason: policy, denyKind: 'policy' };
-    if (input.toolName === 'bash') {
-        const command = readPermissionCommand(input.input);
-        if (!command)
-            return undefined;
-        return evaluateLocalBashCommand(command);
-    }
-    if (FS_PERMISSION_TOOLS.has(input.toolName)) {
-        return evaluateLocalFsTool(input.toolName, input.input, input.workspaceDir);
-    }
     return undefined;
 }
 /**
@@ -94,50 +81,6 @@ export function buildLocalPolicyDenyReason(toolName, input) {
     const sensitive = values.find(containsSensitiveLocalPath);
     if (sensitive) {
         return `Local hard safety policy blocked ${toolName}: sensitive credential path in ${sensitive}`;
-    }
-    return undefined;
-}
-function evaluateLocalBashCommand(command) {
-    const trimmed = command.trim();
-    if (!trimmed)
-        return undefined;
-    if (hasCurlPipeShell(trimmed)) {
-        return {
-            behavior: 'ask',
-            reason: 'Local permission check requires approval: curl-pipe-shell command.',
-        };
-    }
-    if (hasShellSubstitution(trimmed)) {
-        return {
-            behavior: 'ask',
-            reason: 'Local permission check requires approval: shell substitution in bash command.',
-        };
-    }
-    if (isSlowWholeTreeScan(trimmed)) {
-        return {
-            behavior: 'ask',
-            reason: 'Local permission check requires approval: slow unbounded filesystem scan.',
-        };
-    }
-    if (isRecursiveRmCommand(trimmed)) {
-        return {
-            behavior: 'ask',
-            reason: 'Local permission check requires approval: recursive rm command.',
-        };
-    }
-    return undefined;
-}
-function evaluateLocalFsTool(toolName, input, workspaceDir) {
-    if (!workspaceDir)
-        return undefined;
-    const target = readFsToolPath(toolName, input);
-    if (!target)
-        return undefined;
-    if (isWorkspacePathEscape(target, workspaceDir)) {
-        return {
-            behavior: 'ask',
-            reason: `Local permission check requires approval: ${toolName} path escapes workspace (${target}).`,
-        };
     }
     return undefined;
 }
@@ -208,116 +151,6 @@ function isAbsolutePathLike(value) {
         /^[A-Za-z]:[\\/]/.test(value) ||
         /^[A-Za-z]:$/.test(value));
 }
-function isWorkspacePathEscape(target, workspaceDir) {
-    const normalizedTarget = target.replaceAll('\\', '/').trim();
-    if (looksLikeNonPathGlob(normalizedTarget))
-        return false;
-    const workspace = resolvePathForCompare(workspaceDir);
-    const resolved = resolvePathForCompare(path.isAbsolute(normalizedTarget)
-        ? normalizedTarget
-        : path.join(workspaceDir, normalizedTarget));
-    return resolved !== workspace && !resolved.startsWith(`${workspace}/`);
-}
-function looksLikeNonPathGlob(value) {
-    return !value.startsWith('/') && !value.startsWith('..') && !value.includes('/');
-}
-function hasCurlPipeShell(command) {
-    return (/\b(?:curl|wget)\b[\s\S]*\|[\s\S]*(?:^|[\s;&|])(?:sudo\s+)?(?:bash|sh|zsh|fish|dash|ksh)\b/i.test(command) || /\b(?:bash|sh|zsh|fish|dash|ksh)\b[\s\S]*<\s*<\s*\(?\s*(?:curl|wget)\b/i.test(command));
-}
-function hasShellSubstitution(command) {
-    return /`[^`]*`|\$\(|<\(|>\(/.test(command);
-}
-function isSlowWholeTreeScan(command) {
-    return splitShellCommands(command).some((part) => {
-        const tokens = tokenizeShellLike(part);
-        const unwrapped = unwrapCommand(tokens);
-        const commandName = commandBasename(unwrapped[0] ?? '');
-        const args = unwrapped.slice(1);
-        if (commandName === 'find') {
-            const roots = findStartPaths(args);
-            return roots.some(isHugeScanRoot) && !args.includes('-maxdepth');
-        }
-        if (commandName === 'rg' || commandName === 'grep') {
-            if (args.some((arg) => arg === '--max-depth' || arg.startsWith('--max-depth='))) {
-                return false;
-            }
-            return readSearchPaths(args).some(isHugeScanRoot);
-        }
-        if (commandName === 'tree') {
-            if (args.some((arg) => arg === '-L' || /^-L\d+$/.test(arg) || arg.startsWith('--level'))) {
-                return false;
-            }
-            return args.some(isHugeScanRoot);
-        }
-        return false;
-    });
-}
-function findStartPaths(args) {
-    const paths = [];
-    let i = 0;
-    while (i < args.length) {
-        const arg = args[i] ?? '';
-        if (['-H', '-L', '-P'].includes(arg)) {
-            i += 1;
-            continue;
-        }
-        if (['-D', '-O'].includes(arg)) {
-            i += 2;
-            continue;
-        }
-        break;
-    }
-    for (; i < args.length; i += 1) {
-        const arg = args[i] ?? '';
-        if (arg.startsWith('-') || ['(', '!', ')'].includes(arg))
-            break;
-        paths.push(arg);
-    }
-    return paths;
-}
-function readSearchPaths(args) {
-    let patternSeen = false;
-    const paths = [];
-    for (let i = 0; i < args.length; i += 1) {
-        const arg = args[i] ?? '';
-        if (arg === '-e' || arg === '-f' || arg === '--regexp' || arg === '--file') {
-            i += 1;
-            patternSeen = true;
-            continue;
-        }
-        if (arg.startsWith('-'))
-            continue;
-        if (!patternSeen) {
-            patternSeen = true;
-            continue;
-        }
-        paths.push(arg);
-    }
-    return paths;
-}
-function isHugeScanRoot(value) {
-    const normalized = value.replaceAll('\\', '/').replace(/\/+$/, '') || '/';
-    return (HUGE_SCAN_ROOTS.has(normalized) ||
-        normalized === '~' ||
-        normalized === '$HOME' ||
-        /^\$\{HOME\}$/.test(normalized) ||
-        /^[A-Za-z]:$/.test(normalized));
-}
-function isRecursiveRmCommand(command) {
-    return splitShellCommands(command).some((part) => {
-        const tokens = unwrapCommand(tokenizeShellLike(part));
-        const commandName = commandBasename(tokens[0] ?? '');
-        if (commandName !== 'rm')
-            return false;
-        return tokens.slice(1).some((token) => token.startsWith('-') && /r/i.test(token));
-    });
-}
-function splitShellCommands(command) {
-    return command
-        .split(/&&|\|\||[;\n\r]/)
-        .map((part) => part.trim())
-        .filter(Boolean);
-}
 function unwrapCommand(tokens) {
     let cursor = 0;
     while (cursor < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[cursor] ?? '')) {
@@ -339,11 +172,12 @@ function collectPermissionPathOrCommandStrings(toolName, input) {
         input.filePath,
         input.file_path,
         toolName === 'grep' ? undefined : input.pattern,
+        toolName.startsWith('space_') ? input.local_path : undefined,
     ].filter((value) => typeof value === 'string' && value.trim().length > 0);
     if (toolName === 'bash') {
         const command = readPermissionCommand(input);
         if (command && !values.includes(command))
-            values.push(command);
+            values.push(sensitivePathScanSurface(command));
     }
     return values;
 }
@@ -357,7 +191,8 @@ const SENSITIVE_LOCAL_PATHS = [
     /(^|[/\s"'=:$])(?:~\/|\$home\/|\$\{home\}\/)?\.npmrc(?=$|[\s"';&|)])/i,
     /(^|[/\s"'=:$])(?:~\/|\$home\/|\$\{home\}\/)?\.netrc(?=$|[\s"';&|)])/i,
     /(^|[/\s"'=:$])(?:~\/|\$home\/|\$\{home\}\/)?\.git-credentials(?=$|[\s"';&|)])/i,
-    /(^|[/\s"'=:$])(?:~\/|\$home\/|\$\{home\}\/)?\.env(\.|$|[\s"';&|)])/i,
+    // Same template list as the engine's isEnvFile: `.env.example` holds no secrets.
+    new RegExp(String.raw `(^|[/\s"'=:$])(?:~\/|\$home\/|\$\{home\}\/)?\.env(?!\.(?:${TEMPLATE_SUFFIXES.join('|')})(?=$|[\s"';&|)]))(\.|$|[\s"';&|)])`, 'i'),
     /(^|[/\s"'=:$])(?:id_(?:rsa|dsa|ecdsa|ed25519)|[^/\s"';&|)]+\.(?:key|pem|p12|pfx))(?=$|[\s"';&|)])/i,
 ];
 function containsSensitiveLocalPath(value) {
@@ -527,10 +362,5 @@ function isRootOrHomeDeleteTarget(target, workspaceDir) {
         return true;
     }
     return false;
-}
-function resolvePathForCompare(value) {
-    const resolved = path.resolve(value.replaceAll('\\', path.sep));
-    const normalized = resolved.split(path.sep).join('/');
-    return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 //# sourceMappingURL=checkers.js.map

@@ -3,6 +3,8 @@
  * shape it cannot prove, so callers fail closed instead of treating an
  * unrecognized operand as an in-workspace target.
  */
+import { statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { isRmCommand, parseRmTargets, parseScriptPlainCommands, parseWindowsNativeDelete, } from '@mavis/permission';
 import { expandWindowsCommandSurfacesWithShell, normalizeWindowsProgramName, tokenizeWindowsCommand, } from './command-surfaces.js';
@@ -181,20 +183,62 @@ export function isNativeDeleteSurface(surface) {
     return (WINDOWS_NATIVE_DELETE_COMMANDS.has(name) ||
         (name === 'rm' && NATIVE_RM_SHELL_FAMILIES.has(surface.shellFamily)));
 }
-export function resolveWindowsTargets(rawTargets, workspaceDir) {
+export function resolveWindowsTargets(rawTargets, workspaceDir, pathVariables) {
     if (!rawTargets)
         return { resolved: [], hasDynamicTarget: true };
     const resolved = [];
     let hasDynamicTarget = false;
     const workspace = workspaceDir && /^[A-Za-z]:[\\/]/.test(workspaceDir) ? workspaceDir : undefined;
     for (const rawTarget of rawTargets) {
-        const target = resolveWindowsTarget(rawTarget, workspace);
+        const expanded = pathVariables
+            ? expandPowerShellPathVariable(rawTarget, pathVariables)
+            : rawTarget;
+        const target = resolveWindowsTarget(expanded, workspace);
         if (target === undefined)
             hasDynamicTarget = true;
         else
             resolved.push(target);
     }
     return { resolved, hasDynamicTarget };
+}
+const POWERSHELL_PATH_VARIABLE = /^(?:\$env:(temp|tmp|userprofile)|\$\{env:(temp|tmp|userprofile)\}|(~))(?=$|[\\/])/i;
+/**
+ * A script that may rebind one of these values, or quotes one literally,
+ * keeps every variable dynamic: assignment, provider paths (`Set-Item env:TEMP`),
+ * .NET setters, the FileSystem provider Home, or a single-quoted `$env:`.
+ */
+const POWERSHELL_PATH_VARIABLE_REBINDS = [
+    /\$\{?\s*env:\s*(?:temp|tmp|userprofile)\s*\}?\s*(?:[-+*/%]|\?\?)?=(?!=)/i,
+    /(?<![$\w{])env:/i,
+    /SetEnvironmentVariable/i,
+    /\.home\b/i,
+    /'[^']*\$\{?\s*env:/i,
+];
+/**
+ * Values PowerShell resolves these variables to in the runtime's child shell.
+ * `~` follows the FileSystem provider Home, which is USERPROFILE by default.
+ */
+export function readPowerShellPathVariables(command, env = process.env) {
+    if (POWERSHELL_PATH_VARIABLE_REBINDS.some((pattern) => pattern.test(command)))
+        return undefined;
+    const profile = env.USERPROFILE ?? homedir();
+    const values = new Map();
+    for (const [name, value] of [
+        ['temp', env.TEMP],
+        ['tmp', env.TMP],
+        ['userprofile', profile],
+        ['~', profile],
+    ]) {
+        if (value && /^[A-Za-z]:[\\/]/.test(value))
+            values.set(name, value);
+    }
+    return values;
+}
+function expandPowerShellPathVariable(raw, variables) {
+    const match = POWERSHELL_PATH_VARIABLE.exec(raw);
+    const name = (match?.[1] ?? match?.[2] ?? match?.[3])?.toLowerCase();
+    const value = name ? variables.get(name) : undefined;
+    return match && value ? value + raw.slice(match[0].length) : raw;
 }
 function resolveWindowsTarget(rawTarget, workspace) {
     if (/[%$*?`]/.test(rawTarget) || /^~/.test(rawTarget))
@@ -418,17 +462,57 @@ function readWindowsMoveSourceTargets(command, shellFamily) {
         return positional.length > 0 ? positional : undefined;
     return positional.length >= 2 ? positional.slice(0, -1) : undefined;
 }
+/**
+ * A PowerShell Move-Item whose every source is a literal existing file is not
+ * a recursive write. A directory, wildcard or unresolved source stays recursive.
+ */
+export function isSingleFileMove(surface, workspaceDir) {
+    if (surface.shellFamily !== 'powershell')
+        return false;
+    const [program] = tokenizeWindowsCommand(surface.command, surface.shellFamily);
+    if (!program || readWindowsCommandName(program, 'powershell').cmdlet !== 'move-item')
+        return false;
+    const sources = readWindowsMoveSourceTargets(surface.command, surface.shellFamily);
+    if (!sources || sources.length === 0 || sources.some((source) => /[[\]]/.test(source)))
+        return false;
+    const resolved = resolveWindowsTargets(sources, surface.cwdChanged ? undefined : workspaceDir);
+    return !resolved.hasDynamicTarget && resolved.resolved.every(isExistingFile);
+}
+function isExistingFile(target) {
+    // statSync on an unreachable UNC share blocks the runtime until the SMB
+    // timeout; such a source keeps the recursive (pre-existing) treatment.
+    if (/^[\\/]{2}/.test(target))
+        return false;
+    try {
+        return statSync(target).isFile();
+    }
+    catch {
+        return false;
+    }
+}
+/**
+ * Copy-Item / Move-Item (and their bare aliases) only add or relocate data, so
+ * an out-of-workspace destination needs confirmation rather than a hard stop.
+ */
+export function isPowerShellCopyOrMoveItem(command, shellFamily) {
+    if (shellFamily !== 'powershell')
+        return false;
+    const [program] = tokenizeWindowsCommand(command, shellFamily);
+    return (!!program &&
+        ['copy-item', 'move-item'].includes(readWindowsCommandName(program, shellFamily).cmdlet));
+}
 function isWindowsMoveCommand(name, args) {
     return (WINDOWS_MOVE_COMMANDS.has(name) ||
         (name === 'robocopy' && args.some((arg) => /^\/(?:move|mov)$/i.test(arg))));
 }
-function readWindowsMovePositionals(command, args) {
+function readWindowsMovePositionals(command, args, powerShellPaths = false) {
     const positional = [];
     for (let index = 0; index < args.length; index += 1) {
         const arg = args[index];
         if (arg === undefined)
             continue;
-        const skip = windowsMoveOptionSkip(command, arg);
+        // A PowerShell cmdlet takes /tmp/x as a path; only - starts its parameters.
+        const skip = powerShellPaths && arg.startsWith('/') ? undefined : windowsMoveOptionSkip(command, arg);
         if (skip === 'consume-next') {
             index += 1;
             continue;
@@ -467,6 +551,33 @@ export function readWindowsPathSafetyTargets(command, shellFamily, recoverableRm
     if (moveSourceTargets === undefined)
         return undefined;
     return [...writeTargets, ...moveSourceTargets];
+}
+/**
+ * Operands of a copy or move command (copy, xcopy, robocopy, cp, mv, move,
+ * Copy-Item, Move-Item and their aliases), read with the same option rules as
+ * the write and move-source readers. For PowerShell cmdlets an argument that
+ * starts with / is a path, as PowerShell reads it, not a cmd switch.
+ */
+export function readWindowsCopyOrMoveOperands(command, shellFamily) {
+    const [program, ...args] = tokenizeWindowsCommand(command, shellFamily);
+    if (!program)
+        return undefined;
+    const commandName = readWindowsCommandName(program, shellFamily);
+    if (!WINDOWS_COPY_OR_MOVE_COMMANDS.has(commandName.cmdlet))
+        return undefined;
+    const powerShellPaths = ['copy-item', 'move-item'].includes(commandName.cmdlet);
+    const positional = readWindowsMovePositionals(commandName, args, powerShellPaths);
+    const explicit = readExplicitWindowsDestination(commandName, args);
+    const move = isWindowsMoveCommand(commandName.cmdlet, args);
+    if (explicit.explicit)
+        return { move, sources: positional, destination: explicit.destination };
+    // xcopy and robocopy take one source and then one destination.
+    if (['xcopy', 'robocopy'].includes(commandName.name)) {
+        return { move, sources: positional.slice(0, 1), destination: positional[1] };
+    }
+    if (positional.length < 2)
+        return { move, sources: positional, destination: undefined };
+    return { move, sources: positional.slice(0, -1), destination: positional.at(-1) };
 }
 /**
  * Read copy/move destination flags before falling back to a positional

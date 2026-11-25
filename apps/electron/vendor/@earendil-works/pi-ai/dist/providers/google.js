@@ -2,7 +2,7 @@ import { GoogleGenAI, } from "@google/genai";
 import { AssistantMessageEventStream } from "../utils/event-stream.js";
 import { notifyProviderError } from "../utils/provider-error.js";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.js";
-import { consumeGoogleStream, convertMessages, convertTools, getDisabledGoogleThinkingConfig, mapToolChoice, resolveGoogleThinkingRequest, toGoogleSdkThinkingLevel, } from "./google-shared.js";
+import { consumeGoogleStream, convertMessages, convertTools, getDisabledGoogleThinkingConfig, getGeminiMajorVersion, mapToolChoice, resolveGoogleThinkingRequest, toGoogleSdkThinkingLevel, } from "./google-shared.js";
 import { buildBaseOptions } from "./simple-options.js";
 export const streamGoogle = (model, context, options) => {
     const stream = new AssistantMessageEventStream();
@@ -29,7 +29,7 @@ export const streamGoogle = (model, context, options) => {
             if (!apiKey) {
                 throw new Error(`No API key for provider: ${model.provider}`);
             }
-            const client = createClient(model, apiKey, options?.headers);
+            const client = createClient(model, apiKey, options?.headers, options?.fetch);
             let params = buildParams(model, context, options);
             const nextParams = await options?.onPayload?.(params, model);
             if (nextParams !== undefined) {
@@ -58,7 +58,7 @@ export const streamSimpleGoogle = (model, context, options) => {
         thinking: resolveGoogleThinkingRequest(model, options?.reasoning, options?.thinkingBudgets),
     });
 };
-function createClient(model, apiKey, optionsHeaders) {
+function createClient(model, apiKey, optionsHeaders, fetch) {
     const httpOptions = {};
     if (model.baseUrl) {
         httpOptions.baseUrl = model.baseUrl;
@@ -67,6 +67,9 @@ function createClient(model, apiKey, optionsHeaders) {
     if (model.headers || optionsHeaders) {
         httpOptions.headers = { ...model.headers, ...optionsHeaders };
     }
+    // Send through the host transport (proxy, CA, capture) like the other providers.
+    if (fetch)
+        httpOptions.fetch = fetch;
     return new GoogleGenAI({
         apiKey,
         httpOptions: Object.keys(httpOptions).length > 0 ? httpOptions : undefined,
@@ -74,7 +77,10 @@ function createClient(model, apiKey, optionsHeaders) {
 }
 function buildParams(model, context, options = {}) {
     const contents = convertMessages(model, context);
-    const generationConfig = {};
+    // The SDK resumes CONTINUATION with the original prompt and output budget.
+    const generationConfig = {
+        automaticContinuation: getGeminiMajorVersion(model.id) === 4,
+    };
     if (options.temperature !== undefined) {
         generationConfig.temperature = options.temperature;
     }

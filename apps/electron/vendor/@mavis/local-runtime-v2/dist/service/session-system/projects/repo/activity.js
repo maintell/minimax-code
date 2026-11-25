@@ -11,8 +11,10 @@ export const channelProjectPredicate = sql `${sessions.projectId} = ${projects.p
 export const projectActivityExpression = sql `MAX(${projects.latestActivityAtMs}, COALESCE(
   (SELECT MAX(${sessions.updatedAtMs}) FROM ${sessions} WHERE ${channelProjectPredicate}), 0))`;
 /**
- * Project list sort key. A project the user created explicitly may have no
- * conversation yet; it ranks by its creation time until it has activity.
+ * Activity time of a project in lists: the time clients show and the catalog
+ * (`ListProjects`) order. A project the user created explicitly may have no
+ * conversation yet; it uses its creation time until it has activity. The sidebar
+ * list orders by position instead (`projectListPositionExpression`).
  */
 export const projectListActivityExpression = sql `MAX(${projectActivityExpression}, ${projects.createdAtMs})`;
 /**

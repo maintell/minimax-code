@@ -1,10 +1,15 @@
-import { createReadStream } from 'node:fs';
-import { lstat, readdir, realpath } from 'node:fs/promises';
+import { lstat, readdir, readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import JSZip from 'jszip';
+import { logger } from '../../../infra/logging/logger.js';
 import { deployFailure, ensureNotAborted, runDeployStage } from './deploy-failure.js';
 const GET_UPLOAD_URL_PATH = '/mavis/api/v1/mcp/get_upload_url';
 const ARCHIVE_MIME = 'application/zip';
+const ARCHIVE_GENERATE_OPTIONS = {
+    type: 'nodebuffer',
+    compression: 'DEFLATE',
+    compressionOptions: { level: 6 },
+};
 /** Default exclusions keep dev output and credentials out of public archives. */
 export const DEFAULT_IGNORE_PATTERNS = [
     /^\.git$/u,
@@ -105,15 +110,61 @@ async function packZip(files, signal, stage) {
     const zip = new JSZip();
     for (const file of files) {
         ensureNotAborted(signal, 'during packaging', stage);
-        zip.file(file.relPath, createReadStream(file.absPath));
+        // Read one file at a time. A createReadStream entry opens its descriptor as
+        // soon as it is created and JSZip only drains it inside generateAsync, so a
+        // stream error on a not-yet-processed entry is swallowed and the archive
+        // never finishes; opening every file up front also exhausts the descriptor
+        // limit on large sites. A failed read throws here and becomes packaging_failed.
+        zip.file(file.relPath, await readPackagedFile(file.absPath, stage));
     }
-    const archive = await zip.generateAsync({
-        type: 'nodebuffer',
-        compression: 'DEFLATE',
-        compressionOptions: { level: 6 },
-    });
+    const archive = await generateArchive(zip, signal, stage);
     ensureNotAborted(signal, 'after packaging', stage);
     return archive;
+}
+/** Reads one file for the archive and logs the failure code (never the path). */
+async function readPackagedFile(absPath, stage) {
+    try {
+        return await readFile(absPath);
+    }
+    catch (err) {
+        logger.warn({ stage, result: 'failed', error_code: fsErrorCode(err) }, 'website deploy packaging read failed');
+        throw err;
+    }
+}
+function fsErrorCode(err) {
+    return err instanceof Error && 'code' in err && typeof err.code === 'string'
+        ? err.code
+        : 'unknown';
+}
+/**
+ * Runs generateAsync so an abort settles the deploy immediately. Promise.race
+ * keeps a handler on the losing promise, so a later rejection from the
+ * abandoned generateAsync cannot surface as an unhandled rejection.
+ */
+async function generateArchive(zip, signal, stage) {
+    if (signal === undefined)
+        return zip.generateAsync(ARCHIVE_GENERATE_OPTIONS);
+    const { promise: aborted, dispose } = abortRejection(signal, stage);
+    try {
+        return await Promise.race([zip.generateAsync(ARCHIVE_GENERATE_OPTIONS), aborted]);
+    }
+    finally {
+        dispose();
+    }
+}
+/** Rejects as soon as `signal` aborts; `dispose` detaches the listener. */
+function abortRejection(signal, stage) {
+    let rejectAbort;
+    const onAbort = () => {
+        // The abandoned generateAsync keeps compressing until it finishes; it cannot be cancelled.
+        logger.warn({ stage, result: 'aborted' }, 'website deploy aborted during archive generation');
+        rejectAbort?.(deployFailure('website_deploy aborted during packaging', 'aborted', stage));
+    };
+    const promise = new Promise((_resolve, reject) => {
+        rejectAbort = reject;
+    });
+    signal.addEventListener('abort', onAbort, { once: true });
+    return { promise, dispose: () => signal.removeEventListener('abort', onAbort) };
 }
 export function totalBytes(files) {
     return files.reduce((sum, file) => sum + file.bytes, 0);

@@ -122,6 +122,11 @@ const IPC_CHANNELS = {
     RC_SESSION_COMPOSER_MODE_CHANGED: 'rc:session-composer-mode-changed',
     // 外部链接
     OPEN_EXTERNAL: 'open-external',
+    OPEN_URL_IN_BROWSER: 'open-url-in-browser',
+    // mcode-browser 插件的 Chrome 扩展（设置 → 浏览器 → 浏览器扩展）
+    MCODE_BROWSER_EXTENSION_STATUS: 'mcode-browser:extension-status',
+    MCODE_BROWSER_REVEAL_MANUAL_EXTENSION: 'mcode-browser:reveal-manual-extension',
+    MCODE_BROWSER_OPEN_CHROME_EXTENSIONS: 'mcode-browser:open-chrome-extensions',
     // 系统
     SYSTEM_OPEN_LOG_FILE: 'system:open-log-file',
     SYSTEM_GET_LOG_FILE_PATH: 'system:get-log-file-path',
@@ -191,6 +196,12 @@ const IPC_CHANNELS = {
     EMBEDDED_BROWSER_LIST_LOCAL_SERVERS: 'embedded-browser:list-local-servers',
     EMBEDDED_BROWSER_CAPTURE_FRAME: 'embedded-browser:capture-frame',
     EMBEDDED_BROWSER_AGENT_ACTION: 'embedded-browser:agent-action',
+    EMBEDDED_BROWSER_TAKE_OVER: 'embedded-browser:take-over',
+    EMBEDDED_BROWSER_SET_TAKEOVER_PILL_APPEARANCE: 'embedded-browser:set-takeover-pill-appearance',
+    EMBEDDED_BROWSER_CONSUME_PENDING_REVEAL: 'embedded-browser:consume-pending-reveal',
+    EMBEDDED_BROWSER_DESCRIBE_TABS: 'embedded-browser:describe-tabs',
+    EMBEDDED_BROWSER_CONTROL_CHANGED: 'embedded-browser:control-changed',
+    EMBEDDED_BROWSER_INPUT_BLOCKED: 'embedded-browser:input-blocked',
     /** renderer → main: find text in a Browser tab page (shared Cmd/Ctrl+F bar). */
     EMBEDDED_BROWSER_FIND_IN_PAGE: 'embedded-browser:find-in-page',
     EMBEDDED_BROWSER_STOP_FIND_IN_PAGE: 'embedded-browser:stop-find-in-page',
@@ -202,6 +213,7 @@ const IPC_CHANNELS = {
     // Plugin-owned Mini App surfaces
     MINIAPP_LIST: 'miniapp:list',
     MINIAPP_OPEN: 'miniapp:open',
+    MINIAPP_PRESENT: 'miniapp:present',
     MINIAPP_WIDGET: 'miniapp:widget',
     MINIAPP_PREVIEW: 'miniapp:preview',
     MINIAPP_PREVIEW_CACHE: 'miniapp:preview-cache',
@@ -247,6 +259,7 @@ const IPC_CHANNELS = {
     // Deep Link
     DEEPLINK_RECEIVED: 'deeplink:received',
     DEEPLINK_TAKE_WORKSPACE_OPEN: 'deeplink:take-workspace-open',
+    DEEPLINK_TAKE_PLUGIN_TRY: 'deeplink:take-plugin-try',
     // file api
     // file tools
     FILE_READ: 'file:read',
@@ -267,6 +280,10 @@ const IPC_CHANNELS = {
     FILE_UPLOAD: 'file:upload',
     FILE_CHMOD: 'file:chmod',
     // sidebar terminal (interactive PTY)
+    TERMINAL_INLINE_START: 'terminal:inline-start',
+    TERMINAL_INLINE_READ: 'terminal:inline-read',
+    TERMINAL_SECRET_INPUT: 'terminal:secret-input',
+    TERMINAL_INLINE_DISPOSE_SESSION: 'terminal:inline-dispose-session',
     TERMINAL_CREATE: 'terminal:create',
     TERMINAL_LIST: 'terminal:list',
     TERMINAL_ATTACH: 'terminal:attach',
@@ -308,6 +325,10 @@ const IPC_CHANNELS = {
     DOCUMENT_PREVIEW_PPTX_CORE_PORT: 'document-preview:pptx-core-port',
     PREVIEW_CLIPBOARD_WRITE: 'preview-clipboard:write',
     PREVIEW_CLIPBOARD_WRITE_FILES: 'preview-clipboard:write-files',
+    // Manual Space upload (the Space core runs in main; channel names are historical)
+    MCODE_TOOLS_ASSETS_STATUS: 'mcode-tools-assets:status',
+    MCODE_TOOLS_ASSETS_UPLOAD: 'mcode-tools-assets:upload',
+    MCODE_TOOLS_ASSETS_STAT: 'mcode-tools-assets:stat',
     // PPT Preview WebContentsView
     PPT_PREVIEW_CREATE: 'ppt-preview:create',
     PPT_PREVIEW_LOAD: 'ppt-preview:load',
@@ -389,7 +410,9 @@ const IPC_CHANNELS = {
     MAIN_WINDOW_SELECT_CHAT: 'main-window:select-chat',
     // Screenshot
     SCREENSHOT_START: 'screenshot:start',
+    SCREENSHOT_MANAGE_STORAGE: 'screenshot:manage-storage',
     SCREENSHOT_CAPTURE_PAGE_REGION: 'screenshot:capture-page-region',
+    SCREENSHOT_OPEN_PERMISSION_SETTINGS: 'screenshot:open-permission-settings',
     // Tracking recorder (keep in sync with main/config/constants.ts)
     TRACKING_RECORDER_REGISTER_SCREENSHOT: 'tracking-recorder:register-screenshot',
     TRACKING_RECORDER_READ_SCREENSHOT: 'tracking-recorder:read-screenshot',
@@ -631,6 +654,10 @@ const electronObservability = {
 // docs/design/sidebar-terminal-panel.md §6.3 for the contract.
 // ============================================
 const terminalAPI = {
+    startInline: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_INLINE_START, params),
+    readInline: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_INLINE_READ, params),
+    secretInput: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_SECRET_INPUT, params),
+    disposeInlineSession: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_INLINE_DISPOSE_SESSION, params),
     create: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_CREATE, params),
     list: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_LIST, params),
     attach: (params) => ipcRenderer.invoke(IPC_CHANNELS.TERMINAL_ATTACH, params),
@@ -869,6 +896,14 @@ const electronAPI = {
     clearAllStorage: () => ipcRenderer.invoke(IPC_CHANNELS.STORAGE_CLEAR_ALL),
     // 打开外部链接
     openExternal: (url) => ipcRenderer.invoke(IPC_CHANNELS.OPEN_EXTERNAL, url),
+    // 用指定浏览器打开链接；浏览器未安装时返回 browser_not_installed
+    openUrlInBrowser: (url, browser) => ipcRenderer.invoke(IPC_CHANNELS.OPEN_URL_IN_BROWSER, url, browser),
+    // mcode-browser：Chrome 扩展是否已启用（installed / missing / no_chrome）
+    getMcodeBrowserExtensionStatus: () => ipcRenderer.invoke(IPC_CHANNELS.MCODE_BROWSER_EXTENSION_STATUS),
+    // mcode-browser：把扩展复制到固定文件夹并在文件管理器里选中
+    revealMcodeBrowserManualExtension: () => ipcRenderer.invoke(IPC_CHANNELS.MCODE_BROWSER_REVEAL_MANUAL_EXTENSION),
+    // mcode-browser：复制 chrome://extensions 到剪贴板并启动 Chrome
+    openChromeExtensionsPage: () => ipcRenderer.invoke(IPC_CHANNELS.MCODE_BROWSER_OPEN_CHROME_EXTENSIONS),
     // 认证
     logout: () => ipcRenderer.invoke(IPC_CHANNELS.AUTH_LOGOUT),
     // 切换到登录窗口（销毁当前窗口，创建登录窗口）
@@ -1023,7 +1058,14 @@ const electronAPI = {
         return () => ipcRenderer.removeListener(IPC_CHANNELS.MINI_CHAT_FOCUS, handler);
     },
     // Screenshot
-    screenshotStart: (workspaceDir) => ipcRenderer.invoke(IPC_CHANNELS.SCREENSHOT_START, { workspaceDir }),
+    onScreenshotRequested: (callback) => {
+        const handler = () => callback();
+        ipcRenderer.on('screenshot:requested', handler);
+        return () => ipcRenderer.removeListener('screenshot:requested', handler);
+    },
+    screenshotManageStorage: (action) => ipcRenderer.invoke(IPC_CHANNELS.SCREENSHOT_MANAGE_STORAGE, action),
+    screenshotStart: (entry = 'button') => ipcRenderer.invoke(IPC_CHANNELS.SCREENSHOT_START, entry),
+    screenshotOpenPermissionSettings: () => ipcRenderer.invoke(IPC_CHANNELS.SCREENSHOT_OPEN_PERMISSION_SETTINGS),
     capturePageRegion: (rect) => ipcRenderer.invoke(IPC_CHANNELS.SCREENSHOT_CAPTURE_PAGE_REGION, rect),
     ...(trackingRecorderEnabled ? { trackingRecorder: trackingRecorderAPI } : {}),
     // 系统通知（主进程 Notification API）
@@ -1652,6 +1694,7 @@ if (desktopWindowKind === 'main') {
             return () => ipcRenderer.removeListener('browser-webview:agent-pointer', receive);
         },
         ready: () => ipcRenderer.invoke('browser-webview:ready'),
+        takeOver: (id) => ipcRenderer.send('browser-webview:take-over', id),
         applied: (id, revision) => ipcRenderer.send('browser-webview:applied', id, revision),
         onSnapshot: (listener) => {
             const receive = (_event, snapshot) => listener(snapshot);
@@ -1737,13 +1780,53 @@ const embeddedBrowserAPI = {
         const handler = (_event, payload) => {
             if (!payload || typeof payload !== 'object')
                 return;
-            const { sessionId, action } = payload;
+            const { sessionId, action, pluginId } = payload;
             if (typeof sessionId !== 'string' || typeof action !== 'string')
                 return;
-            callback({ sessionId, action });
+            callback({
+                sessionId,
+                action,
+                ...(typeof pluginId === 'string' && pluginId ? { pluginId } : {}),
+            });
         };
         ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_AGENT_ACTION, handler);
         return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_AGENT_ACTION, handler);
+    },
+    /** The user takes over the tab the Agent controls in this session. */
+    takeOver: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_TAKE_OVER, params),
+    /** Theme, typography and copy for the takeover pill drawn in the controlled page. */
+    setTakeoverPillAppearance: (appearance) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_SET_TAKEOVER_PILL_APPEARANCE, appearance),
+    consumePendingReveal: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_CONSUME_PENDING_REVEAL, params),
+    describeTabs: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_DESCRIBE_TABS, params),
+    onControlChanged: (callback) => {
+        const handler = (_event, payload) => {
+            if (!payload || typeof payload !== 'object')
+                return;
+            const { sessionId, mode, controlledTabId } = payload;
+            if (typeof sessionId !== 'string')
+                return;
+            if (mode !== 'idle' && mode !== 'agent' && mode !== 'user')
+                return;
+            callback({
+                sessionId,
+                mode,
+                controlledTabId: typeof controlledTabId === 'number' ? controlledTabId : null,
+            });
+        };
+        ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_CONTROL_CHANGED, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_CONTROL_CHANGED, handler);
+    },
+    onInputBlocked: (callback) => {
+        const handler = (_event, payload) => {
+            if (!payload || typeof payload !== 'object')
+                return;
+            const { sessionId, tabId } = payload;
+            if (typeof sessionId !== 'string' || typeof tabId !== 'number')
+                return;
+            callback({ sessionId, tabId });
+        };
+        ipcRenderer.on(IPC_CHANNELS.EMBEDDED_BROWSER_INPUT_BLOCKED, handler);
+        return () => ipcRenderer.removeListener(IPC_CHANNELS.EMBEDDED_BROWSER_INPUT_BLOCKED, handler);
     },
     findInPage: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_FIND_IN_PAGE, params),
     stopFindInPage: (params) => ipcRenderer.invoke(IPC_CHANNELS.EMBEDDED_BROWSER_STOP_FIND_IN_PAGE, params),
@@ -2059,6 +2142,7 @@ const miniAppAPI = {
     toolPermission: miniAppToolPermission,
     list: () => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_LIST),
     open: openMiniApp,
+    present: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_PRESENT, params),
     refresh: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_REFRESH, params),
     stop: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_STOP, params),
     close: (params) => ipcRenderer.invoke(IPC_CHANNELS.MINIAPP_CLOSE, params),
@@ -2143,6 +2227,8 @@ const deepLinkAPI = {
     },
     // Claim the directory from the latest `workspace/open` link; null once taken.
     takePendingWorkspaceOpen: () => ipcRenderer.invoke(IPC_CHANNELS.DEEPLINK_TAKE_WORKSPACE_OPEN),
+    // Claim the plugin name from the latest `plugin/try` link; null once taken.
+    takePendingPluginTry: () => ipcRenderer.invoke(IPC_CHANNELS.DEEPLINK_TAKE_PLUGIN_TRY),
 };
 contextBridge.exposeInMainWorld('deepLinkAPI', deepLinkAPI);
 // ============================================
@@ -2344,6 +2430,12 @@ const previewClipboardAPI = {
     write: (payload) => ipcRenderer.invoke(IPC_CHANNELS.PREVIEW_CLIPBOARD_WRITE, payload),
 };
 contextBridge.exposeInMainWorld('previewClipboardAPI', previewClipboardAPI);
+const mcodeToolsAssetsAPI = {
+    getStatus: () => ipcRenderer.invoke(IPC_CHANNELS.MCODE_TOOLS_ASSETS_STATUS),
+    upload: (input) => ipcRenderer.invoke(IPC_CHANNELS.MCODE_TOOLS_ASSETS_UPLOAD, input),
+    stat: (input) => ipcRenderer.invoke(IPC_CHANNELS.MCODE_TOOLS_ASSETS_STAT, input),
+};
+contextBridge.exposeInMainWorld('mcodeToolsAssetsAPI', mcodeToolsAssetsAPI);
 // ============================================
 // PPT Preview WebContentsView API
 // Manages a native overlay for rendering qlmanage HTML previews

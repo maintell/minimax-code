@@ -147,7 +147,7 @@ export class BunnySpaceTidyService {
 }
 /**
  * What a rewritten summary must satisfy before it is written: valid at all, under the soft
- * limit, shorter than what it replaces, and with the locked sections untouched.
+ * limit, shorter than what it replaces, with the locked sections untouched.
  */
 function accepted(target, summary) {
     if (!summary.trim() || summary.length >= target.summary.length)
@@ -170,10 +170,11 @@ function lockedLength(summary) {
 function briefing(target) {
     const sections = spaceContextSections(target.summary).map((section) => section.heading || '(开头)');
     return [
-        `空间：${target.name}`,
+        `事项：${target.name}`,
         `当前 summary：${target.summary.length} 个字符，软线 ${SPACE_CONTEXT_SUMMARY_SOFT_LIMIT}。`,
         `小节：${sections.join('、')}`,
         `只改 ${SUMMARY_FILE}；整理后必须短于现在，并且不超过 ${SPACE_CONTEXT_SUMMARY_SOFT_LIMIT} 个字符。`,
+        `原样保留：${SPACE_CONTEXT_LOCKED_SECTIONS.map((heading) => `「${heading}」`).join('')}这几节。`,
     ].join('\n');
 }
 /** The model's file tools: read and list everything, rewrite only `context.md`. */

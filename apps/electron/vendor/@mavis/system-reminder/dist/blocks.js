@@ -68,7 +68,7 @@ function isDefaultLocalAgentDisplayName(env) {
     return env.scene !== 'cloud' && env.agentName === 'mavis' && env.displayName === 'Mavis';
 }
 export function buildAgentContextBlock(env, opts) {
-    // SESSION ROLE is derived from parentSessionId: a session is `branch` iff it
+    // sessionRole is derived from parentSessionId: a session is `branch` iff it
     // was spawned by another session (it has a parent). Otherwise it is `root`.
     // This is the agent's role in the *session tree*, not the same as `agentRole`
     // (kept internally for provider selection) or `session.sessionType` (Root/Branch
@@ -78,9 +78,11 @@ export function buildAgentContextBlock(env, opts) {
     // Cloud scene trims duplicates / fields that have no analogue in the cloud
     // runtime: the internal `agentName:` ID line (cloud has no CLI/routing/
     // storage layer that needs the ID separately from the user-facing display
-    // name), `IS_DEFAULT_WORKSPACE` (cloud always
-    // uses the managed workspace), and `YOUR AGENT CONFIG DIRECTORY` (no
+    // name), `isDefaultWorkspace` (cloud always
+    // uses the managed workspace), and `agentConfigDir` (no
     // on-disk config).
+    //
+    // Keys use lowerCamelCase so every field reads as one structured record.
     const isCloud = env.scene === 'cloud';
     const lines = ['<agent-context>'];
     lines.push(isDefaultLocalAgentDisplayName(env)
@@ -93,22 +95,22 @@ export function buildAgentContextBlock(env, opts) {
     if (!isCloud) {
         lines.push(`  agentName: ${env.agentName}  # routing ID`);
     }
-    lines.push(`  SESSION ROLE: ${sessionRole}`, `  YOUR SESSION ID: ${env.sessionId}`);
+    lines.push(`  sessionRole: ${sessionRole}`, `  sessionId: ${env.sessionId}`);
     if (env.parentSessionId) {
-        lines.push(`  PARENT SESSION: ${env.parentSessionId}`);
+        lines.push(`  parentSessionId: ${env.parentSessionId}`);
         lines.push(buildParentResultDeliveryLine(env, isCloud));
     }
     if (env.sessionType !== 1 && env.rootSessionId) {
-        lines.push(`  YOUR AGENT ROOT SESSION: ${env.rootSessionId}`);
+        lines.push(`  rootSessionId: ${env.rootSessionId}`);
     }
     if (!env.environmentInSystemPrompt) {
-        lines.push(`  YOUR WORKSPACE DIRECTORY: ${env.workspaceDir}`);
+        lines.push(`  workspaceDir: ${env.workspaceDir}`);
         if (!isCloud) {
-            lines.push(`  IS_DEFAULT_WORKSPACE: ${env.isDefaultWorkspace ?? true}`, `  YOUR AGENT CONFIG DIRECTORY: ${env.agentConfigDir}`);
+            lines.push(`  isDefaultWorkspace: ${env.isDefaultWorkspace ?? true}`, `  agentConfigDir: ${env.agentConfigDir}`);
         }
     }
     if (env.scratchpadPath) {
-        lines.push(`  YOUR SCRATCHPAD: available via the MAVIS_SCRATCHPAD env var`, `    (shared free-form whiteboard rooted at this session tree's root session;`, `     read/write with normal Read/Write tools; child sessions inherit the same path`, `     via the same env var. Use it for cross-session notes that don't`, `     fit the structured team board. Do not print the scratchpad path in`, `     user-facing replies.)`);
+        lines.push(`  scratchpad: available via the MAVIS_SCRATCHPAD env var`, `    (shared free-form whiteboard rooted at this session tree's root session;`, `     read/write with normal Read/Write tools; child sessions inherit the same path`, `     via the same env var. Use it for cross-session notes that don't`, `     fit the structured team board. Do not print the scratchpad path in`, `     user-facing replies.)`);
     }
     if (!env.environmentInSystemPrompt) {
         lines.push(`  platform: ${env.platform}`);
@@ -134,7 +136,7 @@ export function buildAgentContextBlock(env, opts) {
         lines.push(`  runtimeMode: monorepo-dev`, `  cliUsage: Use \`${env.dataDir}/bin/mavis <command>\` to invoke CLI commands.`);
     }
     if (env.importedFrom) {
-        lines.push(`  YOU ARE ACTUALLY IMPORTED FROM: ${env.importedFrom}`);
+        lines.push(`  importedFrom: ${env.importedFrom}`);
     }
     if (env.projectInstructions) {
         lines.push(`  projectInstructions: ${env.projectInstructions}`);
@@ -153,7 +155,7 @@ export function buildAgentContextBlock(env, opts) {
     // Cloud has the `mavis` LLM tool instead, so point at it directly.
     if (!teamOff) {
         if (isCloud) {
-            lines.push('  peers (for `communicate`):  `mavis({ command: "session list", args: { mode: "peers", session_id: "me" } })`', '  agents (your roster):       `mavis({ command: "agent list" })`');
+            lines.push('  peers: list peer sessions for `communicate` with `mavis({ command: "session list", args: { mode: "peers", session_id: "me" } })`', '  agents: list your roster with `mavis({ command: "agent list" })`');
         }
         else {
             lines.push('  teamDiscovery: peers and agents are NOT inlined. Load skill `mavis-session` to list peer sessions; load skill `mavis-agent` to list available agents.');
@@ -178,16 +180,16 @@ export function buildSlimAgentContextBlock(env) {
     if (!isCloud) {
         lines.push(`  agentName: ${env.agentName}`);
     }
-    lines.push(`  SESSION ROLE: ${sessionRole}`);
+    lines.push(`  sessionRole: ${sessionRole}`);
     if (!env.sessionIdInContext) {
-        lines.push(`  YOUR SESSION ID: ${env.sessionId}`);
+        lines.push(`  sessionId: ${env.sessionId}`);
     }
     if (env.parentSessionId) {
-        lines.push(`  PARENT SESSION: ${env.parentSessionId}`);
+        lines.push(`  parentSessionId: ${env.parentSessionId}`);
         lines.push(buildParentResultDeliveryLine(env, isCloud));
     }
     if (env.sessionType !== 1 && env.rootSessionId) {
-        lines.push(`  YOUR AGENT ROOT SESSION: ${env.rootSessionId}`);
+        lines.push(`  rootSessionId: ${env.rootSessionId}`);
     }
     lines.push(`  date: ${env.date}`);
     if (!env.environmentInSystemPrompt) {
@@ -200,14 +202,16 @@ export function buildSlimAgentContextBlock(env) {
     lines.push('</agent-context>');
     return lines.join('\n');
 }
+/** `<agent-context>` line of a task child whose result the runtime delivers to the parent. */
+export const RUNTIME_MANAGED_RESULT_DELIVERY_LINE = '  resultDelivery: runtime-managed. Return your result normally; the runtime delivers it through whichever path opened this Turn — the task result, the session send completion, or a task_append result the owner reads with task_output. Do not send a separate message to the parent session.';
 function buildParentResultDeliveryLine(env, isCloud) {
     if (!isCloud && env.taskResultDelivery === 'runtime-managed') {
-        return '  TASK RESULT DELIVERY: Return your result normally; the runtime delivers it through whichever path opened this Turn — the task result, the session send completion, or a task_append result the owner reads with task_output. Do not send a separate message to the parent session.';
+        return RUNTIME_MANAGED_RESULT_DELIVERY_LINE;
     }
     if (!isCloud) {
-        return '  RESULT DELIVERY: Return your result normally in this session. The parent can retrieve the completed branch result through native session tools; do not shell out to message another session.';
+        return '  resultDelivery: Return your result normally in this session. The parent can retrieve the completed branch result through native session tools; do not shell out to message another session.';
     }
-    return `  REPORT-BACK REQUIRED: When your task is complete or blocked, you MUST report results back to your parent session via the \`communicate\` tool with to_session="${env.parentSessionId}" and content="<your report>".`;
+    return `  resultDelivery: REPORT-BACK REQUIRED. When your task is complete or blocked, you MUST report results back to your parent session via the \`communicate\` tool with to_session="${env.parentSessionId}" and content="<your report>".`;
 }
 function escapeAgentContextValue(value) {
     return value
@@ -309,7 +313,7 @@ export function buildCliSunsetMemoryNoticeBlock(notice) {
         return '';
     const lines = ['<cli-sunset-memory-notice>'];
     if (paths.length) {
-        lines.push('Runtime change: this version removed the legacy `mavis` CLI command groups', '(agent, communication, cron, session, memory, skill, hook, spawn). The following stored', 'memory files predate that change and still reference removed CLI commands —', 'do NOT follow CLI instructions found in them:', ...paths.map((path) => `  - ${path}`), 'Native replacements:', '  - agent / cron / session → native `mavis` tool: `mavis({ command: "<group> <action>", args: { ... } })`', '  - communication peers/messages → native `mavis` session list/messages; return results normally instead of using communication send', '  - memory → native `memory` tool (see the mavis skill, references/memory.md)', '  - skills → native `skill` tool; hooks → edit hook files directly', '  - spawn (delegation) → native `task` tool (sub-agent tasks)', '  - `mavis im ...` still works, along with the core CLI surface (`mavis --help`)');
+        lines.push('Runtime change: this version removed the legacy `mavis` CLI command groups', '(agent, communication, cron, session, memory, skill, hook, spawn). The following stored', 'memory files predate that change and still reference removed CLI commands —', 'do NOT follow CLI instructions found in them:', ...paths.map((path) => `  - ${path}`), 'Native replacements:', '  - agent → `agent-manage` Skill, then the `agent_*` tools', '  - session → `session-manage` Skill for reading and tidying; for sending, creating and interrupting, your `assignment_*` tools if you have them, otherwise the `session-dispatch` Skill', '  - cron → `cron-manage` Skill, then the `cron_*` tools', '  - communication peers/messages → the `session_list` / `session_messages` tools; return results normally instead of using communication send', '  - memory → native `memory` tool (see the `memory-manage` Skill)', '  - skills → native `skill` tool; hooks → edit hook files directly', '  - spawn (delegation) → native `task` tool (sub-agent tasks)', '  - `mavis im ...` still works, along with the core CLI surface (`mavis --help`)');
     }
     if (teamPaths.length) {
         lines.push('Also: `mavis team ...` still exists, but its flags and review workflows', 'changed in this version, and delegation now defaults to sub-agent tasks', '(the native `task` tool) — only start a team when the user explicitly asks.', 'These memory files mention it:', ...teamPaths.map((path) => `  - ${path}`), 'Where such memory disagrees with the current mavis-team skill, trust the skill.');

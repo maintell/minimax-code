@@ -36,7 +36,7 @@ export async function resolveLocalTaskAgentTarget(host, agentName, pluginAgents)
         await assertTaskTargetDispatchable(host, resolved);
         source = inferNameResolutionSource(requested, resolved.resolvedAgentName);
         emitSubagentTelemetry(host, SUBAGENT_TELEMETRY_EVENT.resolve, { source, success: true });
-        return resolved;
+        return snapshotAgentDisplayName(host, resolved);
     }
     catch (error) {
         if (isUnknownAgentError(error) && !explicitAgent) {
@@ -44,14 +44,30 @@ export async function resolveLocalTaskAgentTarget(host, agentName, pluginAgents)
             if (bare)
                 return resolvePluginTarget(host, requested, bare);
         }
+        const errorCode = telemetryErrorCode(error);
         emitSubagentTelemetry(host, SUBAGENT_TELEMETRY_EVENT.resolve, {
             source,
             success: false,
-            ...(telemetryErrorCode(error) ? { error_code: telemetryErrorCode(error) } : {}),
+            ...(errorCode ? { error_code: errorCode } : {}),
         });
         if (isUnknownAgentError(error))
             return undefined;
         throw error;
+    }
+}
+async function snapshotAgentDisplayName(host, target) {
+    try {
+        // The explicit prefix keeps this lookup on the resolved owner if a display
+        // name happens to equal a different Agent's stable key.
+        const record = await host.agentRoutes?.getLocalAgent?.(`agent:${target.exactOwnerName}`, {
+            includeContent: false,
+        });
+        const agentDisplayName = record?.displayName?.trim();
+        return agentDisplayName ? { ...target, agentDisplayName } : target;
+    }
+    catch {
+        // Missing presentation metadata must never block Task execution.
+        return target;
     }
 }
 /**
@@ -79,10 +95,12 @@ function resolvePluginTarget(host, requested, agent) {
     });
     if (!agent)
         return undefined;
+    const agentDisplayName = agent.displayName?.trim();
     return {
         requestedName: requested,
         exactOwnerName: agent.scopedName,
         resolvedAgentName: agent.scopedName,
+        ...(agentDisplayName ? { agentDisplayName } : {}),
         canonicalViewName: agent.scopedName,
         trustedBuiltin: false,
         source: 'plugin',

@@ -1,11 +1,9 @@
-import { spawn } from 'node:child_process';
-import { mkdir } from 'node:fs/promises';
 import { resolve as resolvePath } from 'node:path';
-import { resolveHookCommandInvocation } from './command-invocation.js';
+import { spawnHookCommand, } from './command-executor.js';
+import { resolveHookCommandInvocation, } from './command-invocation.js';
 import { isSafePluginHookMatcher } from './parser.js';
 import { boundHandlerDecision } from './output-artifacts.js';
 import { adaptToolIdentity, hasOnlyKeys, hasCompatibleJsonShape, isMcpToolInput, resolveHookFilePath, restoreNativeToolInput, } from './wire-tool-adapter.js';
-const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_INPUT_BYTES = 1024 * 1024;
 const MAX_REASON_CHARS = 4_096;
 const MAX_INJECTED_TEXT_CHARS = 64 * 1024;
@@ -13,16 +11,29 @@ const MAX_OUTPUT_VALUE_DEPTH = 64;
 const MAX_OUTPUT_VALUE_NODES = 10_000;
 const ORDINARY_EVENT_BUDGET_MS = 15_000;
 const SESSION_END_BUDGET_MS = 3_000;
-const PROCESS_DRAIN_BUDGET_MS = 500;
+/** Shell-form resolution for a POSIX executor that is not this machine. */
+const REMOTE_INVOCATION = {
+    platform: 'linux',
+    findExecutable: () => undefined,
+};
 export class PluginHookRunner {
     logger;
     observer;
-    activeChildren = new Set();
+    executor;
+    remote;
+    activeExecutions = new Set();
     disposalController = new AbortController();
     disposed = false;
-    constructor(logger, observer) {
+    /**
+     * `executor` replaces local subprocess execution, e.g. to run commands in a remote compute.
+     * With an executor, the command environment carries only Hook variables and shell-form
+     * commands resolve as POSIX without probing local executables.
+     */
+    constructor(logger, observer, executor) {
         this.logger = logger;
         this.observer = observer;
+        this.executor = executor ?? spawnHookCommand;
+        this.remote = executor !== undefined;
     }
     configure(input) {
         this.logger = input.logger;
@@ -149,7 +160,7 @@ export class PluginHookRunner {
             return;
         this.disposed = true;
         this.disposalController.abort('Plugin Hook runner disposed');
-        await Promise.allSettled([...this.activeChildren].map((child) => terminateAndDrain(child)));
+        await Promise.allSettled([...this.activeExecutions]);
     }
     async runCommand(handler, input, timeoutMs, signal) {
         if (signal?.aborted || this.disposalController.signal.aborted) {
@@ -163,127 +174,157 @@ export class PluginHookRunner {
         if (!serialized) {
             return { diagnostic: runDiagnostic(handler, 'HOOK_INVALID_INPUT'), processKilled: false };
         }
-        let child;
-        const pluginDataDir = handler.pluginDataDir ?? resolvePluginDataDirectory(handler.pluginRoot, handler.pluginName);
+        let execution;
         try {
-            await mkdir(pluginDataDir, { recursive: true, mode: 0o700 });
-            const env = {
-                ...safeHookEnvironment(),
-                ...(handler.origin
-                    ? { MINIMAX_HOOKS_DIR: handler.pluginRoot, MINIMAX_HOOKS_DATA: pluginDataDir }
-                    : {
-                        MINIMAX_PLUGIN_ROOT: handler.pluginRoot,
-                        CLAUDE_PLUGIN_ROOT: handler.pluginRoot,
-                        CODEX_PLUGIN_ROOT: handler.pluginRoot,
-                        PLUGIN_ROOT: handler.pluginRoot,
-                        CLAUDE_PLUGIN_DATA: pluginDataDir,
-                        PLUGIN_DATA: pluginDataDir,
-                    }),
-                MINIMAX_PROJECT_DIR: input.cwd,
-                CLAUDE_PROJECT_DIR: input.cwd,
-                CODEX_PROJECT_DIR: input.cwd,
-                ...(handler.sourceFormat === 'CLAUDE' && handlerInput.effort
-                    ? { CLAUDE_EFFORT: handlerInput.effort.level }
-                    : {}),
-            };
-            const command = expandHookPlaceholders(handler.command, env);
-            const args = handler.args?.map((value) => expandHookPlaceholders(value, env));
-            const invocation = resolveHookCommandInvocation({
-                command,
-                ...(args ? { args } : {}),
-                ...(handler.shell ? { shell: handler.shell } : {}),
-                sourceFormat: handler.sourceFormat,
-            });
-            child = spawn(invocation.command, invocation.args, {
-                cwd: input.cwd,
-                env,
-                shell: invocation.shell,
-                detached: process.platform !== 'win32',
-                windowsHide: true,
-                stdio: ['pipe', 'pipe', 'pipe'],
+            execution = prepareExecution(handler, input, handlerInput, {
+                stdin: serialized,
+                timeoutMs,
+                signal: signal
+                    ? AbortSignal.any([signal, this.disposalController.signal])
+                    : this.disposalController.signal,
+                remote: this.remote,
             });
         }
         catch {
             return { diagnostic: runDiagnostic(handler, 'HOOK_PROCESS_ERROR'), processKilled: false };
         }
-        this.activeChildren.add(child);
-        const overflowController = new AbortController();
-        const readOutput = collectOutput(child, () => overflowController.abort());
-        child.stdin?.on('error', () => undefined);
-        child.stdin?.end(serialized);
-        try {
-            const result = await waitForChild(child, timeoutMs, [...(signal ? [signal] : []), this.disposalController.signal], overflowController.signal);
-            const captured = readOutput();
-            if (result.reason === 'aborted') {
-                return { diagnostic: runDiagnostic(handler, 'HOOK_ABORTED'), processKilled: result.killed };
-            }
-            if (result.reason === 'timeout') {
-                return { diagnostic: runDiagnostic(handler, 'HOOK_TIMEOUT'), processKilled: result.killed };
-            }
-            if (result.reason === 'overflow' || captured.overflow) {
-                return {
-                    diagnostic: runDiagnostic(handler, 'HOOK_INVALID_OUTPUT'),
-                    processKilled: result.killed,
-                };
-            }
-            if (result.reason !== 'exit') {
-                return { diagnostic: runDiagnostic(handler, 'HOOK_PROCESS_ERROR'), processKilled: true };
-            }
-            const killedDescendants = await terminateRemainingProcessGroup(child);
-            // Codex only interprets structured stdout from a successful command.
-            // MiniMax and Compatible intentionally parse JSON on every exit code; exit 2
-            // then adds the event-specific blocking effect which JSON cannot override.
-            const parsesStdout = !(handler.sourceFormat === 'CODEX' && input.event === 'SessionEnd') &&
-                (handler.sourceFormat !== 'CODEX' || result.code === 0);
-            const parsed = parsesStdout
-                ? parseDecision(captured.stdout, handler, input)
-                : { kind: 'empty', decision: defaultDecision(input.event) };
-            const exitDecision = result.code === 2
-                ? explicitExitTwoDecision(input.event, captured.stderr, handler.sourceFormat)
-                : undefined;
-            if (parsed.kind === 'invalid') {
-                if (exitDecision) {
-                    return {
-                        decision: await boundHandlerDecision(handler, input, exitDecision),
-                        processKilled: killedDescendants,
-                    };
-                }
-                return {
-                    ...(parsed.decision
-                        ? { decision: await boundHandlerDecision(handler, input, parsed.decision) }
-                        : {}),
-                    diagnostic: runDiagnostic(handler, 'HOOK_INVALID_OUTPUT'),
-                    processKilled: killedDescendants,
-                };
-            }
-            if (parsed.kind === 'structured') {
-                const decision = exitDecision
-                    ? mergeExitTwoDecision(parsed.decision, exitDecision, input.event, handler.sourceFormat, parsed.hasStructuredBlock)
-                    : parsed.decision;
-                return {
-                    decision: await boundHandlerDecision(handler, input, decision),
-                    processKilled: killedDescendants,
-                };
-            }
-            if (exitDecision)
+        const result = await this.execute(execution);
+        if (result.reason === 'aborted') {
+            return {
+                diagnostic: runDiagnostic(handler, 'HOOK_ABORTED'),
+                processKilled: result.processKilled,
+            };
+        }
+        if (result.reason === 'timeout') {
+            return {
+                diagnostic: runDiagnostic(handler, 'HOOK_TIMEOUT'),
+                processKilled: result.processKilled,
+            };
+        }
+        if (result.reason === 'overflow') {
+            return {
+                diagnostic: runDiagnostic(handler, 'HOOK_INVALID_OUTPUT'),
+                processKilled: result.processKilled,
+            };
+        }
+        if (result.reason !== 'exit') {
+            return {
+                diagnostic: runDiagnostic(handler, 'HOOK_PROCESS_ERROR'),
+                processKilled: result.processKilled,
+            };
+        }
+        const killedDescendants = result.processKilled;
+        // Codex only interprets structured stdout from a successful command.
+        // MiniMax and Compatible intentionally parse JSON on every exit code; exit 2
+        // then adds the event-specific blocking effect which JSON cannot override.
+        const parsesStdout = !(handler.sourceFormat === 'CODEX' && input.event === 'SessionEnd') &&
+            (handler.sourceFormat !== 'CODEX' || result.code === 0);
+        const parsed = parsesStdout
+            ? parseDecision(result.stdout, handler, input)
+            : { kind: 'empty', decision: defaultDecision(input.event) };
+        const exitDecision = result.code === 2
+            ? explicitExitTwoDecision(input.event, result.stderr, handler.sourceFormat)
+            : undefined;
+        if (parsed.kind === 'invalid') {
+            if (exitDecision) {
                 return {
                     decision: await boundHandlerDecision(handler, input, exitDecision),
                     processKilled: killedDescendants,
                 };
-            if (result.code !== 0) {
-                return {
-                    diagnostic: runDiagnostic(handler, 'HOOK_PROCESS_EXITED'),
-                    processKilled: killedDescendants,
-                };
             }
             return {
-                decision: await boundHandlerDecision(handler, input, parsed.decision),
+                ...(parsed.decision
+                    ? { decision: await boundHandlerDecision(handler, input, parsed.decision) }
+                    : {}),
+                diagnostic: runDiagnostic(handler, 'HOOK_INVALID_OUTPUT'),
                 processKilled: killedDescendants,
             };
         }
-        finally {
-            this.activeChildren.delete(child);
+        if (parsed.kind === 'structured') {
+            const decision = exitDecision
+                ? mergeExitTwoDecision(parsed.decision, exitDecision, input.event, handler.sourceFormat, parsed.hasStructuredBlock)
+                : parsed.decision;
+            return {
+                decision: await boundHandlerDecision(handler, input, decision),
+                processKilled: killedDescendants,
+            };
         }
+        if (exitDecision)
+            return {
+                decision: await boundHandlerDecision(handler, input, exitDecision),
+                processKilled: killedDescendants,
+            };
+        if (result.code !== 0) {
+            return {
+                diagnostic: runDiagnostic(handler, 'HOOK_PROCESS_EXITED'),
+                processKilled: killedDescendants,
+            };
+        }
+        return {
+            decision: await boundHandlerDecision(handler, input, parsed.decision),
+            processKilled: killedDescendants,
+        };
+    }
+    async execute(execution) {
+        const pending = invokeExecutor(this.executor, execution);
+        this.activeExecutions.add(pending);
+        try {
+            return await pending;
+        }
+        finally {
+            this.activeExecutions.delete(pending);
+        }
+    }
+}
+function prepareExecution(handler, input, handlerInput, context) {
+    const pluginDataDir = handler.pluginDataDir ?? resolvePluginDataDirectory(handler.pluginRoot, handler.pluginName);
+    const env = {
+        ...(context.remote ? {} : safeHookEnvironment()),
+        ...(handler.origin
+            ? { MINIMAX_HOOKS_DIR: handler.pluginRoot, MINIMAX_HOOKS_DATA: pluginDataDir }
+            : {
+                MINIMAX_PLUGIN_ROOT: handler.pluginRoot,
+                CLAUDE_PLUGIN_ROOT: handler.pluginRoot,
+                CODEX_PLUGIN_ROOT: handler.pluginRoot,
+                PLUGIN_ROOT: handler.pluginRoot,
+                CLAUDE_PLUGIN_DATA: pluginDataDir,
+                PLUGIN_DATA: pluginDataDir,
+            }),
+        MINIMAX_PROJECT_DIR: input.cwd,
+        CLAUDE_PROJECT_DIR: input.cwd,
+        CODEX_PROJECT_DIR: input.cwd,
+        ...(handler.sourceFormat === 'CLAUDE' && handlerInput.effort
+            ? { CLAUDE_EFFORT: handlerInput.effort.level }
+            : {}),
+    };
+    const command = expandHookPlaceholders(handler.command, env);
+    const args = handler.args?.map((value) => expandHookPlaceholders(value, env));
+    const invocation = resolveHookCommandInvocation({
+        command,
+        ...(args ? { args } : {}),
+        ...(handler.shell ? { shell: handler.shell } : {}),
+        sourceFormat: handler.sourceFormat,
+    }, context.remote ? REMOTE_INVOCATION : undefined);
+    return {
+        sessionId: input.sessionId,
+        command: invocation.command,
+        args: invocation.args,
+        shell: invocation.shell,
+        cwd: input.cwd,
+        env,
+        stdin: context.stdin,
+        timeoutMs: context.timeoutMs,
+        signal: context.signal,
+        pluginDataDir,
+        pluginRoot: handler.pluginRoot,
+    };
+}
+async function invokeExecutor(executor, execution) {
+    try {
+        return await executor(execution);
+    }
+    catch {
+        return { reason: 'error', processKilled: false };
     }
 }
 /** Per-Plugin writable directory shared by Hooks and Plugin Agent prompts. */
@@ -326,140 +367,6 @@ function observeEvent(observer, input) {
     }
     catch {
         // Observability is best-effort and must never change Hook behavior.
-    }
-}
-function collectOutput(child, onOverflow) {
-    let stdout = Buffer.alloc(0);
-    let stderr = Buffer.alloc(0);
-    let overflow = false;
-    child.stdout?.on('data', (chunk) => {
-        if (stdout.length + chunk.length > MAX_OUTPUT_BYTES && !overflow) {
-            overflow = true;
-            onOverflow();
-        }
-        stdout = Buffer.concat([stdout, chunk]).subarray(0, MAX_OUTPUT_BYTES);
-    });
-    child.stderr?.on('data', (chunk) => {
-        if (stderr.length + chunk.length > MAX_OUTPUT_BYTES && !overflow) {
-            overflow = true;
-            onOverflow();
-        }
-        stderr = Buffer.concat([stderr, chunk]).subarray(0, MAX_OUTPUT_BYTES);
-    });
-    return () => ({
-        stdout: stdout.toString('utf8'),
-        stderr: stderr.toString('utf8'),
-        overflow,
-    });
-}
-function waitForChild(child, timeoutMs, signals, overflowSignal) {
-    return new Promise((resolve) => {
-        let settled = false;
-        let stopping = false;
-        let timer;
-        const finish = (value) => {
-            if (settled)
-                return;
-            settled = true;
-            if (timer)
-                clearTimeout(timer);
-            for (const signal of signals)
-                signal.removeEventListener('abort', abort);
-            overflowSignal.removeEventListener('abort', overflow);
-            resolve(value);
-        };
-        const stop = async (reason) => {
-            if (stopping || settled)
-                return;
-            stopping = true;
-            await terminateAndDrain(child);
-            finish({ reason, killed: true });
-        };
-        const abort = () => void stop('aborted');
-        const overflow = () => void stop('overflow');
-        timer = setTimeout(() => void stop('timeout'), timeoutMs);
-        child.once('error', () => finish({ reason: 'exit', code: 1, killed: false }));
-        child.once('close', (code) => {
-            if (!stopping)
-                finish({ reason: 'exit', code: code ?? 1, killed: false });
-        });
-        for (const signal of signals)
-            signal.addEventListener('abort', abort, { once: true });
-        overflowSignal.addEventListener('abort', overflow, { once: true });
-        if (signals.some((signal) => signal.aborted))
-            abort();
-        else if (overflowSignal.aborted)
-            overflow();
-    });
-}
-async function terminateAndDrain(child) {
-    const closed = new Promise((resolve) => {
-        if (child.exitCode !== null || child.signalCode !== null)
-            resolve();
-        else
-            child.once('close', () => resolve());
-    });
-    try {
-        if (process.platform === 'win32' && child.pid) {
-            const killed = await waitBounded(runTaskkill(child.pid), PROCESS_DRAIN_BUDGET_MS, false);
-            if (!killed)
-                child.kill('SIGKILL');
-        }
-        else if (child.pid) {
-            process.kill(-child.pid, 'SIGKILL');
-        }
-        else {
-            child.kill('SIGKILL');
-        }
-    }
-    catch {
-        try {
-            child.kill('SIGKILL');
-        }
-        catch {
-            // The process may already have exited.
-        }
-    }
-    await waitBounded(closed, PROCESS_DRAIN_BUDGET_MS, undefined);
-}
-async function terminateRemainingProcessGroup(child) {
-    if (!child.pid)
-        return false;
-    if (process.platform === 'win32') {
-        return await waitBounded(runTaskkill(child.pid), PROCESS_DRAIN_BUDGET_MS, false);
-    }
-    try {
-        process.kill(-child.pid, 'SIGKILL');
-        return true;
-    }
-    catch {
-        return false;
-    }
-}
-async function runTaskkill(pid) {
-    return new Promise((resolve) => {
-        const killer = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
-            windowsHide: true,
-            stdio: 'ignore',
-        });
-        killer.once('error', () => resolve(false));
-        killer.once('close', (code) => resolve(code === 0));
-    });
-}
-async function waitBounded(operation, timeoutMs, timeoutValue) {
-    let timer;
-    try {
-        return await Promise.race([
-            operation,
-            new Promise((resolve) => {
-                timer = setTimeout(() => resolve(timeoutValue), timeoutMs);
-                timer.unref?.();
-            }),
-        ]);
-    }
-    finally {
-        if (timer)
-            clearTimeout(timer);
     }
 }
 function parseDecision(stdout, handler, input) {
@@ -1874,13 +1781,14 @@ function matcherValues(handler, input) {
     const adapted = adaptVendorInput(handler, input).matcherValue;
     if (!adapted)
         return [];
+    const aliases = input.matcherAliases ?? [];
     if (handler.sourceFormat !== 'CODEX')
-        return [adapted];
+        return [adapted, ...aliases];
     if (adapted === 'apply_patch')
-        return [adapted, 'Write', 'Edit'];
+        return [adapted, 'Write', 'Edit', ...aliases];
     if (adapted === 'spawn_agent')
-        return [adapted, 'Agent'];
-    return [adapted];
+        return [adapted, 'Agent', ...aliases];
+    return [adapted, ...aliases];
 }
 function compatiblePermissionMode(value, sourceFormat) {
     if (!value)

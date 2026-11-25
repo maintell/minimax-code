@@ -277,6 +277,7 @@ export class MainOwnedMiniAppSurfaceBroker {
             sessionId: message.sessionId,
             pluginId: message.pluginId,
             ...(message.path !== undefined ? { path: message.path } : {}),
+            ...(message.turnId !== undefined ? { turnId: message.turnId } : {}),
             signal: request.controller.signal,
             isGenerationCurrent: () => this.pendingByTarget.get(target)?.get(message.requestId) === request,
         })
@@ -561,6 +562,7 @@ export class UtilityMiniAppSurfaceClient {
             sessionId: input.sessionId,
             pluginId: input.pluginId,
             ...(input.path !== undefined ? { path: input.path } : {}),
+            ...(input.turnId !== undefined ? { turnId: input.turnId } : {}),
         };
         if (!isMiniAppSurfaceOpenRequestMessage(message) || this.hasPending(requestId)) {
             return Promise.reject(surfaceError('invalid_request'));
@@ -695,10 +697,11 @@ function isMiniAppSurfaceOpenRequestMessage(value) {
     // The Main-owned surface validates path syntax; the broker only bounds the wire value.
     return (isRecord(value) &&
         value.type === 'miniapp-surface-open' &&
-        hasOnlyKeys(value, ['type', 'requestId', 'sessionId', 'pluginId', 'path']) &&
+        hasOnlyKeys(value, ['type', 'requestId', 'sessionId', 'pluginId', 'path', 'turnId']) &&
         isSafeBrokerRequestId(value.requestId) &&
         isSafeIdentifier(value.sessionId) &&
         isSafeIdentifier(value.pluginId) &&
+        (value.turnId === undefined || isSafeIdentifier(value.turnId)) &&
         (value.path === undefined ||
             (typeof value.path === 'string' && value.path.length > 0 && value.path.length <= 4096)));
 }

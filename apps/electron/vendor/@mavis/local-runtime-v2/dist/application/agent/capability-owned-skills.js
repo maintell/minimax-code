@@ -27,21 +27,19 @@ export function withCapabilityOwnedSkills(baseSkills, ownedFor) {
                 ],
             };
         },
-        renderCatalog: (scope) => {
+        listCatalogEntries: async (scope) => {
+            const base = await baseSkills.listCatalogEntries(scope);
             const owned = ownedFor(scope.surface);
             if (owned.length === 0)
-                return baseSkills.renderCatalog(scope);
-            return baseSkills.renderCatalog({
-                ...scope,
-                additionalSkills: [
-                    ...(scope.additionalSkills ?? []).filter(notOwned(owned)),
-                    ...owned.map((skill) => ({
-                        name: skill.name,
-                        description: skill.description,
-                        builtin: true,
-                    })),
-                ],
-            });
+                return base;
+            return [
+                ...base.filter(notOwned(owned)),
+                ...owned.map((skill) => ({
+                    name: skill.name,
+                    description: skill.description,
+                    builtin: true,
+                })),
+            ];
         },
     };
 }

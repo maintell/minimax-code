@@ -7,14 +7,29 @@ import { markV2Injected } from './response-mode/v2-answer-delivery.js';
 import { buildQuestionnaireImageResult } from './response-mode/context-image-result.js';
 import { resolveQuestionnaireAnswers, serializeQuestionnaireResponseMessage, } from '@mavis/shared/questionnaire-response';
 import { LocalQuestionnaireService, } from './orchestration/service.js';
-export function buildLocalAskUserAdapter(ctx) {
+/**
+ * The Desktop question port the harness builds ask_user and
+ * request_feature_enable from. A sync question is created in `begin`; `await`
+ * then waits for it without a time limit and always releases it.
+ */
+export function createLocalUserQuestionHost(ctx) {
     if (!ctx || ctx.configGetter().askUser?.enabled === false)
         return undefined;
+    // Keyed by the handle `begin` returned; the harness passes the same object to `await`.
+    const pending = new WeakMap();
     return {
-        begin: async (toolCtx, toolInput, signal) => beginLocalAskUserQuestionnaire(ctx, toolCtx, toolInput, signal),
+        begin: async (toolCtx, toolInput, signal) => beginLocalAskUserQuestionnaire({ ctx, pending }, toolCtx, toolInput, signal),
+        await: async (handle, signal) => {
+            const sync = pending.get(handle);
+            if (!sync)
+                throw new Error(`ask_user ${handle.requestId} has no sync wait to await`);
+            pending.delete(handle);
+            return awaitSyncAnswer(ctx, sync, signal);
+        },
     };
 }
-async function beginLocalAskUserQuestionnaire(ctx, toolCtx, toolInput, signal) {
+async function beginLocalAskUserQuestionnaire(host, toolCtx, toolInput, signal) {
+    const { ctx } = host;
     if (signal?.aborted)
         throw new Error('Operation aborted');
     const mode = toolInput.mode ?? 'questionnaire';
@@ -56,12 +71,12 @@ async function beginLocalAskUserQuestionnaire(ctx, toolCtx, toolInput, signal) {
         logger.info({ requestId: result.requestId, sessionId: toolCtx.sessionId, responseMode: 'async' }, 'ask_user returned without waiting');
         return v2;
     }
-    const autoSelectAt = goalSkipAutoSelectAt(decision, result);
+    host.pending.set(v2, { toolCtx, result, autoSelectAt: goalSkipAutoSelectAt(decision, result) });
+    return v2;
+}
+async function awaitSyncAnswer(ctx, { toolCtx, result, autoSelectAt }, signal) {
     try {
-        return {
-            ...v2,
-            outcome: await waitForSyncAnswer(ctx, toolCtx, result, { autoSelectAt, signal }),
-        };
+        return await waitForSyncAnswer(ctx, toolCtx, result, { autoSelectAt, signal });
     }
     finally {
         // wait() removes its own entry; this only clears a reservation the wait
@@ -83,7 +98,14 @@ function buildAskUserBeginInput(toolCtx, toolInput, decision) {
         agentName: toolCtx.agentName,
         runId: toolCtx.turnId,
         callId: toolCtx.toolCallId,
-        ...(toolCtx.channelContext ? { originChannelContext: toolCtx.channelContext } : {}),
+        ...(toolCtx.channelContext
+            ? {
+                // The same object the Turn was admitted with. The harness types
+                // chatType/clientName as optional; the store keeps the context only
+                // when every required channel field is present.
+                originChannelContext: toolCtx.channelContext,
+            }
+            : {}),
         ...(decision.v2 ? { responseMode: decision.responseMode } : {}),
         ...(autoSelectAfterMs !== undefined ? { fillRecommendation: true, autoSelectAfterMs } : {}),
         toolInput,
@@ -210,7 +232,7 @@ async function waitForSyncAnswer(ctx, toolCtx, result, wait) {
     const media = await buildQuestionnaireImageResult(ctx, {
         sessionId: toolCtx.sessionId,
         reply: outcome.reply,
-        capabilities: toolCtx.parentAgentConfig?.model.capabilities,
+        capabilities: modelCapabilities(toolCtx),
         signal: wait.signal,
     });
     if (outcome.buffered || media.contextImages?.length) {
@@ -240,6 +262,11 @@ async function waitForSyncAnswer(ctx, toolCtx, result, wait) {
         // Same content the legacy answer message carries, moved into the tool result.
         content: serializeQuestionnaireResponseMessage(result.record.request, outcome.reply, ctx.resolveLocale?.()),
     };
+}
+/** The Turn's model capabilities; the harness carries the agent config untyped. */
+function modelCapabilities(toolCtx) {
+    const model = toolCtx.parentAgentConfig?.model;
+    return model?.capabilities;
 }
 /** Wait for the sync answer; in Goal + skip the recommended options answer at `autoSelectAt`. */
 async function waitWithAutoSelect(target, { autoSelectAt, signal }) {

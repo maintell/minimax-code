@@ -1,6 +1,7 @@
 import { getConfig } from '@mavis/config';
 import { LocalRuntimeApiHost } from './host.js';
 import { copyV2LayoutMigrationReceipt } from '../../infra/legacy-db/v2-migration.js';
+import { withEffectiveAdvisorConfig } from '../../infra/config/effective-advisor.js';
 import { withEffectiveBunnyConfig } from '../../infra/config/effective-bunny.js';
 import { withEffectivePromptSuggestionConfig } from '../../infra/config/effective-prompt-suggestion.js';
 import { updateLocalConfigFile } from '../../infra/config/update.js';
@@ -99,6 +100,7 @@ export function createLocalRuntimeHost(options) {
         skillEnabledState: options.skillEnabledState,
         skillRuntime: options.skillRuntime,
         pluginHookPermissionStore: options.pluginHookPermissionStore,
+        mergeRequests: options.mergeRequests,
         contentSafety: options.contentSafety,
         cliSunsetNotice: options.cliSunsetNotice,
         defaultWorkspaceDir: options.defaultWorkspaceDir,
@@ -141,8 +143,8 @@ export function createLocalRuntimeHost(options) {
 }
 function resolveHostConfig(options, metricsClient) {
     // Every config this host hands out carries the effective prompt-suggestion
-    // and Next Step opt-ins and the effective Bunny beta switch.
-    const config = withEffectiveBunnyConfig({
+    // and Next Step opt-ins, the effective Bunny beta switch and the advisor switch.
+    const effective = withEffectiveBunnyConfig({
         ...withEffectivePromptSuggestionConfig({
             configGetter: options.configGetter ?? (() => getConfig()),
             configUpdater: options.configUpdater ?? updateLocalConfigFile,
@@ -153,6 +155,7 @@ function resolveHostConfig(options, metricsClient) {
         ...(options.bunnyBuildVariant ? { buildVariant: options.bunnyBuildVariant } : {}),
         metricsClient,
     });
+    const config = withEffectiveAdvisorConfig(effective);
     // Read the warnings off the config this host actually runs on, not off the
     // global `getConfig()`. Both product entries derive their getter from
     // `getConfig()`, so a clamped `goal` key still surfaces here; tests that
@@ -190,18 +193,23 @@ function createHostTelemetry(options) {
             ],
         });
     const telemetry = composeTelemetrySinks(options.telemetry, createLocalRuntimeTelemetrySink(observability));
-    const metricsClient = options.metricsClient ?? buildLocalRuntimeMetricsClient(options);
+    const uploadsEnabled = options.diagnosticUploadsEnabled !== false;
+    const metricsClient = (uploadsEnabled ? options.metricsClient : undefined) ?? buildLocalRuntimeMetricsClient(options);
     const evalReporterFactory = options.evalCapture
         ? new LocalEvalReporterFactory({ ...options.evalCapture, metricsClient })
         : undefined;
-    const errorReporter = createDesktopErrorReporter({
-        ...(options.authContextGetter ? { authContextGetter: options.authContextGetter } : {}),
-        ...(options.routingContextGetter ? { routingContextGetter: options.routingContextGetter } : {}),
-        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
-    });
-    const llmRequestFailureHook = createLLMFailureReportHook(errorReporter, {
-        ...(options.appVersion ? { appVersion: options.appVersion } : {}),
-    });
+    const errorReporter = uploadsEnabled
+        ? createDesktopErrorReporter({
+            authContextGetter: options.authContextGetter,
+            routingContextGetter: options.routingContextGetter,
+            fetchImpl: options.fetchImpl,
+        })
+        : undefined;
+    const llmRequestFailureHook = errorReporter
+        ? createLLMFailureReportHook(errorReporter, {
+            appVersion: options.appVersion,
+        })
+        : undefined;
     const bashCompletionCorrelation = new LocalBashCompletionCorrelation(metricsClient);
     // Runtime-start beacon: one bare-name counter per host boot (stored as
     // `local_runtime_started_total` — the server prepends the service name).

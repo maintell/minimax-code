@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 /** Config documents and their copies can contain plaintext credentials. */
 export const PRIVATE_CONFIG_FILE_MODE = 0o600;
@@ -24,6 +25,46 @@ export function writePrivateConfigFileSync(filePath, content, exclusive = false)
     }
     finally {
         fs.closeSync(fd);
+    }
+}
+const TEMPORARY_SUFFIX = '.tmp';
+/** A unique sibling of `target` for an atomic replace; see isPrivateTemporaryNameFor. */
+export function privateTemporaryPath(target) {
+    return `${target}.${process.pid}.${randomUUID()}${TEMPORARY_SUFFIX}`;
+}
+const TEMPORARY_PART = /^\.\d+\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+/**
+ * Whether `name` is exactly a privateTemporaryPath() of the file named
+ * `targetName` (pid and UUID). Callers treat such files as the app's own, and
+ * data-dir migration may delete them, so a user's look-alike (`….bak.tmp`)
+ * must not match.
+ */
+export function isPrivateTemporaryNameFor(name, targetName) {
+    return name.startsWith(targetName) && TEMPORARY_PART.test(name.slice(targetName.length));
+}
+/**
+ * Replaces `target` atomically with an owner-only file: the content goes to an
+ * exclusively created temporary sibling first, so a reader sees either the old
+ * or the new file, never a partial one. The temporary file is removed when any
+ * step fails, and the error is rethrown. `retry` wraps the rename (Windows
+ * reports sharing violations while another process has the target open).
+ */
+export function writePrivateFileAtomicSync(target, content, retry = (operation) => operation()) {
+    const temporary = privateTemporaryPath(target);
+    try {
+        // A brand-new file has nothing to truncate: exclusive creation applies the
+        // owner-only mode before any byte is written.
+        fs.writeFileSync(temporary, content, { flag: 'wx', mode: PRIVATE_CONFIG_FILE_MODE });
+        retry(() => fs.renameSync(temporary, target));
+    }
+    catch (error) {
+        try {
+            fs.unlinkSync(temporary);
+        }
+        catch {
+            // Not created, or already renamed.
+        }
+        throw error;
     }
 }
 //# sourceMappingURL=private-config-file.js.map

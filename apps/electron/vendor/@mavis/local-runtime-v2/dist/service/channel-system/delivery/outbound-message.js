@@ -20,6 +20,10 @@ export function prepareChannelOutboundMessage(input) {
         text: executionFailureReplyText(input.error),
         ...(input.sessionId ? { sessionId: input.sessionId } : {}),
         ...(input.queueItemId ? { queueItemId: input.queueItemId } : {}),
+        // Delivery scope survives the rewrite: a wake-up reply stays a wake-up
+        // reply, so it still must not touch the originating message's card.
+        ...(input.noticeKind ? { noticeKind: input.noticeKind } : {}),
+        ...(input.replyScope ? { replyScope: input.replyScope } : {}),
     };
 }
 function executionFailureReplyText(error) {

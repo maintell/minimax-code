@@ -8,6 +8,7 @@
  */
 import { ipcMain } from "electron";
 import { LOCAL_DESKTOP_RUNTIME_ID, isDesktopRuntimeId, sshProjectIdFromRuntimeId } from "@mavis/shared/desktop-runtime";
+import { inlineTerminalActions } from "../modules/terminal/inline-actions";
 import { IPC_CHANNELS } from "../config/constants";
 import { logger } from "../utils";
 import { getTerminalManager } from "../modules/terminal";
@@ -25,6 +26,10 @@ export function setupTerminalIPC(options = {}) {
     if (registered)
         return;
     registered = true;
+    ipcMain.handle(IPC_CHANNELS.TERMINAL_INLINE_START, (_event, params) => inlineTerminalActions.start(params));
+    ipcMain.handle(IPC_CHANNELS.TERMINAL_INLINE_READ, (_event, params) => inlineTerminalActions.read(params));
+    ipcMain.handle(IPC_CHANNELS.TERMINAL_SECRET_INPUT, (_event, params) => inlineTerminalActions.secretInput(params));
+    ipcMain.handle(IPC_CHANNELS.TERMINAL_INLINE_DISPOSE_SESSION, (_event, params) => inlineTerminalActions.disposeSession(params));
     ipcMain.handle(IPC_CHANNELS.TERMINAL_CREATE, async (_evt, params) => {
         requireString(params?.sessionId, 'sessionId');
         requireString(params?.cwd, 'cwd');
@@ -92,7 +97,11 @@ export function setupTerminalIPC(options = {}) {
         if (typeof params?.data !== 'string') {
             throw new Error('terminal:input: data must be a string');
         }
-        getTerminalManager().write(params.terminalId, params.data, requireAvailableRuntime(params.runtimeId, options));
+        const runtimeId = requireAvailableRuntime(params.runtimeId, options);
+        if (runtimeId === LOCAL_DESKTOP_RUNTIME_ID) {
+            inlineTerminalActions.noteInput(params.terminalId, params.data);
+        }
+        getTerminalManager().write(params.terminalId, params.data, runtimeId);
     });
     ipcMain.handle(IPC_CHANNELS.TERMINAL_RESIZE, async (_evt, params) => {
         requireString(params?.terminalId, 'terminalId');

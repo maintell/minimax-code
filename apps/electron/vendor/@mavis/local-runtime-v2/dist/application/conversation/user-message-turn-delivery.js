@@ -1,6 +1,6 @@
 import { parsePluginMentions } from '@mavis/shared/plugin-mention';
 import { randomUUID } from 'node:crypto';
-import { UserMessageCommitAdmissionError, UserMessageCommitConflictError, retryUserMessageCommit, writeQueryCollapseView, } from '../../service/session-system/index.js';
+import { UserMessageCommitAdmissionError, UserMessageCommitConflictError, isDeterministicUserMessageCommitRejection, retryUserMessageCommit, writeQueryCollapseView, } from '../../service/session-system/index.js';
 import { CHANNEL_STEER_PRODUCER_ID } from '../../service/channel-system/index.js';
 import { isUserSteeringProducer, resolveGenuineUserQueryText, } from '../../service/turn-system/index.js';
 import { sessionClioDirectQueryId, sessionClioSteeringQueryId, } from '../../service/session-clio/index.js';
@@ -106,7 +106,9 @@ async function executeDelivery(options, input) {
         // or evidence that a Turn consumed it.
         if (!result)
             await captureSessionClioQuery(options, input, undefined, genuineUserQueryText);
-        if (accepted && input.propagateDeliveryFailure) {
+        if (accepted &&
+            input.propagateDeliveryFailure &&
+            !isDeterministicUserMessageCommitRejection(error)) {
             start.fail(error);
             throw error;
         }

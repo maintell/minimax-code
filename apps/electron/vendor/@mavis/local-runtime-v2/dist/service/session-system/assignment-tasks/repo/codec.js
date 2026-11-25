@@ -37,6 +37,7 @@ export function decodeAssignmentTask(row, facts = {}) {
         ...present('goal', row.goal),
         ...present('doneWhen', row.doneWhen),
         ...present('userWords', row.userWords),
+        ...present('originChannel', readOriginChannel(row.originChannel)),
         ...present('review', decodeReview(row, where)),
         ...present('completion', decodeCompletion(row, where, facts.details)),
         ...present('pendingStart', decodePendingStart(row, where)),
@@ -49,6 +50,7 @@ export function decodeAssignmentTask(row, facts = {}) {
         ...present('reviewTask', facts.details?.reviewTask),
         ...present('verdict', facts.details?.verdict),
         ...present('verdictClaim', facts.details?.verdictClaim),
+        ...present('verdictGateReleased', facts.details?.verdictGateReleased),
         ...present('reviewOf', facts.details?.reviewOf),
     };
 }
@@ -76,6 +78,7 @@ function decodeCompletion(row, where, details) {
         by: requireMember(required(row.completionBy, `${where}.completion_by`), COMPLETION_ACTORS, `${where}.completion_by`),
         at: required(row.completionAtMs, `${where}.completion_at_ms`),
         ...(details?.completionReason ? { reason: details.completionReason } : {}),
+        ...(details?.completionAutomatic ? { automatic: true } : {}),
         ...(row.completionSummary === null ? {} : { summary: row.completionSummary }),
         ...(details?.completionArtifacts ? { artifacts: [...details.completionArtifacts] } : {}),
         ...(details?.successorSessionId ? { successorSessionId: details.successorSessionId } : {}),
@@ -84,10 +87,18 @@ function decodeCompletion(row, where, details) {
 function decodePendingStart(row, where) {
     if (row.pendingStartContent === null)
         return undefined;
+    const attachments = readPaths(row.pendingStartAttachments);
     return {
         content: row.pendingStartContent,
         queuedAt: required(row.pendingStartQueuedAtMs, `${where}.pending_start_queued_at_ms`),
+        ...(attachments.length ? { attachments } : {}),
     };
+}
+/** A stored path list; anything that is not a list of non-empty paths reads as none. */
+function readPaths(value) {
+    if (!Array.isArray(value))
+        return [];
+    return value.filter((item) => typeof item === 'string' && item.trim() !== '');
 }
 /** Columns owned by a projection; identity, revision and timestamps are added by the writer. */
 export function encodeAssignmentTask(assignment) {
@@ -103,6 +114,7 @@ export function encodeAssignmentTask(assignment) {
         goal: assignment.goal ?? null,
         doneWhen: assignment.doneWhen ? [...assignment.doneWhen] : null,
         userWords: assignment.userWords ?? null,
+        originChannel: assignment.originChannel ? originChannelColumn(assignment.originChannel) : null,
         requestId: assignment.requestId ?? null,
         requestAssignerSessionId: assignment.requestAssignerSessionId ?? null,
         lastReportedKey: assignment.lastReportedKey ?? null,
@@ -114,6 +126,9 @@ function encodeGroups({ pendingStart, completion, review }) {
     return {
         pendingStartContent: pendingStart?.content ?? null,
         pendingStartQueuedAtMs: pendingStart?.queuedAt ?? null,
+        pendingStartAttachments: pendingStart?.attachments?.length
+            ? [...pendingStart.attachments]
+            : null,
         ...encodeCompletion(completion),
         reviewSessionId: review?.sessionId ?? null,
         reviewTurnId: review?.turnId ?? null,
@@ -161,11 +176,13 @@ export function projectTaskFacts(events) {
 /** The facts of `assignment` that `task.details_set` stores. */
 export function taskDetails(assignment) {
     const reason = assignment?.completion?.reason;
+    const automatic = assignment?.completion?.automatic;
     const artifacts = assignment?.completion?.artifacts;
     const successor = assignment?.completion?.successorSessionId;
     const reviewError = assignment?.reviewError;
     return {
         ...(reason ? { completionReason: reason } : {}),
+        ...(automatic ? { completionAutomatic: true } : {}),
         ...(artifacts?.length ? { completionArtifacts: [...artifacts] } : {}),
         ...(successor ? { successorSessionId: successor } : {}),
         ...(reviewError
@@ -188,6 +205,7 @@ function readDetails(value) {
     if (typeof value !== 'object' || value === null)
         return undefined;
     const reason = Reflect.get(value, 'completionReason');
+    const automatic = Reflect.get(value, 'completionAutomatic');
     const artifacts = readArtifacts(Reflect.get(value, 'completionArtifacts'));
     const successor = Reflect.get(value, 'successorSessionId');
     const reviewError = Reflect.get(value, 'reviewError');
@@ -197,6 +215,7 @@ function readDetails(value) {
             : {
                 completionReason: requireMember(String(reason), COMPLETION_REASONS, 'task.details_set.completionReason'),
             }),
+        ...(automatic === true ? { completionAutomatic: true } : {}),
         ...(artifacts?.length ? { completionArtifacts: artifacts } : {}),
         ...(typeof successor === 'string' && successor ? { successorSessionId: successor } : {}),
         ...(reviewError === undefined ? {} : { reviewError: readReviewError(reviewError) }),
@@ -232,6 +251,48 @@ function readRetries(value) {
 function isCount(value) {
     return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
+const ORIGIN_REQUIRED = ['platform', 'clientName', 'chatId', 'chatType'];
+/**
+ * Keeps only address fields, so nothing else a caller put on the object (such
+ * as a WeChat context token) reaches the column.
+ */
+export function originChannelColumn(origin) {
+    return {
+        platform: origin.platform,
+        clientName: origin.clientName,
+        chatId: origin.chatId,
+        chatType: origin.chatType,
+        ...presentText('senderId', origin.senderId),
+        ...presentText('threadId', origin.threadId),
+        ...presentText('sourceMessageId', origin.sourceMessageId),
+    };
+}
+function presentText(key, value) {
+    if (typeof value !== 'string' || !value.trim())
+        return {};
+    const field = {};
+    field[key] = value;
+    return field;
+}
+/** A malformed or partial address reads as none: the task just stays on the desktop. */
+export function readOriginChannel(value) {
+    if (typeof value !== 'object' || value === null)
+        return undefined;
+    for (const key of ORIGIN_REQUIRED) {
+        const field = Reflect.get(value, key);
+        if (typeof field !== 'string' || !field.trim())
+            return undefined;
+    }
+    return originChannelColumn(value);
+}
+function validateOriginChannel(origin) {
+    if (origin &&
+        ORIGIN_REQUIRED.some((key) => {
+            const field = origin[key];
+            return typeof field !== 'string' || !field.trim();
+        }))
+        throw new Error('assignment.originChannel must name platform, client, chat and chat type');
+}
 function validateAssignment(assignment) {
     requireMember(assignment.via, VIA, 'assignment.via');
     // Only Bunny assigns, and its tasks never assign further: every task is one level deep.
@@ -243,6 +304,9 @@ function validateAssignment(assignment) {
         throw new Error('assignment.assignedAt must be a safe integer');
     if (assignment.doneWhen?.some((item) => typeof item !== 'string' || !item.trim()))
         throw new Error('assignment.doneWhen must contain non-empty strings');
+    validateOriginChannel(assignment.originChannel);
+    if (assignment.pendingStart?.attachments?.some((item) => typeof item !== 'string' || !item.trim()))
+        throw new Error('pendingStart.attachments must contain non-empty paths');
     if (assignment.completion) {
         requireMember(assignment.completion.state, COMPLETION_STATES, 'completion.state');
         requireMember(assignment.completion.by, COMPLETION_ACTORS, 'completion.by');

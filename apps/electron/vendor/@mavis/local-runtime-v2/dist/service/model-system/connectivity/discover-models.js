@@ -1,3 +1,5 @@
+import { logger } from '@mavis/shared/local-runtime-logging';
+import { describeFetchFailure } from './fetch-failure.js';
 import { buildModelDiscoveryHeaders, providerModelsUrls } from './provider-request.js';
 // 候选全部缺失时对外只表达“该提供商没有模型列表接口”，状态码对用户没有判断价值；
 // 产品文案据此提示手动添加模型。
@@ -39,6 +41,13 @@ export class ModelDiscoveryClient {
         if (!page.ok)
             return page;
         if (target.api === 'google-generative-ai') {
+            // Compatible gateways often expose only an OpenAI-shaped `{ data: [...] }`
+            // list under `/v1/models`; accept it instead of treating missing `models` as empty.
+            if (!hasOwnGeminiModelsField(page.payload)) {
+                const openAiModels = readModels(page.payload);
+                if (openAiModels)
+                    return { ok: true, models: openAiModels };
+            }
             return this.collectGeminiPages(url, target, page.payload);
         }
         const models = readModels(page.payload);
@@ -95,6 +104,11 @@ export class ModelDiscoveryClient {
                     errorMessage: `Request timed out after ${this.timeoutMs}ms`,
                 };
             }
+            logger.warn({
+                event: 'model_provider_request_failed',
+                op: 'discover',
+                ...describeFetchFailure(error, url),
+            }, 'Model provider request failed');
             return { ok: false, errorCode: 'network', errorMessage: 'Network error' };
         }
         finally {
@@ -142,6 +156,12 @@ function readModels(payload) {
  * supportedGenerationMethods}], nextPageToken}`. Embedding and other
  * non-chat models do not support `generateContent` and are skipped.
  */
+function hasOwnGeminiModelsField(payload) {
+    return Boolean(payload &&
+        typeof payload === 'object' &&
+        !Array.isArray(payload) &&
+        Object.hasOwn(payload, 'models'));
+}
 function readGeminiModelsPage(payload) {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload))
         return undefined;

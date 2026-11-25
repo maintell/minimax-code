@@ -9,17 +9,21 @@ export const GLOBAL_EVENT_TYPES = [
     'agent.updated',
     'project.icon_updated',
     'project.metadata_updated',
+    'sidebar.changed',
+    'ui.request',
     'session.created',
     'session.visibility_updated',
     'session.deleted',
     'session.pinned_updated',
     'session.title_updated',
     'session.model_updated',
+    'session.workspace_updated',
     'session.interaction_mode.changed',
     'session.start',
     'session.finish',
     'session.error',
     'session.abort',
+    'subagent.execution',
     'session.queue.updated',
     'session.compaction.started',
     'session.compaction.completed',
@@ -50,7 +54,22 @@ export const GLOBAL_EVENT_TYPES = [
     'model_access.dev_requests_updated',
     'mcp.auth_updated',
     'mcp.auth_required',
+    'merge_request.updated',
 ];
+/** A committed business result remains primary when event publication or reporting fails. */
+export function publishBestEffort(publisher, event, onFailure) {
+    try {
+        publisher(event);
+    }
+    catch (error) {
+        try {
+            onFailure?.(event, error);
+        }
+        catch {
+            // A committed business result remains primary.
+        }
+    }
+}
 const GLOBAL_EVENT_TYPE_SET = new Set(GLOBAL_EVENT_TYPES);
 export function isGlobalEventType(value) {
     return typeof value === 'string' && GLOBAL_EVENT_TYPE_SET.has(value);

@@ -1,6 +1,14 @@
 import { attachProgrammaticErrorRaw } from '@mavis/agent-core/tools';
 import { describeMcpCallError, findMcpAuthRequiredError, McpNameRegistry, pluginMcpNameKey, McpConnectionPool, } from '@mavis/mcp';
+import { pluginMcpActivationOf, pluginMcpServerNameKey, } from '../plugin/runtime/snapshot-builder.js';
+import { defaultHostNodeFallback, PluginStdioServerResolver, } from './host-node.js';
+import { isOfficialStdioServer } from './official-stdio.js';
 const LIST_TOOLS_CONCURRENCY = 4;
+/**
+ * `_meta` key carrying the calling conversation's opaque id to official stdio Plugin servers.
+ * Remote servers never receive it, and no other conversation data (such as the title) is sent.
+ */
+const PLUGIN_MCP_SESSION_META_KEY = 'minimax/sessionId';
 /**
  * Desktop Plugin MCP owner. Its pool and lookup are deliberately separate
  * from v1 LocalMcpService, whose connections belong to the user's mcp.json.
@@ -11,6 +19,8 @@ export class PluginMcpRuntime {
     inventories = new Map();
     /** Resolved per lookup generation; `null` caches "no credential" for that server. */
     credentials = new Map();
+    /** Keeps each generation's resolved stdio servers, so PATH is probed once per generation. */
+    resolver;
     pool;
     auth;
     logger;
@@ -30,10 +40,11 @@ export class PluginMcpRuntime {
         this.disconnectTimeoutMs = options.disconnectTimeoutMs ?? 5_000;
         this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? 5_000;
         this.onManagedMiniAppToolCall = options.onManagedMiniAppToolCall;
+        this.resolver = new PluginStdioServerResolver(options.hostNode ?? defaultHostNodeFallback());
         this.pool =
             options.pool ??
                 new McpConnectionPool({
-                    getResolvedServer: (serverName) => this.servers.get(serverName)?.server.resolvedServer ?? null,
+                    getResolvedServer: (serverName) => this.resolvedServer(serverName),
                 }, {
                     ...options.poolOptions,
                     logger: this.logger,
@@ -44,7 +55,7 @@ export class PluginMcpRuntime {
         if (this.closed)
             throw new Error('Plugin MCP runtime is closed');
         this.names.assignServers(entries.map((entry) => ({
-            key: pluginMcpNameKey(entry.source, entry.pluginName, entry.server.name),
+            key: pluginMcpServerNameKey(entry),
             name: entry.server.name,
         })));
         const inventoryMode = options.inventoryMode ?? 'discover';
@@ -89,6 +100,7 @@ export class PluginMcpRuntime {
                     source: entry.server.name,
                     pluginName: entry.pluginName,
                     mcpToolName: tool.name,
+                    activation: freeze(pluginMcpActivationOf(entry)),
                     tool: runtimeTool,
                 }));
             }
@@ -101,7 +113,7 @@ export class PluginMcpRuntime {
         });
     }
     assignToolNames(entry, tools, diagnostics) {
-        const allocated = this.names.assignTools(pluginMcpNameKey(entry.source, entry.pluginName, entry.server.name), tools.map((tool) => tool.name));
+        const allocated = this.names.assignTools(pluginMcpServerNameKey(entry), tools.map((tool) => tool.name));
         return tools.flatMap((tool) => {
             const nativeName = allocated.names.get(tool.name);
             if (nativeName)
@@ -147,6 +159,7 @@ export class PluginMcpRuntime {
         this.lifecycleKeys.clear();
         this.inventories.clear();
         this.credentials.clear();
+        this.resolver.clear();
         await ignoreFailure(withTimeout(this.pool.shutdown(), this.shutdownTimeoutMs, 'Plugin MCP runtime shutdown timed out'));
     }
     async disconnectServers(serverNames) {
@@ -286,10 +299,17 @@ export class PluginMcpRuntime {
         const credential = this.credentialFor(entry);
         return credential ? { authorizer: credential.authorizer } : undefined;
     }
+    resolvedServer(serverName) {
+        const entry = this.servers.get(serverName);
+        if (!entry)
+            return null;
+        return this.resolver.resolve(serverName, entry, this.lifecycleKeys.get(serverName) ?? lifecycleKey(entry));
+    }
     replaceLookup(entries) {
         this.servers.clear();
         this.lifecycleKeys.clear();
         this.credentials.clear();
+        this.resolver.clear();
         for (const entry of entries) {
             this.servers.set(poolName(entry), entry);
             this.lifecycleKeys.set(poolName(entry), lifecycleKey(entry));
@@ -329,8 +349,9 @@ export class PluginMcpRuntime {
                         }
                     }
                     let result;
+                    const callOptions = toolCallOptions(entry, context.sessionId, signal);
                     try {
-                        result = await this.pool.callTool(poolName(entry), tool.name, toRecord(input), this.connectionOverrides(entry), signal ? { signal } : undefined);
+                        result = await this.pool.callTool(poolName(entry), tool.name, toRecord(input), this.connectionOverrides(entry), callOptions);
                     }
                     catch (error) {
                         // The thrown error still fails the call exactly as before; PTC
@@ -448,6 +469,18 @@ function lifecycleKey(entry) {
             ? { packageContentDigest: entry.packageContentDigest }
             : {}),
     });
+}
+function sessionMeta(entry, sessionId) {
+    if (!isOfficialStdioServer(entry)) {
+        return undefined;
+    }
+    return sessionId ? { [PLUGIN_MCP_SESSION_META_KEY]: sessionId } : undefined;
+}
+function toolCallOptions(entry, sessionId, signal) {
+    const meta = sessionMeta(entry, sessionId);
+    if (!signal && !meta)
+        return undefined;
+    return { ...(signal ? { signal } : {}), ...(meta ? { meta } : {}) };
 }
 function collisionKey(value) {
     return value.startsWith('mcp__')

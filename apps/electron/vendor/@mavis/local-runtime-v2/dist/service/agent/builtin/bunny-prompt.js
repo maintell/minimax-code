@@ -20,8 +20,22 @@ const MEMORY_BLOCK = /\{if memory\}([\s\S]*?)\{end memory\}/gu;
 export function renderBunnyMemorySections(template, memory) {
     return template.replace(MEMORY_BLOCK, (_block, text) => (memory ? text : ''));
 }
+/**
+ * The review-dispatch paragraphs that only apply while async review is on (config.yaml
+ * `bunny.verdictGate`), marked and resolved like the helper paragraphs.
+ *
+ * Unlike the two blocks above, this pattern also consumes the newline that ends the
+ * `{end verdict_gate}` line. The block is inserted between two existing sections, so removing
+ * only the marked text would leave the blank line that separates them doubled. Consuming exactly
+ * one trailing newline makes the off render byte for byte the template without this block, which
+ * is what keeps the switch-off prompt identical to the prompt before this feature existed.
+ */
+const VERDICT_GATE_BLOCK = /\{if verdict_gate\}(\n[\s\S]*?)\{end verdict_gate\}\n/gu;
+function renderBunnyVerdictGateSections(template, verdictGate) {
+    return template.replace(VERDICT_GATE_BLOCK, (_block, text) => (verdictGate ? text : ''));
+}
 function renderBunnySections(template, input) {
-    return renderBunnyMemorySections(renderBunnyHelperAgentSections(template, input.bunnyHelperAgents === true), input.bunnyMemory === true);
+    return renderBunnyVerdictGateSections(renderBunnyMemorySections(renderBunnyHelperAgentSections(template, input.bunnyHelperAgents === true), input.bunnyMemory === true), input.bunnyVerdictGate === true);
 }
 async function readOptionalFile(path) {
     try {
@@ -38,13 +52,18 @@ async function readOptionalFile(path) {
 const bunnyAgentRenderer = {
     standalone: true,
     async renderParts({ agentDir, input }) {
-        const [template, policy, facts] = await Promise.all([
+        const [template, policy, facts, verdictDiscipline] = await Promise.all([
             readFile(join(agentDir, 'system-prompt.md'), 'utf8'),
             readOptionalFile(join(agentDir, 'memory-policy.md')),
             readFile(join(agentDir, 'runtime-facts.md'), 'utf8'),
+            readOptionalFile(join(agentDir, 'verdict-discipline.md')),
         ]);
         const core = renderBunnySections(template, input);
-        const agentPrompt = [core.replaceAll('{memory_policy}', policy ?? '').trim(), facts.trim()]
+        // Substituted only while the switch is on, so an off render never reads the review text at all.
+        const resolved = input.bunnyVerdictGate === true
+            ? core.replaceAll('{verdict_discipline}', verdictDiscipline?.trim() ?? '')
+            : core;
+        const agentPrompt = [resolved.replaceAll('{memory_policy}', policy ?? '').trim(), facts.trim()]
             .filter(Boolean)
             .join('\n\n');
         return { coreTemplate: template, agentPrompt };

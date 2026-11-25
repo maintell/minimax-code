@@ -1,3 +1,4 @@
+import { AssignmentCursorError } from '../../service/assignment/index.js';
 import { isBunnyPermissionMode, BunnyBackupNotFoundError, BunnyTaskModelInvalidError, } from '../../service/bunny/index.js';
 import { WorkingStateError, } from '../../service/working-state/index.js';
 import { toAssignmentStateView } from '../../application/session/wire.js';
@@ -189,11 +190,19 @@ export class BunnyController extends BunnyControllerBase {
         if (!request.name.trim() ||
             (request.limit !== undefined && (!Number.isSafeInteger(request.limit) || request.limit < 0)))
             throw new AppError(400, 'INVALID_ARGUMENTS', 'name and limit are invalid');
+        validateAssignmentPageRequest(request);
         // Every task lives in the Bunny store; with nothing stored there is none.
         if (this.nothingStored())
             return { assignments: [] };
-        const listed = await assignments.list(request.name, request.limit);
-        return { assignments: listed.map(toAssignmentStateView) };
+        try {
+            const page = await assignments.page(request.name, request);
+            return { ...page, assignments: page.assignments.map(toAssignmentStateView) };
+        }
+        catch (error) {
+            if (error instanceof AssignmentCursorError)
+                throw new AppError(400, 'INVALID_ARGUMENTS', error.message);
+            throw error;
+        }
     }
     requireBunny() {
         return this.requireOwner(this.bunny, 'BUNNY_UNAVAILABLE', BUNNY_UNAVAILABLE);
@@ -254,5 +263,11 @@ async function saveTaskModel(bunny, model) {
             throw new AppError(400, error.code, error.message);
         throw error;
     }
+}
+function validateAssignmentPageRequest(request) {
+    if (request.worklineId !== undefined && !request.worklineId.trim())
+        throw new AppError(400, 'INVALID_ARGUMENTS', 'workline_id is invalid');
+    if (request.cursor !== undefined && (!request.cursor || request.cursor.length > 4096))
+        throw new AppError(400, 'INVALID_ARGUMENTS', 'cursor is invalid');
 }
 //# sourceMappingURL=bunny.controller.js.map

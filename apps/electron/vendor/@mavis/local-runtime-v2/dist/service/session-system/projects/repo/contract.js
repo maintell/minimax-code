@@ -14,6 +14,7 @@ export const PROJECT_REPOSITORY_CAPABILITIES = [
     'setHidden',
     'restoreSessionAfterRemoval',
     'putOrder',
+    'moveListed',
     'touchRecent',
 ];
 //# sourceMappingURL=contract.js.map

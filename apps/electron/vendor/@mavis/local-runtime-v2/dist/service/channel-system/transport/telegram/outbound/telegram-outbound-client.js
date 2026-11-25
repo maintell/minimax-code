@@ -9,6 +9,7 @@ import { detach, settleQuietly } from '../../../settle.js';
 import { LocalChannelClientUnavailableError, } from '../../../ingress/runner.js';
 import { prepareChannelOutboundMessage } from '../../../delivery/outbound-message.js';
 import { sendTelegramQuestionnaireFallback } from '../questionnaire/telegram-questionnaire-legacy-delivery.js';
+import { SingleReplyQuote, toTelegramReplyAnchor } from './telegram-sender.js';
 export class LocalTelegramChannelClient {
     outboundStore;
     resolveSend;
@@ -97,12 +98,16 @@ export class LocalTelegramChannelClient {
             return;
         }
         const { sender, chatId } = resolved;
+        // Quote the inbound message this reply answers, so a burst of queued
+        // messages stays matchable. One quote per reply: the first thing actually
+        // sent carries it, the rest continue the same reply.
+        const quote = new SingleReplyQuote(toTelegramReplyAnchor(input.ctx.sourceMessageId));
         const text = input.text?.trim() ?? '';
         if (text) {
-            await sender.sendRichText(chatId, input.text, input.ctx.threadId);
+            await sender.sendRichText(chatId, input.text, input.ctx.threadId, quote.take());
         }
         for (const att of input.media ?? []) {
-            await sender.sendMedia(chatId, att, input.ctx.threadId);
+            await sender.sendMedia(chatId, att, input.ctx.threadId, quote.take());
         }
     }
     /**

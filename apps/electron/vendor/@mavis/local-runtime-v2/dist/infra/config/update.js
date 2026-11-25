@@ -1,8 +1,8 @@
-import { randomBytes } from 'node:crypto';
 import fs, { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import { getConfig, getConfigPath, minimaxApiModels, parseConfigText, resetConfig, serializeConfigPreservingComments, } from '@mavis/config';
 import lockfile from 'proper-lockfile';
+import { writeFileAtomically } from '../file/atomic-write.js';
 import { LocalConfigValidationError, readLocalRawConfig } from './raw-config.js';
 import { ASK_USER_POLICY_FIELDS, assertMutableConfigField, assertSafeConfigRecord, DANGEROUS_CONFIG_PATH_SEGMENTS, isPlainRecord, validateAskUserConfigRecord, validateEnabledOnlyConfigRecord, validateBunnyConfigRecord, validateLocalConfigValue, validateReviewConfigRecord, validatePluginRecommendationConfigRecord, validateSubagentConfigRecord, } from './update-policy.js';
 const LOCAL_CONFIG_WRITE_ERROR_MESSAGE = 'Local runtime failed to update config file';
@@ -11,6 +11,27 @@ class LocalConfigWriteError extends Error {
     name = 'LocalConfigWriteError';
     constructor() {
         super(LOCAL_CONFIG_WRITE_ERROR_MESSAGE);
+    }
+}
+const configUpdateListeners = new Set();
+/**
+ * Runs after each successful `updateLocalConfigFile` write (the Desktop
+ * settings path). Model-context and BYOK writes and edits made outside the
+ * runtime do not notify. Listeners must be cheap and must not throw into the
+ * writer; returns the unsubscribe function.
+ */
+export function onLocalConfigUpdated(listener) {
+    configUpdateListeners.add(listener);
+    return () => configUpdateListeners.delete(listener);
+}
+function notifyLocalConfigUpdated() {
+    for (const listener of configUpdateListeners) {
+        try {
+            listener();
+        }
+        catch {
+            // A listener failure never turns a committed config write into an error.
+        }
     }
 }
 export async function updateLocalConfigFile(body, extraMutableRoots = new Set(), preparedCommitPayload) {
@@ -39,6 +60,7 @@ export async function updateLocalConfigFile(body, extraMutableRoots = new Set(),
         }
         await atomicWriteFile(configPath, serializeConfigPreservingComments(originalText, parseConfigText(originalText), raw));
         resetConfig();
+        notifyLocalConfigUpdated();
         return { config: getConfig() };
     }
     catch (err) {
@@ -200,30 +222,13 @@ export async function updateLocalByokConfig(mutate) {
 }
 /** @internal Exported only for focused tests. */
 export async function atomicWriteFile(filePath, content) {
-    const tmpPath = join(dirname(filePath), `.config-tmp-${randomBytes(6).toString('hex')}`);
-    let created = false;
     try {
-        const mode = LOCAL_CONFIG_FILE_MODE;
-        const temporary = await fs.promises.open(tmpPath, 'wx', mode);
-        created = true;
-        try {
-            await temporary.writeFile(content, 'utf-8');
-            await temporary.chmod(mode);
-        }
-        finally {
-            await temporary.close();
-        }
-        await fs.promises.rename(tmpPath, filePath);
+        await writeFileAtomically(filePath, content, {
+            mode: LOCAL_CONFIG_FILE_MODE,
+            tempPrefix: '.config-tmp-',
+        });
     }
     catch {
-        if (created) {
-            try {
-                await fs.promises.unlink(tmpPath);
-            }
-            catch {
-                // 保留原始写入错误；临时文件清理尽力完成。
-            }
-        }
         throw new LocalConfigWriteError();
     }
 }
@@ -254,18 +259,24 @@ function applyLocalConfigUpdate(raw, body) {
 // put 会把对象深合并到目标上；对标量叶子字段做 put 会绕过取值校验，一律拒绝。
 const PUT_REJECTED_LEAF_FIELDS = new Set([
     'miniAppSuggestion.enabled',
+    'productionParity',
     'review.mode',
     'review.turnDiffCard',
     'permission.nativeDelete',
     'worktreeRefreshBeforeCreate',
+    'worktreeAutoCleanupEnabled',
+    'worktreeKeepCount',
     'promptSuggestion.enabled',
     'quotaAutoResume.enabled',
     'nextStepBox.enabled',
+    'advisor.enabled',
     'bunny.enabled',
     'pluginRecommendation.enabled',
     // Arrays are replaced with `set`; a deep-merge put would drop the list.
     'pluginRecommendation.dismissedPlugins',
     'subagent.maxConcurrentPerSession',
+    'mergeRequests.createAsDraft',
+    'mergeRequests.githubMergeMethod',
 ]);
 const PUT_RECORD_VALIDATORS = new Map([
     ['review', validateReviewConfigRecord],
@@ -275,6 +286,7 @@ const PUT_RECORD_VALIDATORS = new Map([
     ['promptSuggestion', (record) => validateEnabledOnlyConfigRecord('promptSuggestion', record)],
     ['quotaAutoResume', (record) => validateEnabledOnlyConfigRecord('quotaAutoResume', record)],
     ['nextStepBox', (record) => validateEnabledOnlyConfigRecord('nextStepBox', record)],
+    ['advisor', (record) => validateEnabledOnlyConfigRecord('advisor', record)],
     ['pluginRecommendation', validatePluginRecommendationConfigRecord],
 ]);
 function applyLocalConfigPut(raw, field, value) {

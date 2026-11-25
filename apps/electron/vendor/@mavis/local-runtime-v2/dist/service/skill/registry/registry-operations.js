@@ -1,7 +1,6 @@
 import { readdir, readFile, realpath, rm, stat } from 'node:fs/promises';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { renderLocalSkillsCatalogResult, } from '@mavis/context-manager';
 import { SkillRegistry } from '@mavis/skills';
 import {} from '@mavis/thrift-gen/generated/desktop-service/types';
 import { resolveDataDirVariables } from '@mavis/shared/data-dir-variables';
@@ -96,7 +95,7 @@ export function listRegistryRuntimeSkills(registry, options = {}) {
         refreshedAt: snapshot?.generatedAt ?? Date.now(),
     };
 }
-export function renderLocalRegistrySkillsCatalog(registry, options = {}) {
+export function listRegistryCatalogEntries(registry, options = {}) {
     const entries = filterInjectableRegistrySkills(registry.getAvailableSkills(), {
         agentName: options.agentName,
         compatibleAgentNames: options.compatibleAgentNames,
@@ -110,20 +109,14 @@ export function renderLocalRegistrySkillsCatalog(registry, options = {}) {
         // `filterInjectableRegistrySkills` (registry-family) has no disabled-location
         // awareness, so keep preview_train's disabled-skill-location gate here.
     }).filter((entry) => !options.disabledLocationUris?.has(entry.locationUri));
-    // DesktopService registry entries and legacy builtin skill entries must render
-    // the same <available_skills> shape; otherwise the clean local-runtime prompt
-    // drifts depending on which skill source populated the catalog.
-    return renderLocalSkillsCatalogResult([
-        ...entries.map((entry) => ({
-            name: entry.name,
-            description: entry.description,
-            builtin: entry.rootKind === 'builtin',
-        })),
-        ...(options.additionalSkills ?? []),
-    ], {
-        contextWindowTokens: options.contextWindowTokens,
-        tokenEstimator: options.tokenEstimator,
-    });
+    // DesktopService registry entries and legacy builtin skill entries map to the same
+    // catalog entry shape, so the skill catalog window renders them alike whichever
+    // skill source populated the catalog.
+    return entries.map((entry) => ({
+        name: entry.name,
+        description: entry.description,
+        builtin: entry.rootKind === 'builtin',
+    }));
 }
 export function readRegistrySkillByName(registry, name, options = {}) {
     const ambiguous = ambiguousLegacySkillNames(registry, options);

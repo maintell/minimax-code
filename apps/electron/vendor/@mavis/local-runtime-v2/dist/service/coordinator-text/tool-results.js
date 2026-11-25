@@ -27,13 +27,21 @@ export function assignmentTakenOver(successorSessionId) {
 export function assignmentModelUnavailable(modelKey, reason) {
     return `任务模型 ${modelKey} 不可用，没有创建任务：${reason}`;
 }
-export function assignmentSpaceNotFound(wanted, spaces, defaultSpaceName) {
-    return `找不到任务空间「${wanted}」。可选：${spaces.map((item) => `${item.name}（${item.id}）`).join('、')}；不指定时放进 ${defaultSpaceName}`;
+function spaceChoices(spaces) {
+    return spaces.length
+        ? `已有事项：${spaces.map((item) => `${item.name}（${item.id}）`).join('、')}。`
+        : '还没有事项。';
+}
+export function assignmentSpaceNotFound(wanted, spaces) {
+    return `找不到事项「${wanted}」，任务没有派出。${spaceChoices(spaces)}都不相符就先用 bunny_task_space_create 新建事项，再派任务。`;
+}
+export function assignmentSpaceRequired(spaces) {
+    return `没有填 space，任务没有派出。${spaceChoices(spaces)}space 填这个任务推进的事项 ID；都不相符就先用 bunny_task_space_create 新建事项，再派任务。`;
 }
 /** Where a task runs, as the create result and its reports name it. */
 export function executionLocationText(location) {
     if (location.project === undefined)
-        return '空间目录';
+        return '事项目录';
     return `${location.project}${location.worktree ? '（工作树）' : ''}`;
 }
 /** A project sub-directory the task's new worktree does not have yet. */
@@ -42,10 +50,25 @@ export function worktreeSubPathMissing(subPath) {
 }
 // Space commands (application/session/bunny-composition.ts).
 export const SPACE_CONTEXT_NOTICE_HINT = 'context.md 已更新，但宿主不会替你通知。请对 openTasks 里每个受这次改动影响的任务调用 assignment_send，reason 填 decision';
-export const SPACE_CREATE_NEEDS_USER = '这一轮不是用户回复唤醒的，不能新建任务空间。先用问卷向用户提议名称、目标和理由，等用户同意后，在用户回复的那一轮里再建；用户没同意就把任务放进 Bunny 的空间。';
 // context.md writes (session-system/files/library/space-context.ts).
-export function spaceContextConflict(revision) {
-    return `context.md 已被改过，请重新读取后再写（当前版本 ${revision}）`;
+/**
+ * A revision the caller passed, cut so a wrong value cannot flood the tool result. A
+ * revision is a hash of the summary, never the summary itself.
+ */
+export function spaceContextRevisionEcho(revision) {
+    return revision.length > 64 ? `${revision.slice(0, 64)}…（已截断）` : revision;
+}
+/**
+ * A write whose revision is no longer current. Both revisions are named: a caller that
+ * mistyped one, or spliced a new prefix onto an old suffix, sees its own value next to the
+ * current one instead of retrying the same wrong string. What the write would have replaced
+ * travels in the error's model details, so the rewrite needs no second read. Nothing was
+ * written.
+ */
+export function spaceContextConflict(providedRevision, currentRevision) {
+    return (`context.md 已被改过，这次没有写入：你传的 revision 是 ${spaceContextRevisionEcho(providedRevision)}，` +
+        `当前 revision 是 ${currentRevision}。把你要改的那部分现在的内容里的改动并进这次要写的内容，` +
+        `用当前 revision 再写一次。`);
 }
 /** The write as it would land: `current` is the summary before the write, when it was read. */
 export function spaceContextTooLong(length, limit, current) {
@@ -65,8 +88,8 @@ export const SPACE_CONTEXT_SUMMARY_TAG = 'summary 里不能出现 </summary> 标
 export const SESSION_FOREIGN_TARGET = 'Bunny 只能停止、修改或发消息给自己派出的任务；其他对话只读。要接着做，用 assignment_create 派一个新任务，把它的进展写进任务说明。';
 // File writes the permission layer refuses (assignment/permission/).
 export const PERMISSION_RUNTIME_DIRECTORY = '这里用不了：Bunny 的数据库目录 data/ 和回收站 .trash/ 只由运行时维护，不能直接写或删。';
-export const PERMISSION_SPACE_CONTEXT_ARCHIVE = '这里用不了：任务空间的 context-archive.md 是系统整理 context.md 时留下的原文存档，只能读，不能写或删。要找回整理掉的内容，读出来再用 mavis space context write 写回 context.md。';
-export const PERMISSION_SPACE_CONTEXT_FILE = '这里用不了：任务空间的 context.md 不能用文件工具或 bash 直接写。改现状用 mavis space context write（先 mavis space context read 拿 revision），改目标用 mavis space update 的 goal。';
+export const PERMISSION_SPACE_CONTEXT_ARCHIVE = '这里用不了：事项的 context-archive.md 是系统整理 context.md 时留下的原文存档，只能读，不能写或删。要找回整理掉的内容，读出来再用 bunny_task_space_context_write 写回 context.md。';
+export const PERMISSION_SPACE_CONTEXT_FILE = '这里用不了：事项的 context.md 不能用文件工具或 bash 直接写。改简报用 bunny_task_space_context_write（先 bunny_task_space_context_read 拿 revision），改目标用 bunny_task_space_update 的 goal。';
 /** Asks the user instead of passing automatically: the task owning the session is unknown. */
 export const PERMISSION_UNKNOWN_OWNER = '读不到这个会话的任务归属，不能按自动通过处理，这一次请你确认';
 // Conversation search (bunny/conversation-search/, session-system/messages/search-index/).

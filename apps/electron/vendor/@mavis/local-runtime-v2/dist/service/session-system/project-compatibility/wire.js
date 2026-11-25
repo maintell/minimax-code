@@ -54,9 +54,19 @@ export function toSessionInfoView(session, isDefaultWorkspaceSession) {
                 resolvedBranch: session.runLocation.resolvedBranch,
                 parentRepoDir: session.runLocation.parentRepoDir,
                 createdAt: session.runLocation.createdAt,
+                ...worktreeCleanupView(session.runLocation),
             }
             : undefined,
     };
+}
+/**
+ * Cleanup state of a run location as Desktop reads it. Restore marks the
+ * Session unrestorable once it finds the snapshot gone.
+ */
+export function worktreeCleanupView(location) {
+    return location.cleanedAt !== undefined
+        ? { cleanedAt: location.cleanedAt, restorable: location.restorable !== false }
+        : {};
 }
 /** @internal Exported only for focused tests. */
 export function toSessionTreeChildView(session) {

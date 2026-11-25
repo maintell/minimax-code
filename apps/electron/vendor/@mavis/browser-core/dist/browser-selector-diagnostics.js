@@ -1,3 +1,4 @@
+import { resolveSelectorCandidates, selectorCandidatesExpression, } from './browser-selector-candidates.js';
 import { evaluate } from './browser-state.js';
 import { isBrowserOperationInterruption } from './operation-timeout.js';
 /**
@@ -74,7 +75,7 @@ export function selectorHead(selector) {
     return head || undefined;
 }
 const LANDMARK_TAG_PATTERN = /^(?:main|form|nav|header|footer|aside|article|section|dialog)$/i;
-const LANDMARK_ROLE_PATTERN = /^[a-z]*\[\s*role\s*=\s*["']?(?:main|dialog|alertdialog|form|navigation|banner|contentinfo|complementary|region|search)["']?\s*\]$/i;
+const LANDMARK_ROLE_PATTERN = /^[a-z]*\[\s*role\s*=\s*["']?(?:main|article|dialog|alertdialog|form|navigation|banner|contentinfo|complementary|region|search)["']?\s*\]$/i;
 /**
  * Landmark selectors (`main`, `form`, `[role=dialog]`) are the usual first guess
  * for "read the content area", but many app pages have none of them (eval
@@ -85,6 +86,17 @@ export function landmarkSelectorHead(selector) {
     if (!head)
         return undefined;
     return LANDMARK_TAG_PATTERN.test(head) || LANDMARK_ROLE_PATTERN.test(head) ? head : undefined;
+}
+/** Where a text read of a missing region falls back to, first present wins. */
+export const READ_REGION_FALLBACKS = ['main', '[role="main"]', 'article', 'body'];
+const READ_REGION_PATTERN = /^(?:main|article|[a-z]*\[\s*role\s*=\s*["']?(?:main|article)["']?\s*\]|#(?:main(?:[-_]?content)?|content|page[-_]?content|primary))$/i;
+/**
+ * True when the whole selector names the page's content region rather than a
+ * particular element, so "read the page" is still answerable without it. A
+ * compound like `main > ul` or a list asks for something narrower.
+ */
+export function isReadRegionSelector(selector) {
+    return READ_REGION_PATTERN.test(selector.trim());
 }
 const PAGE_CONTROL_COUNTS = `{
   buttons: document.querySelectorAll('button, [role="button"], input[type="button"], input[type="submit"]').length,
@@ -113,7 +125,9 @@ export async function diagnoseSelectorMiss(session, selector) {
         }
         let controls = null;
         try { controls = ${PAGE_CONTROL_COUNTS}; } catch { controls = null; }
-        return { url: location.href, tailCount, landmarkCount, controls };
+        let candidates = null;
+        try { candidates = ${selectorCandidatesExpression(selector)}; } catch { candidates = null; }
+        return { url: location.href, tailCount, landmarkCount, controls, candidates };
       })()`);
         const diagnostics = {};
         if (typeof facts?.url === 'string')
@@ -138,6 +152,9 @@ export async function diagnoseSelectorMiss(session, selector) {
                 links: controls.links,
             };
         }
+        const candidates = await resolveSelectorCandidates(session, facts?.candidates);
+        if (candidates.length > 0)
+            diagnostics.candidates = candidates;
         return diagnostics;
     }
     catch (error) {
@@ -153,6 +170,14 @@ export function selectorMissRecovery(diagnostics) {
         parts.push(landmark.wholeSelector
             ? `This page has no element matching "${landmark.selector}". To read the page content use selector "body" (query kind: "text" without a selector reads body).`
             : `This page has no element matching "${landmark.selector}"; drop that prefix (or scope with "body") and retry.`);
+    }
+    if (diagnostics.candidates?.length) {
+        parts.push(diagnostics.candidates.some((candidate) => candidate.ref || candidate.selector)
+            ? "The candidates here come from the current page and are its closest matches for this selector; use a candidate's ref or selector instead of guessing another one."
+            : 'The candidates here come from the current page and are its closest matches for this selector, but none has a ref or a unique selector: find the one you mean with query kind: "semantic" and its text, and act through the returned ref.');
+        if (diagnostics.candidates.some((candidate) => candidate.count !== undefined)) {
+            parts.push('A candidate with a count is a repeated structure: its selector matches that many elements, so read it with all: true or kind: "rows".');
+        }
     }
     const misses = diagnostics.consecutiveMisses ?? 0;
     if (misses >= 2) {

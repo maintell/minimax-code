@@ -18,5 +18,6 @@ export { outputLimitRecoveryExtension, } from './output-limit-recovery.js';
 export { appSourceAdapter, fileSourceAdapter, mcpSourceAdapter, SOURCE_REFERENCE_DETAILS_KEY, SOURCE_REFERENCE_MARKER_TAG, sourceReferenceExtension, } from './source-reference.js';
 export { PLAN_MODE_GUIDANCE, planModeExtension, renderPlanModeReminder, } from './plan-mode.js';
 export { MiniAppLifecycleError, createMiniAppControlExtension, MINIAPP_TOOL_DEFINITION, } from './miniapp.js';
+export { PluginExtensionAuthoringError, createPluginExtensionAuthoringExtension, } from './plugin-extension.js';
 export { createPptPreviewExtension, } from './ppt-preview.js';
 //# sourceMappingURL=index.js.map

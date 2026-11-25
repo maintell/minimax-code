@@ -431,6 +431,24 @@ export interface MiniAppToolRequestAPI {
   request(names: readonly string[]): Promise<Record<string, 'allow' | 'ask' | 'deny'>>;
 }
 
+export interface MiniAppOpenedFile {
+  readonly path: string;
+  readonly name: string;
+  readonly extension: string;
+}
+
+export interface MiniAppFileOpen {
+  readonly handlerId: string;
+  readonly files: readonly MiniAppOpenedFile[];
+}
+
+export interface MiniAppFilesAPI {
+  subscribe(
+    listener: (open: MiniAppFileOpen) => void,
+    options?: MiniAppHostSubscribeOptions,
+  ): MiniAppHostDisposable;
+}
+
 export interface MiniAppClientAPI {
   readonly message: MiniAppMessageAPI;
   readonly agent?: MiniAppAgentAPI;
@@ -445,6 +463,8 @@ export interface MiniAppClientAPI {
   readonly speech?: MiniAppSpeechAPI;
   /** Effective Host preferences and bounded navigation; absent on older Hosts. */
   readonly host?: MiniAppHostAPI;
+  /** Absent on older Hosts; check `capabilities.has('files.subscribe')`. */
+  readonly files?: MiniAppFilesAPI;
   /**
    * Synchronous probe of Host features, fixed per Host version; independent of this Mini App's
    * manifest or grants. Absent on older Hosts: check `window.mcode?.miniapp?.capabilities?.has`.

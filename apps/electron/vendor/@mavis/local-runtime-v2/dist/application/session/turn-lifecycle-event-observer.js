@@ -1,4 +1,5 @@
 import { RuntimeEventStatus, RuntimeEventType, } from '@mavis/agent-core/protocol';
+import { parseByokErrorStatus } from '../../service/model-system/index.js';
 import { readNextStepCard } from '@mavis/shared/next-step';
 export function createSessionTurnLifecycleEvents(input) {
     const { captureAfterTurn, ...options } = input;
@@ -28,8 +29,12 @@ export class SessionTurnLifecycleEventObserver {
         }
         const card = readNextStepCard({ details: tail.details });
         const details = tail.details;
+        // A card that asks something lets clients without this history still find the question.
         if (card)
-            this.nextSteps.set(key, { waitingForUser: card.blocked });
+            this.nextSteps.set(key, {
+                waitingForUser: card.blocked,
+                ...(card.ask ? { hasNextStepCard: true } : {}),
+            });
         // The durable marker every waiting tool publishes (ask_user, Plan review, feature enable).
         else if (details?.waiting_for_user === true)
             this.nextSteps.set(key, { waitingForUser: true });
@@ -179,7 +184,6 @@ export class SessionTurnLifecycleEventObserver {
             });
             return;
         }
-        const error = event.payload.error;
         const message = terminalErrorMessage(event);
         this.options.publish({
             type: 'session.error',
@@ -187,9 +191,7 @@ export class SessionTurnLifecycleEventObserver {
                 ...common,
                 status: 'error',
                 ...(message ? { error: message } : {}),
-                ...(typeof error?.code === 'number' ? { errorCode: error.code } : {}),
-                ...(error ? { errorSource: 'agent-runtime' } : {}),
-                ...(error?.details ? { errorDetail: error.details } : {}),
+                ...terminalErrorFields(event.payload.error, message),
             },
         });
     }
@@ -200,6 +202,30 @@ function terminalMemoryStatus(status) {
     if (status === 'failed')
         return 'error';
     return 'aborted';
+}
+/**
+ * Code, source and detail of a failed Turn. A BYOK provider's own failure keeps
+ * its attribution, so clients name the user's provider instead of reading it as
+ * a MiniMax service error. Its code follows the BYOK payload first, as the
+ * persisted Turn outcome does (`normalizeRuntimeErrorStatus` in turn-outcome.ts),
+ * so the live event and the stored status agree.
+ */
+function terminalErrorFields(error, message) {
+    const errorCode = typeof error?.code === 'number' ? error.code : undefined;
+    const byok = parseByokErrorStatus(message, errorCode);
+    if (byok) {
+        return {
+            errorCode: byok.errorCode,
+            errorSource: byok.errorSource,
+            errorDetail: byok.errorDetail,
+            errorProviderId: byok.errorProviderId,
+        };
+    }
+    return {
+        ...(errorCode !== undefined ? { errorCode } : {}),
+        ...(error ? { errorSource: 'agent-runtime' } : {}),
+        ...(error?.details ? { errorDetail: error.details } : {}),
+    };
 }
 function terminalErrorMessage(event) {
     return event.payload.error?.message?.trim() || event.payload.stop_reason?.message?.trim();

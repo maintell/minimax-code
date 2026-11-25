@@ -214,12 +214,19 @@ export class BuiltinAgentCatalog {
             const parts = this.renderLayerParts(input, `${root}/${file}`, templates);
             core.push(file === 'prompt-base-windows' ? normalizeWindowsShellBase(parts.core) : parts.core);
         }
+        core.push(await this.inlineTerminalPrompt(input));
         return {
             core: core
                 .map((part) => part.trim())
                 .filter(Boolean)
                 .join('\n\n'),
         };
+    }
+    async inlineTerminalPrompt(input) {
+        if (input.inlineActions !== true || input.surface !== 'interactive')
+            return '';
+        const prompt = await this.readPromptAssetFile(undefined, '_v2/INLINE_TERMINAL.md.hbs');
+        return prompt ? `${prompt}\nLocal host platform: ${process.platform}.` : '';
     }
     renderLayerParts(input, source, templates) {
         const context = {

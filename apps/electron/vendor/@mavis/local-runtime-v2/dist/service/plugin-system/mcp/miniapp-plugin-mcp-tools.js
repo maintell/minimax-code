@@ -1,4 +1,4 @@
-import { McpToolCallNotDispatchedError, McpToolCallTimeoutError } from '@mavis/mcp';
+import { createPluginMcpCallSource, } from './plugin-mcp-call-source.js';
 const UNAVAILABLE_SERVER_DIAGNOSTICS = new Set([
     'MCP_SERVER_LIST_FAILED',
     'MCP_SERVER_WARMING',
@@ -6,73 +6,66 @@ const UNAVAILABLE_SERVER_DIAGNOSTICS = new Set([
 ]);
 /**
  * Serves `context.tool` every published Plugin MCP tool under its runtime name, as an Agent turn
- * sees it. Calls run the snapshot's runtime tool, so they reach the MCP runtime generation that
- * listed the tool; that generation is leased for the call like a turn's, so a publication cannot
- * close it mid-call.
+ * sees it: a name projection over the Plugin MCP call source, which leases the listing generation
+ * for the call like a turn's, so a publication cannot close it mid-call.
  */
-export function createMiniAppPluginMcpTools(host) {
+export function createMiniAppPluginMcpTools(host, calls = createPluginMcpCallSource(host)) {
+    const published = () => calls
+        .list()
+        .flatMap((target) => [...target.tools].map(([tool, entry]) => ({ target, tool, entry })));
     return {
         async list() {
             const snapshot = host.currentSnapshot;
-            const tools = pluginMcpBindings(snapshot).flatMap((binding) => listedTool(binding));
+            const tools = published().map(({ target, tool, entry: { runtimeName, ...definition } }) => ({
+                name: runtimeName,
+                server: target.server,
+                tool,
+                ...definition,
+            }));
             const partial = snapshot.diagnostics.some((diagnostic) => UNAVAILABLE_SERVER_DIAGNOSTICS.has(diagnostic.code) &&
                 snapshot.mcpServers.some((entry) => entry.pluginName === diagnostic.pluginName &&
                     entry.server.name === diagnostic.capabilityName));
             return { tools, partial };
         },
         async call(input) {
-            const snapshot = host.currentSnapshot;
-            const view = snapshot.turnCapabilities;
-            const binding = pluginMcpBindings(snapshot).find((candidate) => candidate.tool.def.name === input.name);
-            if (!binding)
+            const match = published().find((candidate) => candidate.entry.runtimeName === input.name);
+            if (!match)
                 return refusal('TOOL_REF_STALE');
+            const { target, tool } = match;
             try {
-                host.retainTurnCapabilities(view);
+                calls.retain(target.revision);
             }
             catch {
                 return refusal('MCP_SERVER_UNAVAILABLE');
             }
             try {
-                const result = await binding.tool.impl.execute({ sessionId: `miniapp:${input.pluginId}`, turnId: 'miniapp-tool-call' }, input.arguments, input.signal);
-                return projectMcpResult(result.details?.mcp);
-            }
-            catch (error) {
-                // The pool's only error that proves nothing reached the server.
-                if (error instanceof McpToolCallNotDispatchedError)
-                    return refusal('REQUEST_CANCELLED');
-                return error instanceof McpToolCallTimeoutError ? serverTimeout() : unknownOutcome();
+                return projectDispatch(await calls.call({
+                    target,
+                    tool,
+                    args: input.arguments,
+                    signal: input.signal,
+                    invocation: { sessionId: `miniapp:${input.pluginId}`, turnId: 'miniapp-tool-call' },
+                }));
             }
             finally {
-                host.releaseTurnCapabilities(view);
+                calls.release(target.revision);
             }
         },
     };
 }
-function pluginMcpBindings(snapshot) {
-    return snapshot.turnCapabilities.runtimeToolBindings.filter((binding) => binding.kind === 'mcp' && typeof binding.mcpToolName === 'string');
-}
-function listedTool(binding) {
-    if (!binding.mcpToolName)
-        return [];
-    const { def } = binding.tool;
-    return [
-        {
-            name: def.name,
-            server: binding.source,
-            tool: binding.mcpToolName,
-            ...(def.description ? { description: def.description } : {}),
-            inputSchema: { ...def.schema },
-        },
-    ];
-}
-function projectMcpResult(value) {
-    if (!isRecord(value) || !Array.isArray(value.content))
-        return unknownOutcome();
+function projectDispatch(dispatch) {
+    if (dispatch.status === 'not_dispatched') {
+        return refusal(dispatch.reason === 'cancelled' ? 'REQUEST_CANCELLED' : 'TOOL_REF_STALE');
+    }
+    if (dispatch.status === 'unknown_after_dispatch') {
+        return dispatch.reason === 'timeout' ? serverTimeout() : unknownOutcome();
+    }
+    const { result } = dispatch;
     return {
         ok: true,
-        isError: value.isError === true,
-        content: value.content,
-        ...(isRecord(value.structuredContent) ? { structuredContent: value.structuredContent } : {}),
+        isError: result.isError === true,
+        content: result.content,
+        ...(isRecord(result.structuredContent) ? { structuredContent: result.structuredContent } : {}),
     };
 }
 function refusal(code) {

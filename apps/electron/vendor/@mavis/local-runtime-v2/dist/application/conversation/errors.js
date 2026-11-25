@@ -6,8 +6,19 @@ export class ApplicationError extends AppError {
         this.name = 'ApplicationError';
     }
 }
+/**
+ * Automatic cleanup removed the Session's worktree. Only Desktop can restore it,
+ * so TUI, CLI and Agent callers are told to go there instead of retrying.
+ */
+const WORKTREE_CLEANED_ADMISSION_ERROR = {
+    status: 409,
+    key: 'local_worktree_cleaned',
+    message: "This conversation's worktree was cleaned up automatically. Restore it from the conversation in MiniMax Code Desktop before continuing; retrying will not help.",
+};
 /** Known Turn admission errors shared by direct HTTP, SSE and queue controls. */
 export function turnAdmissionError(reason) {
+    if (reason === 'policy:worktree:cleaned')
+        return { ...WORKTREE_CLEANED_ADMISSION_ERROR };
     if (reason === 'policy:cloud-handoff:interrupt-timeout') {
         return {
             status: 409,

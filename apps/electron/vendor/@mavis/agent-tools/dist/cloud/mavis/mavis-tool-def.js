@@ -28,7 +28,9 @@ const MavisArgsSchema = Type.Object({
     system_prompt: Type.Optional(Type.String({ description: 'Agent system prompt.' })),
     persona: Type.Optional(Type.String({ description: 'Agent persona.' })),
     description: Type.Optional(Type.String({ description: 'Human-readable description.' })),
-    avatar: Type.Optional(Type.String({ description: 'Avatar URL or asset id.' })),
+    avatar: Type.Optional(Type.String({
+        description: 'Built-in portrait marker mavis-agent-avatar://default/v1/<0-9>. Omit on create to select a default portrait; omit on update to preserve it. Existing server-allowed legacy image URLs are also accepted. Do not supply emoji or invent URLs.',
+    })),
     // session
     mode: Type.Optional(Type.Union([Type.Literal('sessions'), Type.Literal('peers')], {
         description: 'session_list mode. sessions is the default; peers lists reachable peers.',
@@ -57,10 +59,19 @@ const MavisArgsSchema = Type.Object({
     additionalProperties: true,
     description: 'Subcommand-specific arguments object. This schema lists the known field superset; dispatcher validates exact fields for the selected command.',
 });
-export const MavisBaseToolDef = {
-    name: 'mavis',
-    operationClassifier: createMavisOperationClassifier(CLOUD_MAVIS_COMMANDS),
-    description: `CLI-style management tool for Mavis Agent. Run agent / drive CRUD on behalf of the current user. Session list, get, update, and messages are standalone on-demand tools: search for session_* with tool_search, then call mcp_invoke. For sending messages to peer sessions use the standalone \`communicate\` tool; for team plans use the standalone \`team\` tool.
+/**
+ * `teamTool`：运行时是否注册独立的 `team` 工具（v1 cloud-runtime 有，cloud-harness-server 没有），
+ * 只决定描述里是否有指向它的句子。
+ */
+export function createMavisBaseToolDef(options) {
+    const teamClause = options.teamTool ? '; for team plans use the standalone `team` tool' : '';
+    const peersSentence = options.teamTool
+        ? 'Team plans use the standalone `team` tool; sending messages to peers uses the standalone `communicate` tool.'
+        : 'Sending messages to peers uses the standalone `communicate` tool.';
+    return {
+        name: 'mavis',
+        operationClassifier: createMavisOperationClassifier(CLOUD_MAVIS_COMMANDS),
+        description: `CLI-style management tool for Mavis Agent. Run agent / drive CRUD on behalf of the current user. Session list, get, update, and messages are standalone on-demand tools: search for session_* with tool_search, then call mcp_invoke. For sending messages to peer sessions use the standalone \`communicate\` tool${teamClause}.
 
 USAGE
   mavis({ command: "<group> <action> [subaction]", args: { ... } })
@@ -76,6 +87,7 @@ GROUPS (high-frequency commands shown; call \`<group> help\` for the rest)
 agent — your roster
   Suggest agent creation or tool setup only after repeated work shows a need, supported by facts from memory; do not promote setup flows.
   Use agent create only after the user explicitly asks for or approves creating an agent.
+  Agent avatars use the existing ten-portrait library. Omit avatar on create to select and save one, or use mavis-agent-avatar://default/v1/<0-9> to select a variant. Do not use emoji as avatars. Omit avatar on update to preserve the current portrait.
   agent list      args: { cursor?: string, limit?: number }
   agent get       args: { agent_name: string }
   agent create    args: { name: string, system_prompt?: string, persona?: string, description?: string, avatar?: string }
@@ -87,17 +99,9 @@ session — conversations
   Search for session_* with tool_search, then call mcp_invoke.
   session help      → same migration note
 
-drive — files, folders, websites, quota
-  drive files list         args: { parent_id?: string (empty=root), node_type?: "Folder"|"File", offset?: number, limit?: number }
-  drive files get          args: { node_id: string }
-  drive files delete       args: { node_id: string }
-  drive files search       args: { keyword?: string, category?: "documents"|"excel"|"ppt"|"images"|"videos"|"audio"|"other", source?: "UserUpload"|"AgentDeliverable"|"SystemGenerated", session_id?: string, offset?: number, limit?: number, is_favorited?: boolean }
-  drive files download     args: { node_id: string }              → returns { download_url }
-  drive help               → list nodes move / nodes rename and their args
-
 OUTPUT
   Success: { ok: true, command, response: <archon-server response object> }
-  Failure: { ok: false, command, error: { kind: "validation"|"archon_server"|"oss_upload"|"workspace"|"unknown", message: string, ...details } }
+  Failure: { ok: false, command, error: { kind: "validation"|"archon_server"|"workspace"|"unknown", message: string, ...details } }
   Help:    { ok: true, command, response: { group, summary, commands: [{ command, summary, args: [...], examples: [...] }] } }
 
 ID fields (task_id, template_id, plan_id, node_id, ...) are always JSON strings to preserve snowflake int64 precision — never pass them as numbers.
@@ -111,15 +115,16 @@ ID fields (task_id, template_id, plan_id, node_id, ...) are always JSON strings 
 EXAMPLES
   mavis({ command: "agent list", args: { limit: 20 } })
   mavis({ command: "agent get", args: { agent_name: "me" } })
-  mavis({ command: "drive files list", args: { parent_id: "" } })
   mavis({ command: "agent help" })                  // expand agent update / delete spec`,
-    schema: Type.Object({
-        command: Type.String({
-            description: 'Subcommand in "<group> <action> [subaction]" form, e.g. "agent list", "drive files list", "agent help". Call "<group> help" (or "<group> -h") for less-used commands not listed inline. Session tools are session_list, session_get, session_update, and session_messages. Team plans use the standalone `team` tool; sending messages to peers uses the standalone `communicate` tool.',
+        schema: Type.Object({
+            command: Type.String({
+                description: `Subcommand in "<group> <action> [subaction]" form, e.g. "agent list", "agent help". Call "<group> help" (or "<group> -h") for less-used commands not listed inline. Session tools are session_list, session_get, session_update, and session_messages. ${peersSentence}`,
+            }),
+            args: Type.Optional(MavisArgsSchema),
         }),
-        args: Type.Optional(MavisArgsSchema),
-    }),
-};
+    };
+}
+export const MavisBaseToolDef = createMavisBaseToolDef({ teamTool: true });
 const MAVIS_TEAM_RECOMMENDATION = '; for team plans use the standalone `team` tool.';
 const MAVIS_COMMAND_TEAM_RECOMMENDATION = ' Team plans use the standalone `team` tool; sending messages to peers';
 /**

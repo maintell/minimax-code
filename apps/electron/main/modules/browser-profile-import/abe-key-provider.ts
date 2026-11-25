@@ -1,6 +1,20 @@
 import { lstat, readFile } from "node:fs/promises";
 import { windowsDpapiUnprotect } from "./platform-crypto";
-import { extractAbeEnvelope, abeEnvelopeCngBlock, unwrapAbeEnvelope, AbeEnvelopeError, ABE_KEY_LENGTH } from "./abe-envelope";
+import { extractAbeEnvelope, abeEnvelopeCngVersion, abeEnvelopeCngBlock, unwrapAbeEnvelope, AbeEnvelopeError, ABE_KEY_LENGTH } from "./abe-envelope";
+import { CHROME_CNG_KEY_NAME, CHROME_CNG_KEY_NAME_V4 } from "./abe-broker-protocol";
+/**
+ * Envelope 版本 → 机器 CNG 密钥名。
+ *
+ * 类型写成 `Record<3 | 4, string>` 而不是三元表达式：`abeEnvelopeCngVersion` 的返回值
+ * 一旦增加新版本，这里不补就会变成类型错误。密钥名必须和 `abe-envelope.ts` 里同版本的
+ * Mask 成对更新 —— 用错 Mask 或用错密钥名都不会在长度校验或 CNG 调用上暴露（两把机器
+ * 密钥在同一台机器上都能打开，且 CNG 里的 AES 不做认证），只会走到最后一步变成一个
+ * 无法定位的 `auth_failed`。
+ */
+const CNG_KEY_NAME_BY_ENVELOPE_VERSION = {
+    3: CHROME_CNG_KEY_NAME,
+    4: CHROME_CNG_KEY_NAME_V4,
+};
 /**
  * Chrome App-Bound Encryption (ABE) v20 Key 的获取编排。
  *
@@ -9,7 +23,8 @@ import { extractAbeEnvelope, abeEnvelopeCngBlock, unwrapAbeEnvelope, AbeEnvelope
  *   Base64( "APPB"[4] + ABE Blob )
  *
  * ABE Blob 需要两层 DPAPI（先 SYSTEM 上下文、再用户上下文）才能剥离，其中 SYSTEM
- * 那层必须由外部 broker 执行；broker 同时负责 v3 所需的 CNG 解密。本模块只负责：
+ * 那层必须由外部 broker 执行；broker 同时负责 CNG 封装类（v3 / v4）所需的 CNG
+ * 解密。本模块只负责：
  *
  *   1. 校验并剥离 `APPB` 前缀
  *   2. 把 Blob 交给 broker 拿回内层（本进程再剥用户层）
@@ -52,6 +67,10 @@ export class AbeKeyError extends Error {
         this.reason = reason;
         if (options && 'cause' in options)
             this.cause = options.cause;
+        if (options?.envelope)
+            this.envelope = options.envelope;
+        if (options?.cngKeyName)
+            this.cngKeyName = options.cngKeyName;
     }
 }
 
@@ -143,19 +162,32 @@ export async function readWindowsChromeAppBoundKey(localStatePath, dependencies,
             envelope = extractAbeEnvelope(plaintext).envelope;
         }
         catch (error) {
-            throw new AbeKeyError('envelope_invalid');
+            throw new AbeKeyError('envelope_invalid', {
+                envelope: describeEnvelopeFailure('extract', error, plaintext),
+            });
         }
-        // v3 的 cng_block 必须在 SYSTEM 上下文解开，先异步取回再注入同步解封。
-        const cngBlock = abeEnvelopeCngBlock(envelope);
+        // v3 / v4 的 cng_block 必须在 SYSTEM 上下文解开，先异步取回再注入同步解封。
+        // 用哪把机器密钥由 Envelope 版本决定：v3 是 key1，v4 是 key2。版本不认识时
+        // 不发起特权调用，让下面的 unwrap 直接报 version_mismatch —— 否则「Chrome
+        // 又换了格式」会被记成 broker_failed，把排查方向引到权限上。
+        const cngVersion = abeEnvelopeCngVersion(envelope);
         let cngPlain;
-        if (cngBlock) {
-            try {
-                cngPlain = await dependencies.privileged.cngDecrypt(cngBlock, signal);
-            }
-            catch (error) {
-                if (signal?.aborted)
-                    throw error;
-                throw new AbeKeyError('broker_failed', { cause: error });
+        if (cngVersion !== null) {
+            const cngBlock = abeEnvelopeCngBlock(envelope);
+            if (cngBlock) {
+                try {
+                    cngPlain = await dependencies.privileged.cngDecrypt(cngBlock, CNG_KEY_NAME_BY_ENVELOPE_VERSION[cngVersion], signal);
+                }
+                catch (error) {
+                    if (signal?.aborted)
+                        throw error;
+                    throw new AbeKeyError('broker_failed', {
+                        cause: error,
+                        // 记下当时推导出的密钥名：CNG 打不开时，日志要能区分「密钥名推导错了」
+                        // 和「broker 起不来 / 用户取消了 UAC」，否则排查方向会被引到权限上。
+                        cngKeyName: CNG_KEY_NAME_BY_ENVELOPE_VERSION[cngVersion],
+                    });
+                }
             }
         }
         try {
@@ -169,7 +201,15 @@ export async function readWindowsChromeAppBoundKey(localStatePath, dependencies,
             return assertAbeKey(key);
         }
         catch (error) {
-            throw new AbeKeyError('envelope_invalid');
+            throw new AbeKeyError('envelope_invalid', {
+                envelope: describeEnvelopeFailure('unwrap', error, plaintext),
+                // CNG 封装类的解封失败同样要带上当时用的密钥名：用错密钥名不会让 cngDecrypt
+                // 抛错（两把机器密钥都在、CNG 里的 AES 无认证），只会走到这里变成 auth_failed。
+                // 只在 cngDecrypt 抛错时记录的话，最典型的那种「密钥名推导错了」恰好查不到。
+                ...(cngVersion !== null
+                    ? { cngKeyName: CNG_KEY_NAME_BY_ENVELOPE_VERSION[cngVersion] }
+                    : {}),
+            });
         }
         finally {
             cngPlain?.fill(0);
@@ -179,6 +219,27 @@ export async function readWindowsChromeAppBoundKey(localStatePath, dependencies,
     finally {
         plaintext.fill(0);
     }
+}
+function describeEnvelopeFailure(step, error, plaintext) {
+    const diagnostics = {
+        step,
+        reason: error instanceof AbeEnvelopeError ? error.reason : 'unexpected',
+        plaintextLength: plaintext.length,
+    };
+    if (plaintext.length < 4)
+        return diagnostics;
+    const pathFieldLength = plaintext.readUInt32LE(0);
+    diagnostics.pathFieldLength = pathFieldLength;
+    const envelopeLengthOffset = 4 + pathFieldLength;
+    if (envelopeLengthOffset + 4 > plaintext.length)
+        return diagnostics;
+    const envelopeLength = plaintext.readUInt32LE(envelopeLengthOffset);
+    diagnostics.envelopeLength = envelopeLength;
+    const envelopeStart = envelopeLengthOffset + 4;
+    if (envelopeLength !== ABE_KEY_LENGTH && envelopeStart < plaintext.length) {
+        diagnostics.envelopeVersion = plaintext[envelopeStart];
+    }
+    return diagnostics;
 }
 function assertAbeKey(key) {
     if (key.length !== ABE_KEY_LENGTH)

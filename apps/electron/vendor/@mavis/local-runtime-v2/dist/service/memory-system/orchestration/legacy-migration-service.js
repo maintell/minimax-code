@@ -21,9 +21,11 @@ function deriveLegacySessionId(agentName, sourceFile) {
 // ---------------------------------------------------------------------------
 // LegacyMigrationService implementation
 // ---------------------------------------------------------------------------
-/** 只迁移主 Agent 的旧记忆；main 是 mavis 的历史目录名，两处都可能存在。 */
+/**
+ * 只迁移主 Agent 的旧记忆；main 是 mavis 的历史目录名，两处都可能存在。
+ * 用户资料 `memory/user.md` 是设置里的“关于你”，每轮作为 `<user_profile>` 注入，不迁移。
+ */
 const PRIMARY_AGENT_NAMES = ['mavis', 'main'];
-const USER_MEMORY_SOURCE = 'memory/user.md';
 /**
  * 单段迁移输入的字节上限。一个旧文件只能迁成一份不超过 maxSessionDocBytes（64KB）的文档，
  * 单次输出也有 token 上限；上百 KB 的 MEMORY.md 整份交给模型只能删内容或被截断。
@@ -48,15 +50,11 @@ export class MemoryLegacyMigrationService {
         // 选择迁移之后用户执行过 Reset：Reset 即清空，剩余旧记忆不再迁入。
         if (await this.resetSinceMigrationStarted(record.legacyMigrationResetEpoch))
             return [];
-        const migrated = new Set(record.migratedLegacySessionIds);
-        const handled = new Set([...migrated, ...(record.abandonedLegacySessionIds ?? [])]);
-        const { sources, userMemory } = await this.readSources();
-        const userParts = sources.filter((source) => source.userAuthored);
-        // 用户资料全部分段迁入后才清空原文件；清空失败或进程中断时，下一轮在这里补做。
-        if (userMemory !== undefined && userParts.every((part) => migrated.has(part.sessionId))) {
-            await this.deps.fileStore.clearLegacyUserMemory(userMemory);
-        }
-        const pending = sources.filter((source) => !handled.has(source.sessionId));
+        const handled = new Set([
+            ...record.migratedLegacySessionIds,
+            ...(record.abandonedLegacySessionIds ?? []),
+        ]);
+        const pending = (await this.readSources()).filter((source) => !handled.has(source.sessionId));
         // 收尾独立于逐文件迁移：写配置失败或进程中断时，后续每轮在这里重试，直到登记完成。
         if (pending.length === 0 && !record.legacyRecallDisabled) {
             await this.deps.disableLegacyRecall(PRIMARY_AGENT_NAMES[0]);
@@ -70,7 +68,7 @@ export class MemoryLegacyMigrationService {
     }
     async migrate(candidate) {
         const config = this.deps.config();
-        // 一轮迁移进行中关闭了记忆写入：不再调用模型、写库或清空资料，下次唤醒按当时开关决定。
+        // 一轮迁移进行中关闭了记忆写入：不再调用模型或写库，下次唤醒按当时开关决定。
         if (!config.writeEnabled)
             return { status: 'stale-input' };
         const contract = await this.deps.modelGateway.resolveContract('migration');
@@ -109,7 +107,7 @@ export class MemoryLegacyMigrationService {
         return { status: envelope.status === 'ok' ? 'migrated' : 'empty' };
     }
     /**
-     * 最后一个文件处理完毕时立即收尾；清空资料与停用旧召回失败都由下一次 listPending 补做，
+     * 最后一个文件处理完毕时立即收尾；停用旧召回失败由下一次 listPending 补做，
      * 不把已经成功的迁移或放弃登记记成失败。
      */
     async finish() {
@@ -127,20 +125,15 @@ export class MemoryLegacyMigrationService {
         const scope = await this.deps.repository.getScope(GLOBAL_SCOPE_KEY);
         return scope !== undefined && scope.resetEpoch !== startEpoch;
     }
-    /** 主 Agent 的旧文件加用户资料副本，大文件已切段；用户资料归属第一个存在旧目录的主 Agent。 */
+    /** 主 Agent 的旧文件，大文件已切段。 */
     async readSources() {
         const sources = [];
         for (const agentName of PRIMARY_AGENT_NAMES) {
             for (const file of await this.deps.fileStore.readLegacyAgentSources(agentName)) {
-                sources.push(...candidatesOf(agentName, file.sourceFile, file.content, false));
+                sources.push(...candidatesOf(agentName, file.sourceFile, file.content));
             }
         }
-        const userMemory = await this.deps.fileStore.snapshotLegacyUserMemory();
-        if (userMemory !== undefined) {
-            const owner = sources[0]?.agentName ?? PRIMARY_AGENT_NAMES[0];
-            sources.unshift(...candidatesOf(owner, USER_MEMORY_SOURCE, userMemory, true));
-        }
-        return { sources, userMemory };
+        return sources;
     }
     /** 迁移文档与正常抽取文档同构：单事务提交后物化镜像（§8.4）。返回 false 表示提交前作用域已变化。 */
     async commit(candidate, content, resetEpoch) {
@@ -185,13 +178,13 @@ export class MemoryLegacyMigrationService {
 // Helpers
 // ---------------------------------------------------------------------------
 /** 一个旧文件对应的待迁项：不超过单段上限时整份一项，否则每段一项，来源标注 `#part-<序号>-of-<总数>`。 */
-function candidatesOf(agentName, sourceFile, content, userAuthored) {
+function candidatesOf(agentName, sourceFile, content) {
     const parts = splitLegacyContent(content);
     if (parts.length <= 1) {
         // 小文件原样一项；大文件只剩一段时（其余是空白）用切好的这一段，保证不超过单段上限。
-        return [candidateOf(agentName, sourceFile, parts[0] ?? content, userAuthored)];
+        return [candidateOf(agentName, sourceFile, parts[0] ?? content)];
     }
-    return parts.map((part, index) => candidateOf(agentName, `${sourceFile}#part-${index + 1}-of-${parts.length}`, part, userAuthored));
+    return parts.map((part, index) => candidateOf(agentName, `${sourceFile}#part-${index + 1}-of-${parts.length}`, part));
 }
 /**
  * 按标题切段：先以 `#` / `##` 标题为界分节，超长的节再按空行分段，再按行，最后按字符；
@@ -239,14 +232,14 @@ function splitByBytes(text) {
 function utf8Bytes(value) {
     return Buffer.byteLength(value, 'utf8');
 }
-function candidateOf(agentName, sourceFile, content, userAuthored) {
+function candidateOf(agentName, sourceFile, content) {
     return {
         sessionId: deriveLegacySessionId(agentName, sourceFile),
         sourceRevision: sha256(content),
         agentName,
         sourceFile,
         content,
-        userAuthored,
+        userAuthored: false,
     };
 }
 /** 限流按模型服务环境故障处理，由 Reconciler 停止本批且不计次。 */

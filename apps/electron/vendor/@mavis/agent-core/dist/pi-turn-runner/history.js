@@ -78,11 +78,16 @@ export function newHistory(turn, agent) {
             if (total <= lastSnapshotLength)
                 return;
             const delta = agent.state.messages.slice(lastSnapshotLength, total);
+            const assistantMessageIds = delta.flatMap((message, index) => {
+                const messageId = turn.assistantMessageIds.get(message);
+                return messageId ? [{ index, messageId }] : [];
+            });
             const delivered = await deliver({
                 sessionId: turn.input.sessionId,
                 turnId: turn.input.turnId,
                 reason: 'messageDelta',
                 messages: [...delta],
+                ...(assistantMessageIds.length > 0 ? { assistantMessageIds } : {}),
             });
             if (delivered)
                 lastSnapshotLength = total;

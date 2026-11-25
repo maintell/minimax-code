@@ -1,4 +1,6 @@
 import { KeyedOperationLane } from '@mavis/shared/keyed-operation-lane';
+import { settleInBackground } from '../../../infra/async/settle.js';
+import { logger } from '../../../infra/logging/logger.js';
 import {} from './session-operation-gate.js';
 export function createSessionTurnDeletionService(options) {
     const lane = new KeyedOperationLane();
@@ -10,11 +12,7 @@ export function createSessionTurnDeletionService(options) {
                 options.operations.release(sessionId);
                 return;
             }
-            const operationDrain = options.operations.block(sessionId);
-            const dispatchDrain = options.dispatcher.quiesceSession(sessionId);
-            await options.repository.beginSessionDeletion(sessionId);
-            await Promise.all([operationDrain, dispatchDrain]);
-            await requireQuiescentTurn(options, sessionId);
+            await quiesceForDeletion(options, sessionId);
             await options.disposeRuntimeSession(sessionId);
             await options.repository.deleteSessionData(sessionId);
             await cleanup();
@@ -23,6 +21,52 @@ export function createSessionTurnDeletionService(options) {
             options.operations.release(sessionId);
         }),
     };
+}
+/**
+ * Fences the Session and proves Turn quiescence. Nothing has been deleted yet, so a failure here
+ * reopens the Session instead of leaving every gate closed with no owner left to release them.
+ */
+async function quiesceForDeletion(options, sessionId) {
+    const operationDrain = options.operations.block(sessionId);
+    const dispatchDrain = options.dispatcher.quiesceSession(sessionId);
+    try {
+        await options.repository.beginSessionDeletion(sessionId);
+        await Promise.all([operationDrain, dispatchDrain]);
+        await requireQuiescentTurn(options, sessionId);
+    }
+    catch (error) {
+        try {
+            await reopenAfterFailedQuiescence(options, sessionId, [operationDrain, dispatchDrain]);
+        }
+        catch (rollbackError) {
+            logger.warn({
+                sessionId,
+                error: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+            }, 'Could not reopen the Session after its deletion failed before cleanup');
+        }
+        throw error;
+    }
+}
+async function reopenAfterFailedQuiescence(options, sessionId, drains) {
+    await Promise.allSettled(drains);
+    const durable = await options.repository.abandonSessionDeletion(sessionId);
+    // A quiescent fence may come from an earlier attempt whose cleanup already ran; only a
+    // successful retry or startup recovery may clear it.
+    if (durable.status !== 'not-started')
+        return;
+    options.completeProcessDeletion(sessionId);
+    options.operations.release(sessionId);
+    // resumeSession lifts the quiesce before its first await; the drain it then starts may run a
+    // whole Turn, so the failed deletion reports without waiting for it.
+    settleInBackground(resumeReopenedSession(options, sessionId));
+}
+async function resumeReopenedSession(options, sessionId) {
+    try {
+        await options.dispatcher.resumeSession(sessionId);
+    }
+    catch (error) {
+        logger.warn({ sessionId, error: error instanceof Error ? error.message : String(error) }, 'Could not drain the Queue of a Session reopened after its deletion failed');
+    }
 }
 async function requireQuiescentTurn(options, sessionId) {
     const activeTurnId = options.controller.activeTurnId(sessionId);

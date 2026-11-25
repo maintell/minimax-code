@@ -2,6 +2,7 @@ export function findPendingLocalPermissionRequest(pendingPermissionRequests, inp
     const fingerprint = localPermissionRuleContentsFingerprint(input.ruleContents, input.ruleMatchers);
     for (const item of pendingPermissionRequests.values()) {
         if (item.sessionId === input.sessionId &&
+            item.requester === input.requester &&
             item.toolName === input.toolName &&
             item.agentName === input.agentName &&
             item.parentToolCallId === input.parentToolCallId &&

@@ -216,12 +216,6 @@ export class DesktopWorkspaceFileServiceBase extends DesktopModelProviderService
             options: req.options,
         });
     }
-    removeWorkspaceGitWorktree(_ctx, req) {
-        return this.post('/mavis/api/file/git/worktrees/remove', {
-            workspace: req.workspace,
-            worktreeDir: req.worktreeDir,
-        });
-    }
     listFsDirs(_ctx, req) {
         return this.localApiJson(query('/mavis/api/fs/dirs', {
             directory: req.directory,

@@ -171,6 +171,12 @@ function parseModel(rawValue, diagnose) {
     };
     const contextOptions = optional('context_window_options', () => parsePositiveIntegerOptions(aliasValue(raw.context_window_options, raw.contextWindowOptions, 'context_options')), 'contextOptions');
     const contextOptionHints = optional('context_window_option_hints', () => parseContextWindowOptionHints(aliasValue(raw.context_window_option_hints, raw.contextWindowOptionHints, 'context_option_hints'), contextOptions));
+    const hint = optional('hint', () => {
+        if (raw.hint === undefined)
+            return undefined;
+        return requireNonEmptyString(raw.hint, 'hint');
+    });
+    const advisorRecommended = optional('advisor_recommended', () => parseOptionalBoolean(aliasValue(raw.advisor_recommended, raw.advisorRecommended, 'advisor_recommended'), 'advisor_recommended'));
     const thinkingConfig = readThinkingConfig(raw, diagnose, optional);
     const thinking = raw.thinking === undefined ? {} : { ...requireRecord(raw.thinking, 'thinking') };
     const effortOptions = optional('effort_options', () => {
@@ -208,6 +214,8 @@ function parseModel(rawValue, diagnose) {
         model.contextWindowOptions = contextOptions;
     if (contextOptionHints)
         model.contextWindowOptionHints = contextOptionHints;
+    applyModelHint(model, hint);
+    applyAdvisorRecommended(model, advisorRecommended);
     if (Object.keys(thinking).length)
         model.thinking = thinking;
     else
@@ -215,6 +223,19 @@ function parseModel(rawValue, diagnose) {
     if (Object.keys(errors).length)
         model.parameterErrors = errors;
     return model;
+}
+/**
+ * Applies the usage hint delivered with the model. `cloneModelWithoutParsedFields` already
+ * dropped the raw field, so an absent or rejected hint leaves the model without one.
+ */
+function applyModelHint(model, hint) {
+    if (hint)
+        model.hint = hint;
+}
+/** The official advisor recommendation; an absent or rejected one leaves the model without it. */
+function applyAdvisorRecommended(model, advisorRecommended) {
+    if (advisorRecommended !== undefined)
+        model.advisorRecommended = advisorRecommended;
 }
 /** Clones the raw model minus the fields `parseModel` re-derives in normalized form. */
 function cloneModelWithoutParsedFields(raw) {
@@ -226,6 +247,9 @@ function cloneModelWithoutParsedFields(raw) {
         'contextWindowOptionHints',
         'effort_options',
         'default_effort',
+        'hint',
+        'advisor_recommended',
+        'advisorRecommended',
         'parameterErrors',
     ])
         delete model[field];
@@ -298,6 +322,11 @@ function requirePositiveInteger(value, reason) {
     if (!Number.isSafeInteger(value) || Number(value) <= 0 || Number(value) > 2_147_483_647)
         throw new Error(reason);
     return Number(value);
+}
+function parseOptionalBoolean(value, reason) {
+    if (value !== undefined && typeof value !== 'boolean')
+        throw new Error(reason);
+    return value;
 }
 function requireNonEmptyString(value, reason) {
     if (typeof value !== 'string' || !value.trim())

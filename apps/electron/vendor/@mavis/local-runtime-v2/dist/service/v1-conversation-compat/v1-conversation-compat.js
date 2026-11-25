@@ -359,11 +359,22 @@ function toQueueAttachment(input) {
             ...(dataUrl ? { dataUrl } : {}),
             ...(input.assetId ? { assetId: input.assetId } : {}),
             ...(input.error ? { error: input.error } : {}),
+            ...queueAssetReferenceFields(input),
         },
     ];
 }
+function queueAssetReferenceFields(input) {
+    if (!input.driveNodeId)
+        return {};
+    return {
+        driveNodeId: input.driveNodeId,
+        ...(input.drivePath ? { drivePath: input.drivePath } : {}),
+        ...(input.sizeBytes !== undefined ? { sizeBytes: input.sizeBytes } : {}),
+    };
+}
 function hasQueueAttachmentPayload(input, filePath, dataUrl) {
-    return Boolean(filePath || dataUrl || input.assetId || input.error);
+    // An asset library reference has no local payload; its node is the payload.
+    return Boolean(filePath || dataUrl || input.assetId || input.error || input.driveNodeId);
 }
 async function cleanupRejectedRegistration(operation, discardCreated) {
     try {
@@ -376,10 +387,15 @@ async function cleanupRejectedRegistration(operation, discardCreated) {
 }
 function queueAttachmentMetadata(input, filePath) {
     return {
-        type: input.type === 'image' ? 'image' : 'file',
+        type: queueAttachmentType(input),
         fileName: input.fileName?.trim() || attachmentFileName(filePath),
         mimeType: input.mimeType?.trim() ?? '',
     };
+}
+function queueAttachmentType(input) {
+    if (input.type === 'folder' && input.driveNodeId)
+        return 'folder';
+    return input.type === 'image' ? 'image' : 'file';
 }
 function attachmentFileName(filePath) {
     const normalized = filePath.replaceAll('\\', '/');

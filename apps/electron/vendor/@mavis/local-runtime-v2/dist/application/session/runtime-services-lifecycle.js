@@ -1,6 +1,5 @@
 import { createModelAccessExtensionTool } from '../../service/model-access-extension/index.js';
 import { settleInBackground, } from '../../service/plugin-system/index.js';
-import { abortLocalPluginHookSessionTurn, endLocalPluginHookSession, } from '../../service/turn-system/index.js';
 import { createRuntimeGlobalEventWriter, } from '../events.js';
 import { resolvePluginServiceLogger } from './plugin-service-logger.js';
 import { createStartupRecoveryRunner, } from './startup-recovery.js';
@@ -182,8 +181,12 @@ export function createRuntimeServicesGlobalEventWriter(options, state, nowMs) {
 export function createRuntimePluginSessionLifecycle(turnSystem, plugin) {
     return {
         runPluginHookSessionEndFence: turnSystem.sessionLifecycle.runExclusive,
-        preparePluginHookSessionEnd: (sessionId) => abortLocalPluginHookSessionTurn(sessionId, (executionSessionId) => turnSystem.turns.abort({ sessionId: executionSessionId, reason: 'session-archive' })),
-        endPluginHookSession: (sessionId) => endLocalPluginHookSession(sessionId, 'archive', plugin.enabledHookPluginNames()),
+        preparePluginHookSessionEnd: async (sessionId) => {
+            await turnSystem.pluginHooks?.abortSessionTurn(sessionId, (executionSessionId) => turnSystem.turns.abort({ sessionId: executionSessionId, reason: 'session-archive' }));
+        },
+        endPluginHookSession: async (sessionId) => {
+            await turnSystem.pluginHooks?.endSession(sessionId, 'archive', plugin.enabledHookPluginNames());
+        },
     };
 }
 export function createRuntimePluginAuthContextNotifier(input) {
@@ -321,6 +324,8 @@ export function createRuntimeServicesLifecycle(input) {
             ...(input.reportFailure ? { reportFailure: input.reportFailure } : {}),
             ...(input.startupRecoveryFault ? { fault: input.startupRecoveryFault } : {}),
         });
+        // Its first sweep waits on its own unref'd timer, never on recovery steps.
+        input.worktreeCleanup?.start();
         return startupRecovery.start();
     };
     const stopStartupRecovery = async () => {
@@ -346,6 +351,7 @@ export function createRuntimeServicesLifecycle(input) {
         await backgroundAgentRecovery?.settled;
         const failures = [];
         const closeSteps = [
+            () => Promise.resolve(input.worktreeCleanup?.close()),
             () => input.applications.backgroundTask.close(),
             () => input.applications.session.sideChat.close(),
             () => Promise.resolve(input.applications.session.handoff.close()),
@@ -359,7 +365,8 @@ export function createRuntimeServicesLifecycle(input) {
             () => Promise.resolve(input.turnSystem.close()),
             () => Promise.resolve(input.closeLaunchpad?.()),
             () => Promise.resolve(input.closeBrowserUse?.()),
-            () => Promise.resolve(input.disposePluginHookSessions?.()),
+            () => Promise.resolve(input.closeHarness?.()),
+            () => Promise.resolve(input.pluginExtension?.close()),
             () => Promise.resolve(input.plugin.close()),
             () => Promise.resolve(input.skillSystem.close()),
             () => Promise.resolve(input.mcp.close()),
@@ -447,6 +454,14 @@ function createStartupRecoverySteps(input) {
             run: async (signal) => {
                 if (!signal.aborted)
                     await input.cron?.ready();
+            },
+        },
+        {
+            name: 'plugin-extension-recovery',
+            owner: 'plugin-extension',
+            run: async (signal) => {
+                if (!signal.aborted)
+                    await input.pluginExtension?.onRuntimeStart();
             },
         },
         {

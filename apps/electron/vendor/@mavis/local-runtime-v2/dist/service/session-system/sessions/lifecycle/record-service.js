@@ -150,7 +150,7 @@ export class SessionRecordService {
             agent,
         });
         const appMode = normalizeAppMode(input.appMode ?? parent?.appMode);
-        const runLocation = await this.resolveCreateRunLocation(input.runLocation, appMode, workspace.workspaceDir);
+        const runLocation = await this.resolveCreateRunLocation(input.runLocation, appMode, workspace, explicitWorkspaceDir);
         const isDefaultWorkspace = createDefaultWorkspaceIdentity({
             taskWorkspace: workspace.taskWorkspace,
             parent,
@@ -210,7 +210,7 @@ export class SessionRecordService {
             explicitWorkspaceDir,
             agent,
         });
-        const runLocation = await resolveRequestedRunLocation(requested, workspace.workspaceDir, (r, dir) => this.resolveRunLocation(r, dir));
+        const runLocation = await resolveRequestedRunLocation(requested, workspace.workspaceDir, (r, dir) => this.resolveRunLocation(r, dir, explicitWorkspaceDir === undefined));
         const input = { ...requested, ...whenPresent('runLocation', runLocation) };
         const appMode = input.appMode ?? parent?.appMode;
         const sessionType = input.sessionType ?? 'branch';
@@ -295,10 +295,11 @@ export class SessionRecordService {
         const workspace = await this.resolveWorkspace(input.sessionId, input.explicitWorkspaceDir, input.agent);
         return { ...workspace, taskWorkspace };
     }
-    async resolveCreateRunLocation(requested, appMode, workspaceDir) {
+    async resolveCreateRunLocation(requested, appMode, workspace, explicitWorkspaceDir) {
         if (!requested || appMode !== 'coding')
             return undefined;
-        return this.resolveRunLocation(requested, workspaceDir);
+        const implicit = explicitWorkspaceDir === undefined && workspace.taskWorkspace === undefined;
+        return this.resolveRunLocation(requested, workspace.workspaceDir, implicit);
     }
     async createRootSession(input) {
         const sessionId = this.makeSessionId();
@@ -325,6 +326,14 @@ export class SessionRecordService {
             parentSessionId: null,
             origin: 'root-repair',
         });
+    }
+    /**
+     * The folder a new Session of this Agent gets without a Project, keyed by the given Session:
+     * the Agent's configured default directory, else that Session's own runtime directory.
+     */
+    async resolveNoProjectWorkspaceDir(session) {
+        const agent = await this.requireAgentDefaults(session.agentName);
+        return (await this.resolveWorkspace(session.sessionId, undefined, agent)).workspaceDir;
     }
     async resolveWorkspace(sessionId, explicitWorkspaceDir, agent) {
         if (explicitWorkspaceDir) {
@@ -518,9 +527,9 @@ export class SessionRecordService {
             throw new SessionServiceError('parent-not-found', `Parent Session not found: ${parentSessionId}`);
         return parent;
     }
-    async resolveRunLocation(input, workspaceDir) {
+    async resolveRunLocation(input, workspaceDir, workspaceDirImplicit = false) {
         try {
-            return await this.deps.runLocation.resolve(input, workspaceDir);
+            return await this.deps.runLocation.resolve(input, workspaceDir, { workspaceDirImplicit });
         }
         catch (error) {
             const code = error && typeof error === 'object' && typeof Reflect.get(error, 'code') === 'string'

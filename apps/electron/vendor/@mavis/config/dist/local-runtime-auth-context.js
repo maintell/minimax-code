@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { retryWindowsFileSystemOperation } from '@mavis/shared';
+import { writePrivateFileAtomicSync } from './private-config-file.js';
 export const LOCAL_RUNTIME_AUTH_CONTEXT_FILE = 'local-runtime.auth.json';
 function readOptionalString(value) {
     return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
@@ -53,19 +54,8 @@ export function writeLocalRuntimeAuthContext(dataDir, data, options = {}) {
         updatedAtMs: Date.now(),
         auth,
     };
-    const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-    fs.writeFileSync(tmpPath, `${JSON.stringify(payload, null, 2)}\n`, {
-        encoding: 'utf-8',
-        mode: 0o600,
-    });
-    if (options.retryWindowsFileSystem) {
-        retryWindowsFileSystemOperation(() => fs.renameSync(tmpPath, filePath));
-        retryWindowsFileSystemOperation(() => fs.chmodSync(filePath, 0o600));
-    }
-    else {
-        fs.renameSync(tmpPath, filePath);
-        fs.chmodSync(filePath, 0o600);
-    }
+    // The temporary file is owner-only before any byte is written; rename keeps that.
+    writePrivateFileAtomicSync(filePath, `${JSON.stringify(payload, null, 2)}\n`, options.retryWindowsFileSystem ? retryWindowsFileSystemOperation : undefined);
     return { path: filePath, written: true };
 }
 export function clearLocalRuntimeAuthContextFile(dataDir) {

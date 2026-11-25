@@ -278,6 +278,7 @@ const RECEIVED_ERROR_CODES = new Set([
     'SESSION_ARCHIVED',
     'SESSION_BUSY',
     'SESSION_SEND_REJECTED',
+    'SESSION_WORKTREE_CLEANED',
 ]);
 function receivedErrorLabel(error) {
     const key = error instanceof ApplicationError ? error.key : undefined;

@@ -5,7 +5,7 @@
  * management tool. The schema stays CLI-like (`command` + `args`) so the
  * model can copy a compact command name, while the tool description owns the
  * team-specific planning/decision contract instead of burying it among agent,
- * cron, session, and drive commands.
+ * cron, and session commands.
  */
 var __esDecorate = (this && this.__esDecorate) || function (ctor, descriptorIn, decorators, contextIn, initializers, extraInitializers) {
     function accept(f) { if (f !== void 0 && typeof f !== "function") throw new TypeError("Function expected"); return f; }

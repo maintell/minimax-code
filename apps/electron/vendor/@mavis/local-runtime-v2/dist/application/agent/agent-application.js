@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import { isDefaultAgentAvatarMarker, isBunnyAgentAvatarMarker } from '@mavis/shared/agent-avatar';
+import { randomInt, randomUUID } from 'node:crypto';
+import { formatDefaultAgentAvatarMarker, isDefaultAgentAvatarMarker, isBunnyAgentAvatarMarker, } from '@mavis/shared/agent-avatar';
 import { BoundedInternalTurnPromptReadRegistry, isPromptSnapshotInvalidError, } from '@mavis/agent-runtime';
 import { AgentServiceError, AgentImportService, } from '../../service/agent/index.js';
 import { SAFETY_SCENE, } from '../../service/content-safety/index.js';
@@ -78,7 +78,7 @@ export class AgentApplication {
      */
     async createDefinition(input) {
         await this.reviewConfigFields(createDefinitionReviewFields(input));
-        const created = await this.options.service.create(input);
+        const created = await this.options.service.create(withDefaultAvatar(input));
         publishBestEffort(this.options.publish ?? (() => undefined), {
             type: 'agent.created',
             payload: { agentName: created.exactOwnerName },
@@ -326,6 +326,21 @@ export class AgentApplication {
         this.pendingGreetingByTurn.delete(turnId);
         this.greetingInFlight.delete(agentName);
     }
+}
+/**
+ * One create boundary for every entry point that reaches it: the create dialog,
+ * the `agent create` tool and host clients. An omitted or blank avatar persists a
+ * built-in portrait marker so the roster renders the portrait family instead of a
+ * name initial. Blank counts as omitted because the cloud Runtime reads the same
+ * field with a truthiness check, and a create has nothing to clear; a
+ * definition-supplied portrait stays authoritative.
+ */
+function withDefaultAvatar(input) {
+    const explicitAvatar = input.avatar !== undefined && input.avatar.trim() !== '';
+    if (explicitAvatar || input.initialDefinition?.mavis?.avatar !== undefined) {
+        return input;
+    }
+    return { ...input, avatar: formatDefaultAgentAvatarMarker(randomInt(10)) };
 }
 function createDefinitionReviewFields(input) {
     const definition = input.initialDefinition;

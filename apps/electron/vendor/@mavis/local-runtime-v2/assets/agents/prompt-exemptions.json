@@ -31,6 +31,9 @@
     "mavis/prompt-session-root.md": "Static Agent-specific session layer outside remote Prompt control.",
     "mavis/prompt-session-root.md.hbs": "Static Agent-specific session layer outside remote Prompt control.",
     "mavis/skills/control-in-app-browser/SKILL.md": "Browser Use service-owned built-in Skill asset, outside Prompt injection.",
+    "mavis/skills/control-in-app-browser/references/browser-details.md": "Browser Use service-owned Skill reference read on demand, outside Prompt injection.",
+    "mavis/skills/control-in-app-browser/references/browser-programs.md": "Browser Use service-owned Skill section for Browser program turns, outside Prompt injection.",
+    "mavis/skills/control-in-app-browser/references/skill-short.md": "Browser Use service-owned sections of the built-in Skill's short form, outside Prompt injection.",
     "mavis/skills/mavis-doctor/SKILL.md": "Built-in Skill asset, outside Prompt injection.",
     "mavis/skills/mavis-doctor/references/global-triage.md": "Built-in Skill reference, outside Prompt injection.",
     "mavis/skills/mavis-doctor/references/local-proxy-recipes.md": "Built-in Skill reference, outside Prompt injection.",
@@ -44,6 +47,7 @@
     "verifier/agent.md": "Agent capability configuration, outside Prompt injection.",
     "worker/agent.md": "Agent capability configuration, outside Prompt injection.",
     "_v2/tui/SYSTEM.md.hbs": "V2 本地模式 Prompt，合并身份、规则与功能条件；不参与 desktop_agent 动态下发。",
-    "_v2/PTC_TOOL_CALLS.md.hbs": "V2 本地 PTC 段落，只在 PTC 真正生效的回合由运行时渲染后插入主模板；不参与 desktop_agent 动态下发，远端版本和旧客户端都不需要它。"
+    "_v2/PTC_TOOL_CALLS.md.hbs": "V2 本地 PTC 段落，只在 PTC 真正生效的回合由运行时渲染后插入主模板；不参与 desktop_agent 动态下发，远端版本和旧客户端都不需要它。",
+    "_v2/INLINE_TERMINAL.md.hbs": "Desktop 本地随包交互协议，随支持该原生 IPC 的客户端发布；不向旧客户端动态下发。"
   }
 }

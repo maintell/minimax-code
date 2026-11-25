@@ -11,7 +11,8 @@
  *      system secrets, credentials, and private keys flow through the LLM gate
  *      in auto/bypass modes and fall back to user ask when not allowed.
  *   2. Workspace boundary asks delegate to the mode router: auto may use the
- *      LLM gate, while default mode surfaces user confirmation.
+ *      LLM gate, while default mode surfaces user confirmation. Writes under
+ *      the system temp directory are allowed, as for bash and apply_patch.
  *   3. Otherwise `isPathAllowed` decides; soft sensitive paths return
  *      normal ASK so auto mode can route them through the classifier gate
  *      (handled by PermissionService, not here).
@@ -46,6 +47,11 @@ export class FsToolPermissionChecker {
             return undefined;
         const decision = evaluatePathCapability(filePath, toolActionForFsTool(toolName), context, {
             toolName,
+            // Same temp-directory write allowance as bash and apply_patch: a scratch
+            // file under the system temp directory needs no approval. Deny rules and
+            // sensitive names are checked before this fallback, so `<tmp>/.env` or a
+            // user-denied temp path still stops.
+            allowTempWrite: WRITE_TOOLS.has(toolName),
         });
         if (decision.behavior === 'allow') {
             this.maybeRecordWrite(toolName, filePath, context);

@@ -2,9 +2,12 @@ import { memoryContextCharsUsed } from '@mavis/shared/memory-context-budget';
 import { isLegacyMemoryRecallEnabled, isMemoryV2Enabled, resolveAgentCapabilities, } from '@mavis/config';
 import { join } from 'node:path';
 import { AuthStorage } from '@earendil-works/pi-coding-agent/auth-storage';
+import { parseBunnyAssignmentPurpose } from '@mavis/shared/bunny-assignment-purpose';
 import { createHostedBackgroundReminderCapabilities } from '../../background-bash/index.js';
+import { createTaskSubagentWait } from '../../background-task/index.js';
 import { isLocalChildWorkerSession } from '../../session-system/index.js';
-import { HttpRemoteTokenCounter, createHostedAgentContextUsageCapabilities, } from '../../turn-system/index.js';
+import { memoryToolsRegistered, namespacedToolGates } from '../../turn-system/index.js';
+import { HttpRemoteTokenCounter, createContextUsageCapabilities } from '@mavis/harness';
 import { recordMemorySessionTerminal, v1AutoMemoryWritesStopped, } from '../../memory-system/index.js';
 import { PI_TURN_RUNNER_LOGGER } from '../../../infra/observability/pi-turn-logger.js';
 import { createWebsiteDeployTurnProjection, prepareDeployedSources } from '../../website/index.js';
@@ -34,19 +37,28 @@ export function createHostedAgentCapabilities(host, restrictions = {}) {
             includeFallback: false,
         }),
         skills: createHostedSkillCapabilities(host, restrictions),
+        /** The namespace Skill gates for one Turn; see `hostedSkillToolGates`. */
+        skillToolGates: (input) => hostedSkillToolGates(host, restrictions, input),
         memory: host.memoryFacade,
         toolSources: {
             resolve: (input) => resolveHostedToolSources(host, restrictions, input),
         },
         review,
         websiteDeploy: createHostedWebsiteDeployCapabilities(host),
-        createChildBashLifecycle: (input) => isLocalChildWorkerSession(input.session)
-            ? host.backgroundTasks.createChildBashLifecycle({
+        createChildBashLifecycle: (input) => {
+            const scope = {
                 sessionId: input.session.sessionId,
                 turnId: input.turnId,
                 signal: input.signal,
-            })
-            : undefined,
+            };
+            if (isLocalChildWorkerSession(input.session)) {
+                return host.backgroundTasks.createChildBashLifecycle(scope);
+            }
+            // A Bunny task's Turn waits for the subagents it started, so it reports after them.
+            return parseBunnyAssignmentPurpose(input.session.purpose) !== undefined
+                ? createTaskSubagentWait(host.backgroundTaskService, scope)
+                : undefined;
+        },
         checkpointState: {
             captureSubagents: (input) => host.backgroundTaskService.captureCheckpointSnapshot(input.sessionId),
         },
@@ -131,7 +143,10 @@ export function createHostedAgentCapabilities(host, restrictions = {}) {
                 });
             },
         },
-        ...createHostedAgentContextUsageCapabilities(host),
+        contextUsage: createContextUsageCapabilities({
+            isEnabled: host.isContextWindowUsageEnabled,
+            ...(host.fetchImpl ? { fetchImpl: host.fetchImpl } : {}),
+        }),
         reportFailure: (sessionId, message) => host.reportPiTurnFailure(sessionId, message),
         metricsClient: host.metricsClient,
     };
@@ -202,7 +217,12 @@ function resolveHostedOwnerToolSources(host, restrictions, input) {
             ? { pluginRecommendationAvailable: true }
             : {}),
         ...(input.desktopCapabilities ? { desktopCapabilities: input.desktopCapabilities } : {}),
+        ...hostedToolCoordinationOptions(input),
     });
+}
+/** The Skill catalog and the `skill` tool both gate on the coordinator declaration. */
+function hostedToolCoordinationOptions(input) {
+    return input.coordination ? { coordination: input.coordination } : {};
 }
 function hostedToolMemoryOptions(host, restrictions, input) {
     const memoryEnabled = !restrictions.disableMemory &&
@@ -216,6 +236,40 @@ function hostedToolMemoryOptions(host, restrictions, input) {
         !v1AutoMemoryWritesStopped(host.configGetter().memory) &&
         input.session.memoryPolicy?.writeEnabled !== false;
     return { memoryEnabled, memoryReadEnabled, memoryWriteEnabled };
+}
+/**
+ * The three namespace Skill gates for one Turn, decided by the same adapters
+ * and the same memory predicate `buildOwnerTurnToolSources` uses. The prompt's
+ * Skill catalog is rendered before the Turn's tools exist, so it asks here
+ * instead of recomputing availability per call site — which is how the catalog
+ * and the `skill` tool drifted apart before.
+ */
+function hostedSkillToolGates(host, restrictions, input) {
+    const availability = host.resolveNamespacedToolAvailability?.() ?? {
+        desktopToolsAvailable: false,
+        cronToolsAvailable: false,
+    };
+    const memory = hostedToolMemoryOptions(host, restrictions, input);
+    return namespacedToolGates({
+        desktopToolsAvailable: availability.desktopToolsAvailable,
+        cronToolsAvailable: !restrictions.disableCron && availability.cronToolsAvailable,
+        memoryToolsAvailable: memoryToolsRegistered({
+            memoryFacade: host.memoryFacade,
+            memoryEnabled: memory.memoryEnabled,
+            ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),
+            ...(hostedMemoryAgentScopeEnabled(input) === undefined
+                ? {}
+                : { memoryAgentScopeEnabled: hostedMemoryAgentScopeEnabled(input) }),
+            memoryReadEnabled: memory.memoryReadEnabled,
+            memoryWriteEnabled: memory.memoryWriteEnabled,
+        }),
+    });
+}
+/** Mirrors `buildLocalTurnToolSourcesForHost`: a task child has no Agent memory scope. */
+function hostedMemoryAgentScopeEnabled(input) {
+    if (input.excludeAgentResources || input.session.sessionKind === 'task')
+        return false;
+    return input.agentMemoryEnabled;
 }
 function hostedToolSkillOptions(restrictions, input) {
     return {

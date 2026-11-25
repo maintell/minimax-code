@@ -1,5 +1,4 @@
 export * from './contracts.js';
-export { DEFAULT_SPACE_NAME, spaceDisplayName } from './files/library/space-name.js';
 export { SPACE_CONTEXT_ARCHIVE_FILE, SPACE_CONTEXT_FILE, SPACE_CONTEXT_LOCKED_SECTIONS, SPACE_CONTEXT_SECTIONS, SPACE_CONTEXT_SUMMARY_LIMIT, SPACE_CONTEXT_SUMMARY_SOFT_LIMIT, SpaceContextConflictError, parseSpaceContext, readSpaceContext, spaceContextExcerpt, spaceContextLockedSection, spaceContextNeedsTidy, spaceContextRevision, spaceContextSection, spaceContextSections, validateSpaceContextSummary, writeTidiedSpaceContext, } from './files/library/space-context.js';
 export { BUNNY_DATABASE_DIR, BUNNY_TRASH_DIR, SPACE_ARTIFACTS_DIR, SPACE_META_FILE, assertSpaceId, scanSpaceDirectories, } from './files/library/space-directory.js';
 export { ComposerSendBehaviorPreference, ComposerEnterBehaviorPreference, createComposerPreferences, } from './composer-preferences.js';
@@ -16,7 +15,7 @@ export * from './files/index.js';
 export * from './media-identity/index.js';
 export * from '@mavis/session-report';
 export * from './queue/index.js';
-export { EMPTY_COORDINATOR_ROSTER, assignedByBunnyCondition, assignmentTaskId, createAssignerTasks, createAssignmentTaskRepository, createCoordinatorOwnership, createCoordinatorRoster, findSessionAncestor, goalStatusOf, isAssignedByBunny, parseVerdict, readVerdict, verdictIdempotencyKey, REVIEW_FINISHED, } from './assignment-tasks/index.js';
+export { EMPTY_COORDINATOR_ROSTER, assignedByBunnyCondition, assignmentTaskId, createAssignerTasks, createAssignmentTaskRepository, createCoordinatorOwnership, createCoordinatorRoster, findSessionAncestor, sessionIsCoordinator, goalStatusOf, isAssignedByBunny, originChannelColumn, parseVerdict, readOriginChannel, readVerdict, verdictIdempotencyKey, REVIEW_FINISHED, } from './assignment-tasks/index.js';
 export { readAssignerBySession, readBunnyAssignedSessionIds, } from './assignment-tasks/repo/assigned-by-bunny.js';
 export { createMainSessionIndex, sweepSessionOrphans, } from './sessions/lifecycle/orphan-sweep.js';
 export * from './stream/index.js';
@@ -41,9 +40,11 @@ export { SessionArtifactsService, ArtifactCatalogError } from './files/artifacts
 export { ArtifactLibraryService } from './files/library/service.js';
 export { createLibraryReset } from './files/library/reset.js';
 export { LocalProjectContractError } from './project-compatibility/index.js';
+export { worktreeCleanupView } from './project-compatibility/wire.js';
 export { LocalSessionController } from './conversation/controller.js';
 export { LocalMessageQueueStore } from './conversation/compatibility-queue.js';
 export { isVisibleTreeSession } from './conversation/visibility.js';
+export { INTERNAL_TREE_SESSION_KINDS } from './sessions/repo/filters.js';
 export { applyLocalSessionListOptions } from './conversation/representation/list-options.js';
 export { withoutLocalSessionPagination } from './conversation/representation/list-options.js';
 export { buildMavisSessionAdapter } from './session-send/mavis-tool-adapters.js';

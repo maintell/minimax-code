@@ -125,7 +125,9 @@ export function setupAuthIPC(options) {
             return { success: true };
         }
         catch (error) {
-            return { success: false, error: String(error) };
+            const diagnostics = classifyDesktopLoginError(error, 'login_failed', process.platform);
+            logger.warn({ msg: '[Auth] Failed to complete login', ...diagnostics });
+            return { success: false, error: String(error), diagnostics };
         }
     });
 }

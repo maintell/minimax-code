@@ -79,17 +79,36 @@ async function bestEffortSetAgentExecutionGlow(tab, active) {
 export async function executeWithAgentExecutionGlow(tab, execute) {
     const previousLeases = tab.agentExecutionGlowLeases ?? 0;
     tab.agentExecutionGlowLeases = previousLeases + 1;
-    if (previousLeases === 0)
+    // A Browser program holds the glow across its ops; one op does not toggle it.
+    if (previousLeases === 0 && tab.agentProgramGlow !== true) {
         await bestEffortSetAgentExecutionGlow(tab, true);
+    }
     try {
         return await execute();
     }
     finally {
         const nextLeases = Math.max(0, (tab.agentExecutionGlowLeases ?? 1) - 1);
         tab.agentExecutionGlowLeases = nextLeases;
-        if (nextLeases === 0)
+        if (nextLeases === 0 && tab.agentProgramGlow !== true) {
             await bestEffortSetAgentExecutionGlow(tab, false);
+        }
     }
+}
+/** A Browser program starts working on this tab: the glow stays on until it is released. */
+export async function holdAgentProgramGlow(tab) {
+    if (tab.agentProgramGlow === true)
+        return;
+    tab.agentProgramGlow = true;
+    if ((tab.agentExecutionGlowLeases ?? 0) === 0)
+        await bestEffortSetAgentExecutionGlow(tab, true);
+}
+/** The program ended or moved to another tab: the glow follows the ops still running. */
+export async function releaseAgentProgramGlow(tab) {
+    if (tab.agentProgramGlow !== true)
+        return;
+    tab.agentProgramGlow = false;
+    if ((tab.agentExecutionGlowLeases ?? 0) === 0)
+        await bestEffortSetAgentExecutionGlow(tab, false);
 }
 export async function handleAgentCursorBridgeEvent(options) {
     const message = normalizeAgentCursorBridgeMessage(options.envelope);
@@ -134,6 +153,7 @@ export function isAgentCursorVisible(options) {
     return true;
 }
 export async function captureTabScreenshotWithoutAgentCursor(tab, params, getWebContents) {
+    const startedAt = Date.now();
     return withAgentCursorHiddenForCapture(tab, async () => {
         if (params.scope === 'fullPage') {
             if (tab.controller.isOffscreen()) {
@@ -170,16 +190,19 @@ export async function captureTabScreenshotWithoutAgentCursor(tab, params, getWeb
         if (image.isEmpty()) {
             throw new Error('Page is offscreen and no rendered frame is available — open the FilePanel browser tab and retry');
         }
+        const capturedAt = Date.now();
         const capturedSize = image.getSize();
         const outputSize = tab.controller.getCapturePageOutputSize(params, capturedSize);
         const resizedImage = outputSize.width === capturedSize.width && outputSize.height === capturedSize.height
             ? image
             : image.resize({ ...outputSize, quality: 'best' });
         const outputImage = tab.controller.normalizeCapturedImage?.(resizedImage) ?? resizedImage;
+        const data = outputImage.toPNG().toString('base64');
         return {
-            data: outputImage.toPNG().toString('base64'),
+            data,
             width: outputSize.width,
             height: outputSize.height,
+            timing: { captureMs: capturedAt - startedAt, encodeMs: Date.now() - capturedAt },
         };
     });
 }

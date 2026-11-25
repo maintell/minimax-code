@@ -4,7 +4,7 @@ import { sessions } from '../../../../../infra/db/schema/sessions.js';
 import { normalizeAbsolutePath } from '../../../shared/path-normalization.js';
 import { sessionAgentNamePredicate } from '../agent-name-predicate.js';
 export function sessionListPredicate(options) {
-    return and(eq(sessions.columnarVersion, 3), listAgentPredicate(options), listRuntimePredicate(options), workspacePredicate(options.workspaceDir), workspaceDirsPredicate(options.workspaceDirs), projectKeysPredicate(options.projectKeys), requiredWorkspacePredicate(options.requireWorkspaceDir), listOriginPredicate(options), listParentPredicate(options), archivedPredicate(options.archived), listTypePredicate(options), listVisibilityPredicate(options), includedKindsPredicate(options.includeSessionKinds), excludedKindsPredicate(options.excludeSessionKinds), startsWithPredicate(options.includePurposePrefix), notStartsWithPredicate(options.excludePurposePrefix), listSearchPredicate(options));
+    return and(eq(sessions.columnarVersion, 3), listAgentPredicate(options), listRuntimePredicate(options), workspacePredicate(options.workspaceDir), workspaceDirsPredicate(options.workspaceDirs), workspaceRootsPredicate(options.workspaceRoots), projectKeysPredicate(options.projectKeys), requiredWorkspacePredicate(options.requireWorkspaceDir), listOriginPredicate(options), listParentPredicate(options), archivedPredicate(options.archived), listTypePredicate(options), listVisibilityPredicate(options), includedKindsPredicate(options.includeSessionKinds), excludedKindsPredicate(options.excludeSessionKinds), startsWithPredicate(options.includePurposePrefix), notStartsWithPredicate(options.excludePurposePrefix), listSearchPredicate(options));
 }
 function listAgentPredicate(options) {
     return sessionAgentNamePredicate(options.agentName);
@@ -14,19 +14,37 @@ function listRuntimePredicate(options) {
         ? eq(sessions.runtime, options.runtime)
         : undefined;
 }
+/** Windows 路径不区分大小写，按小写比较。 */
+const WINDOWS_PATH = /^[A-Za-z]:[\\/]|^\\\\/u;
 function workspacePredicate(workspaceDir) {
     if (workspaceDir === undefined)
         return undefined;
     const normalized = normalizeAbsolutePath(workspaceDir);
     if (!normalized)
         return sql `0`;
-    return /^[A-Za-z]:[\\/]|^\\\\/u.test(normalized)
+    return WINDOWS_PATH.test(normalized)
         ? eq(sql `lower(${sessions.workspaceDir})`, normalized.toLocaleLowerCase())
         : eq(sessions.workspaceDir, normalized);
 }
 /** 落在其中任一工作目录；每个目录按 `workspaceDir` 同样的规则比较。空列表不限。 */
 export function workspaceDirsPredicate(workspaceDirs) {
     return workspaceDirs?.length ? or(...workspaceDirs.map(workspacePredicate)) : undefined;
+}
+/** 工作目录是其中某个目录或在它之下；每个目录按 `workspaceDir` 同样的规则比较。空列表不限。 */
+function workspaceRootsPredicate(roots) {
+    return roots?.length ? or(...roots.map(workspaceRootPredicate)) : undefined;
+}
+/** 比较前缀而不用 LIKE，路径里的 `%`、`_` 不会被当成通配符；长度由 SQLite 按字符计。 */
+function workspaceRootPredicate(root) {
+    const normalized = normalizeAbsolutePath(root);
+    if (!normalized)
+        return sql `0`;
+    const windows = WINDOWS_PATH.test(normalized);
+    const separator = windows ? '\\' : '/';
+    const value = windows ? normalized.toLocaleLowerCase() : normalized;
+    const prefix = value.endsWith(separator) ? value : `${value}${separator}`;
+    const column = windows ? sql `lower(${sessions.workspaceDir})` : sql `${sessions.workspaceDir}`;
+    return sql `(${column} = ${value} OR substr(${column}, 1, length(${prefix})) = ${prefix})`;
 }
 /**
  * 属于其中任一项目的 Session。项目 key 和侧栏、项目接口一致：默认项目是 `default`，工作区项目是

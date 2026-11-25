@@ -1,6 +1,6 @@
 import { createEvaluatorVerifierAdapter, EvaluatorModelCallError, VerificationDispatchError, } from '@mavis/goal';
 import { randomUUID } from 'node:crypto';
-import { LLM_RETRY_CALL_IDENTITY, } from '@mavis/agent-core/pi-turn-runner';
+import { isLLMContextOverflowMessage, LLM_RETRY_CALL_IDENTITY, } from '@mavis/agent-core/pi-turn-runner';
 import { GOAL_CONFIG_DEFAULTS, resolveModelCallRoute } from '@mavis/config';
 import { isContextOverflow, streamSimple } from '@earendil-works/pi-ai';
 import { ThinkingLevel } from '@mavis/protocol';
@@ -248,8 +248,14 @@ function evaluateFinalMessage(final, contextWindow, signal) {
         incomplete: usage.incomplete,
     };
 }
-/** A final response that says the request exceeded the model's context window. */
+/**
+ * A final response that says the request exceeded the model's context window.
+ * The shared provider wording is read first, as main-turn recovery does: Pi's
+ * patterns miss several providers (e.g. Zhipu `Prompt exceeds max length`).
+ */
 export function isFinalContextOverflow(final, contextWindow) {
+    if (final.stopReason === 'error' && isLLMContextOverflowMessage(final.errorMessage))
+        return true;
     const usage = Reflect.get(final, 'usage');
     if (usage && typeof usage === 'object')
         return isContextOverflow(final, contextWindow);

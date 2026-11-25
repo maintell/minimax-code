@@ -11,6 +11,8 @@
  *   - `agent_data` / `agent_data_patch` 是 archon-biz schema 域,archon-server
  *     不感知字段语义,LLM 给 raw JSON string 即可
  */
+import { randomInt } from 'node:crypto';
+import { formatDefaultAgentAvatarMarker } from '@mavis/shared/agent-avatar';
 import { AgentCreationSource } from '../../runtime-types.js';
 import { HostToolCapability } from '@mavis/protocol';
 import { archonBusinessFailure, failure, success } from '../output.js';
@@ -101,7 +103,9 @@ export const handleAgentCreate = async (ctx, args, signal) => {
         display_name: args.name,
         agent_data: agentData,
         ...(args.description ? { description: args.description } : {}),
-        ...(args.avatar ? { avatar: args.avatar } : {}),
+        // Match the create dialog's ten built-in portraits. Persist the chosen
+        // marker so later reads and renames keep the same avatar across clients.
+        avatar: args.avatar || formatDefaultAgentAvatarMarker(randomInt(10)),
         creation_source: AgentCreationSource.Manual,
     }, signal);
     return baseRespOrSuccess(ctx.command, resp, '/api/v1/agents/create');

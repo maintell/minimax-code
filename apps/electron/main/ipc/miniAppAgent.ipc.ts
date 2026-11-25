@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ipcMain } from "electron";
-import { isMiniAppAgentBusyReason, readMiniAppAgentOpenSessionReply, readMiniAppAgentRunRequest, readMiniAppAgentAnswerRequest, readMiniAppAgentReplyRequest, readMiniAppAgentObserveRequest, readMiniAppAgentSessionRequest, readMiniAppAgentOpenRequest, readMiniAppAgentOpenSessionRequest, isMiniAppAgentRequestId } from "@mavis/shared/miniapp-surface";
+import { isMiniAppAgentBusyReason, readMiniAppAgentOpenSessionReply, readMiniAppAgentRunRequest, readMiniAppAgentAnswerRequest, readMiniAppAgentReplyRequest, readMiniAppAgentObserveRequest, readMiniAppAgentSessionRequest, readMiniAppAgentOpenRequest, HOME_PANEL_OWNER, readMiniAppAgentOpenSessionRequest, isMiniAppAgentRequestId } from "@mavis/shared/miniapp-surface";
 import { IPC_CHANNELS } from "../config/constants.js";
 import { getEmbeddedBrowserManager } from "../modules/browser/embedded-browser-manager.js";
 import { panelClosedUtilityMiniAppAgent, runUtilityMiniAppAgent, answerUtilityMiniAppAgent, replyUtilityMiniAppAgent, observeUtilityMiniAppAgent, listUtilityMiniAppAgentSessions, getUtilityMiniAppAgentSession, openUtilityMiniAppAgent, panelOpenedUtilityMiniAppAgent } from "../modules/local-runtime/utility";
@@ -330,6 +330,10 @@ export function setupMiniAppAgentIPC() {
             return failure('invalid_request');
         const source = manager.captureMiniAppComposerSource(event.sender, event.senderFrame);
         if (!source?.sessionId)
+            return failure('not_permitted');
+        // Agent-session tabs live in a chat's side panel; Home's panel (the renderer's Home owner)
+        // has no chat to host them.
+        if (source.sessionId === HOME_PANEL_OWNER)
             return failure('not_permitted');
         const caller = {
             pluginId: source.pluginId,

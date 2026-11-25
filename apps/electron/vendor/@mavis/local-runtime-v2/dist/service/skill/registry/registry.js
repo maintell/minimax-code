@@ -1,6 +1,6 @@
 import {} from '@mavis/skills';
 import { readConfiguredSkillRoots } from './roots.js';
-import { deleteRegistrySkill, getRegistrySkillDetail, hasRegistryLocationUri, inferAgentNameFromConfiguredLocationUri, listRegistryRuntimeSkills, listRegistrySkillFiles, listRegistrySkillSummaries, readRegistrySkillByName, readRegistrySkillFile, resolveRegistrySkillIdentity, renderLocalRegistrySkillsCatalog, } from './registry-operations.js';
+import { deleteRegistrySkill, getRegistrySkillDetail, hasRegistryLocationUri, inferAgentNameFromConfiguredLocationUri, listRegistryRuntimeSkills, listRegistrySkillFiles, listRegistrySkillSummaries, readRegistrySkillByName, readRegistrySkillFile, resolveRegistrySkillIdentity, listRegistryCatalogEntries, } from './registry-operations.js';
 import { createRegistryHandle, inheritedRuntimeReadBetaFlags, normalizeAgentName, } from './registry-handle.js';
 import { createAgentResourceScopeReader, withoutAgentResourceRoots, } from './registry-agent-scope.js';
 // The provider is process-scoped while workspace roots are session-scoped.
@@ -170,7 +170,7 @@ function createRegistryOperations(context) {
                 });
             });
         },
-        async renderCatalog(input = {}) {
+        async listCatalogEntries(input = {}) {
             return withAgentResourceScope(input, async (scopedInput) => {
                 const agentName = normalizeAgentName(scopedInput.agentName);
                 const handle = await getHandleForAgent(scopedInput);
@@ -179,7 +179,7 @@ function createRegistryOperations(context) {
                     readMcpServerNames(),
                     enabledState.getDisabledLocationUris(),
                 ]);
-                return renderLocalRegistrySkillsCatalog(registry, {
+                return listRegistryCatalogEntries(registry, {
                     agentName,
                     compatibleAgentNames: scopedInput.compatibleAgentNames,
                     injectableBuiltinSkillNames: scopedInput.injectableBuiltinSkillNames,
@@ -188,8 +188,6 @@ function createRegistryOperations(context) {
                     betaFlags: scopedInput.betaFlags,
                     mcpServerNames,
                     disabledLocationUris,
-                    contextWindowTokens: scopedInput.contextWindowTokens,
-                    additionalSkills: scopedInput.additionalSkills,
                 });
             });
         },

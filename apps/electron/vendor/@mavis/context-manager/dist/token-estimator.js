@@ -87,7 +87,9 @@ function isVisualContentBlock(block) {
     return block.type === 'image' || block.type === 'video';
 }
 function calculateContextTokens(usage) {
-    return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+    return (usage.contextTokens ||
+        usage.totalTokens ||
+        usage.input + usage.output + usage.cacheRead + usage.cacheWrite);
 }
 function getAssistantUsage(message) {
     if (message.role !== 'assistant')

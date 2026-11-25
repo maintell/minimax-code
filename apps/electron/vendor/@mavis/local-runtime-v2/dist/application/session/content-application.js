@@ -7,8 +7,9 @@ import { getCloudDriveNodeId, isCommitIdTransportId } from '@mavis/shared/asset-
 import { isOrdinaryQuestionnaireResponseOrigin } from '@mavis/shared/questionnaire';
 import { isSideChatSendOrigin } from '@mavis/shared/sidechat-send-origin';
 import { DriveNodeSource, DriveNodeType, InstalledPluginSource, PluginCapabilityType, } from '@mavis/thrift-gen/generated/desktop-service/types';
-import { ArtifactCatalogError, SpaceContextConflictError, MessageQueryServiceError, PeekContextServiceError, SessionInputSummaryServiceError, SessionUsageServiceError, SessionSourceQueryServiceError, isInlineDisplayDataUrl, } from '../../service/session-system/index.js';
+import { ArtifactCatalogError, SpaceContextConflictError, MessageQueryServiceError, PeekContextServiceError, SessionFileSyncServiceError, SessionInputSummaryServiceError, SessionUsageServiceError, SessionSourceQueryServiceError, isInlineDisplayDataUrl, } from '../../service/session-system/index.js';
 import { AppError } from '../errors.js';
+import { messageApplicationError, fileSyncApplicationError, inputSummaryApplicationError, sourceHistoryApplicationError, } from './content-errors.js';
 import { queryCollapseSteeringProjection } from '../conversation/query-collapse-identity.js';
 import { projectPeerMessageOrigin } from '../conversation/peer-message-origin.js';
 import { isUndeliveredRetryCopy } from '../conversation/undelivered-side-messages.js';
@@ -101,7 +102,11 @@ export class SessionContentApplication {
     async getArtifactSpaceContext(_context, request) {
         return this.artifactMutation(() => this.options.artifactCatalog.library.readContext(request.id));
     }
-    /** Rewrites context.md's `<summary>`; a stale revision is a 409 SPACE_CONTEXT_CONFLICT. */
+    /**
+     * Rewrites context.md's `<summary>`; a stale revision is a 409 SPACE_CONTEXT_CONFLICT. The
+     * message names both revisions, and the current summary stays in the error's model details,
+     * which only the mavis tool path prints: this response body stays small.
+     */
     async writeArtifactSpaceContext(_context, request) {
         return this.artifactMutation(() => this.options.artifactCatalog.library.writeContext(request));
     }
@@ -147,6 +152,64 @@ export class SessionContentApplication {
             hasMore: page.hasMore,
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
         };
+    }
+    async getSessionFileSyncs(_context, request) {
+        const syncs = await this.options.files.getSessionFileSyncs({
+            sessionId: request.id,
+            paths: request.paths ?? [],
+        });
+        return { syncs };
+    }
+    async recordSessionFileSync(_context, request) {
+        try {
+            const sync = await this.options.files.recordSessionFileSync({
+                sessionId: request.id,
+                path: request.path,
+                nodeId: request.nodeId,
+                sha256: request.sha256,
+                ...(request.drivePath !== undefined ? { drivePath: request.drivePath } : {}),
+                ...(request.accountId ? { accountId: request.accountId } : {}),
+            });
+            return { sync };
+        }
+        catch (error) {
+            if (error instanceof SessionFileSyncServiceError)
+                throw fileSyncApplicationError(error);
+            throw error;
+        }
+    }
+    async querySessionFileSyncSources(_context, request) {
+        try {
+            return await this.options.files.querySessionFileSyncSources(request);
+        }
+        catch (error) {
+            if (error instanceof SessionFileSyncServiceError)
+                throw fileSyncApplicationError(error);
+            throw error;
+        }
+    }
+    async invalidateSessionFileSyncSources(_context, request) {
+        try {
+            return {
+                removed: await this.options.files.invalidateSessionFileSyncSources(request.sources),
+            };
+        }
+        catch (error) {
+            if (error instanceof SessionFileSyncServiceError)
+                throw fileSyncApplicationError(error);
+            throw error;
+        }
+    }
+    async bindSessionFileSyncOwner(_context, request) {
+        try {
+            await this.options.files.bindSessionFileSyncOwner(request.sources, request.accountId);
+            return {};
+        }
+        catch (error) {
+            if (error instanceof SessionFileSyncServiceError)
+                throw fileSyncApplicationError(error);
+            throw error;
+        }
     }
     async listSessionInputSummaries(_context, request) {
         try {
@@ -516,24 +579,6 @@ function carriesSourceContextOrigin(message, sourceContext) {
         (message.source === 'questionnaire' &&
             isOrdinaryQuestionnaireResponseOrigin(sourceContext.origin)));
 }
-function messageApplicationError(error) {
-    switch (error.reason) {
-        case 'session-not-found':
-            return new AppError(404, 'SESSION_NOT_FOUND', error.message);
-        case 'data-corrupt':
-            return new AppError(500, 'MESSAGE_DATA_CORRUPT', error.message);
-    }
-}
-function inputSummaryApplicationError(error) {
-    return new AppError(error.reason === 'session-not-found' ? 404 : 400, error.reason === 'session-not-found'
-        ? 'SESSION_NOT_FOUND'
-        : 'INVALID_SESSION_INPUT_SUMMARY_PAGINATION', error.message);
-}
-function sourceHistoryApplicationError(error) {
-    return new AppError(error.reason === 'session-not-found' ? 404 : 400, error.reason === 'session-not-found'
-        ? 'SESSION_NOT_FOUND'
-        : 'INVALID_SESSION_SOURCE_PAGINATION', error.message);
-}
 function toSessionSourceRecordView(source) {
     return {
         sourceId: source.sourceId,
@@ -683,6 +728,8 @@ function toAttachmentView(value) {
             filePath: maybeString(filePath),
             desktopPath: maybeString(desktopPath),
             dataUrl: displayUrl(dataUrl),
+            driveNodeId: maybeString(firstDefined([local.driveNodeId, local.drive_node_id])),
+            drivePath: maybeString(firstDefined([local.drivePath, local.drive_path])),
         },
         cloud: {
             uploadId: maybeString(firstDefined([cloud.uploadId, cloud.upload_id])),

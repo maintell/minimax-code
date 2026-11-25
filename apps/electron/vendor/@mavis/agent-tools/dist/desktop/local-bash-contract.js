@@ -1,7 +1,6 @@
 import { getShellConfig } from '@earendil-works/pi-coding-agent/shell';
-import { Clone, Type } from '@sinclair/typebox';
-import { LocalBashToolDef } from './builtin-defs.js';
-import { DEFAULT_FOREGROUND_BASH_SOFT_YIELD_MS, DEFAULT_FOREGROUND_BASH_TIMEOUT_SECONDS, MAX_FOREGROUND_BASH_TIMEOUT_SECONDS, MAX_MANAGED_BASH_TIMEOUT_SECONDS, } from './local-bash-timing.js';
+import { createBashToolSchema, LocalBashToolDef } from '../core-tools/defs.js';
+import { DEFAULT_FOREGROUND_BASH_SOFT_YIELD_MS } from './local-bash-timing.js';
 export function resolveLocalBashShell() {
     try {
         return getShellConfig().type;
@@ -12,14 +11,9 @@ export function resolveLocalBashShell() {
 }
 /** A fresh definition for the final admitted Turn inventory. */
 export function createLocalBashToolDefinition(capabilities) {
-    const base = Clone(LocalBashToolDef.schema);
-    const schema = capabilities.background ? base : Type.Omit(base, ['run_in_background']);
-    schema.properties.timeout.description = capabilities.background
-        ? `Total command timeout in seconds. Foreground with automatic backgrounding: default/max ${MAX_MANAGED_BASH_TIMEOUT_SECONDS}s, including foreground time. Explicit background: uses the specified timeout, or a 1-hour runtime limit if omitted.`
-        : `Timeout in seconds. Foreground: default ${DEFAULT_FOREGROUND_BASH_TIMEOUT_SECONDS}s; values above ${MAX_FOREGROUND_BASH_TIMEOUT_SECONDS}s are capped.`;
     return {
         ...LocalBashToolDef,
-        schema,
+        schema: createBashToolSchema(capabilities.background),
         description: `${LocalBashToolDef.description}\n\n${renderBashUsage(capabilities)}`,
     };
 }

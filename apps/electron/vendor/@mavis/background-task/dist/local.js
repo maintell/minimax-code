@@ -1,5 +1,18 @@
 import { randomUUID } from 'node:crypto';
 export const BACKGROUND_TASK_CHECKPOINT_DETAILS_HINT = 'Call task_query for the live task list, then task_output(task_id) for progress or results.';
+export function readPluginSpawnOrigin(task) {
+    const origin = task.metadata?.['spawnedBy'];
+    if (typeof origin !== 'object' || origin === null)
+        return undefined;
+    const { kind, pluginId, activationGeneration } = origin;
+    if (kind !== 'plugin-extension' || typeof pluginId !== 'string')
+        return undefined;
+    return {
+        kind,
+        pluginId,
+        activationGeneration: typeof activationGeneration === 'string' ? activationGeneration : '',
+    };
+}
 export class BackgroundTaskError extends Error {
     code;
     details;

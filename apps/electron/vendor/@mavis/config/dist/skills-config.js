@@ -15,9 +15,12 @@
  *     across sources. The visible skill roster still keeps only the priority
  *     winner.
  *   - `sources`: per-source-kind `{ enabled, priority }`. Higher priority
- *     wins on name collision. Only the externally-discoverable sources are
- *     surfaced — Mavis-internal sources (`builtin-*`, `agent-*`, `user-mavis`)
- *     are not user-configurable here (handled by the SkillStore directly).
+ *     wins on name collision between external sources. External sources always
+ *     rank below MCode's own global skills directory (`<dataDir>/skills`), so
+ *     no configured priority can shadow a same-named global skill. Only the
+ *     externally-discoverable sources are surfaced — Mavis-internal sources
+ *     (`builtin-*`, `agent-*`, `user-mavis`) are not user-configurable here
+ *     (handled by the SkillStore directly).
  */
 const EXTERNAL_SOURCE_KINDS = [
     'user-cc',
@@ -47,6 +50,7 @@ export const DEFAULT_SKILLS_CONFIG = {
             'user-agents': { enabled: true, priority: 30 },
         },
     },
+    freezeCatalog: true,
 };
 function isObject(v) {
     return v != null && typeof v === 'object' && !Array.isArray(v);
@@ -91,7 +95,16 @@ export function parseSkillsConfig(raw) {
                 : defaults.external.duplicateWarn,
             sources,
         },
+        freezeCatalog: parseBoolean(skillsObj.freezeCatalog, defaults.freezeCatalog ?? true),
     };
+}
+/** `config.skills.*` overrides may arrive as YAML strings ("false"). */
+function parseBoolean(value, fallback) {
+    if (typeof value === 'boolean')
+        return value;
+    if (value === 'true' || value === 'false')
+        return value === 'true';
+    return fallback;
 }
 export const EXTERNAL_SOURCE_KIND_LIST = EXTERNAL_SOURCE_KINDS;
 //# sourceMappingURL=skills-config.js.map

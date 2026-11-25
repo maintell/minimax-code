@@ -5,7 +5,7 @@ import path from 'node:path';
 import lockfile from 'proper-lockfile';
 import { PluginSystemError } from '../../errors.js';
 import { findEnabledCachedPackage, normalizedPluginName, settleInBackground, } from '../../plugin-system-helpers.js';
-import { computeMiniAppPackageDigests, computePluginDirectoryDigest, pluginDigestCacheKey, } from '../package/package-contract.js';
+import { computeMiniAppPackageDigests, materializeContentAddressedDirectory, pluginDigestCacheKey, } from '../package/package-contract.js';
 import { readLinkedPluginPackage, readMiniMaxPlugin, scanLocalPluginPackages, } from '../package/package-readers.js';
 import { pluginIdFromInstallDirectory } from '../local/install-directory.js';
 import { PluginLinkRegistry, unavailableLinkedPackage, } from '../local/plugin-links.js';
@@ -31,6 +31,7 @@ const DEFAULT_HOOK_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1_000;
 const DEFAULT_HOOK_CACHE_MAX_BYTES = 512 * 1024 * 1024;
 const HOOK_CACHE_LOCK_STALE_MS = 30_000;
 const HOOK_CACHE_KEY = /^sha256-tree-v1-[0-9a-f]{64}$/;
+const QUARANTINED_ROOT = /^sha256-tree-v1-[0-9a-f]{64}\.corrupt-[0-9a-f-]+$/;
 const OWNED_TEMPORARY_ROOT = /^\.tmp-([1-9]\d*)-[0-9a-f-]+-/;
 /**
  * Owns Plugin package discovery, cache restore, and local uninstall staging.
@@ -224,7 +225,7 @@ export class PluginPackageStorage {
             lease = await acquireHookPackageLease(cacheRoot, cacheKey);
             const taskKey = `${cacheRoot}\0${cacheKey}`;
             const existing = hookPackageMaterializationTasks.get(taskKey);
-            const materialization = existing ?? this.ensureHookPackage(path.join(cacheRoot, cacheKey), cacheRoot, entry);
+            const materialization = existing ?? this.ensureHookPackage(cacheRoot, entry);
             if (!existing)
                 hookPackageMaterializationTasks.set(taskKey, materialization);
             let immutableRoot;
@@ -279,30 +280,25 @@ export class PluginPackageStorage {
             };
         }
     }
-    async ensureHookPackage(immutableRoot, cacheRoot, entry) {
-        if (!(await this.isValidHookCache(immutableRoot, entry))) {
-            await rm(immutableRoot, { recursive: true, force: true });
-            const stagingRoot = await mkdtemp(path.join(cacheRoot, `.tmp-${String(process.pid)}-${hookProcessInstanceId}-`));
-            await rmdir(stagingRoot);
-            try {
+    async ensureHookPackage(cacheRoot, entry) {
+        const materialized = await materializeContentAddressedDirectory({
+            parent: cacheRoot,
+            stagingPrefix: `.tmp-${String(process.pid)}-${hookProcessInstanceId}-`,
+            expectedDigest: entry.contentDigest,
+            digestOptions: {
+                pathPolicy: entry.plugin.manifestKind === 'MINIMAX' ? 'minimax-portable' : 'agent-plugin',
+            },
+            populate: async (stagingRoot) => {
+                await rmdir(stagingRoot);
                 await cp(entry.plugin.rootPath, stagingRoot, {
                     recursive: true,
                     errorOnExist: true,
                     force: false,
                 });
-                const digest = await computePluginDirectoryDigest(stagingRoot, {
-                    pathPolicy: entry.plugin.manifestKind === 'MINIMAX' ? 'minimax-portable' : 'agent-plugin',
-                });
-                if (digest.contentDigest !== entry.contentDigest) {
-                    throw new PluginSystemError('LOCAL_PLUGIN_CHANGED_DURING_SCAN', 'local Plugin changed while its immutable Hook snapshot was materialized');
-                }
-                await this.commitHookPackage(stagingRoot, immutableRoot, entry);
-            }
-            finally {
-                await rm(stagingRoot, { recursive: true, force: true });
-            }
-        }
-        return immutableRoot;
+            },
+            mismatchError: () => new PluginSystemError('LOCAL_PLUGIN_CHANGED_DURING_SCAN', 'local Plugin changed while its immutable Hook snapshot was materialized'),
+        });
+        return materialized.root;
     }
     async initializeHookCache() {
         const physicalDataDir = await realpath(this.options.dataDir);
@@ -351,29 +347,6 @@ export class PluginPackageStorage {
         finally {
             if (hookCacheGcTasks.get(cacheRoot) === collection)
                 hookCacheGcTasks.delete(cacheRoot);
-        }
-    }
-    async commitHookPackage(stagingRoot, immutableRoot, entry) {
-        try {
-            await rename(stagingRoot, immutableRoot);
-        }
-        catch (error) {
-            if (!(await this.isValidHookCache(immutableRoot, entry)))
-                throw error;
-        }
-    }
-    async isValidHookCache(root, entry) {
-        try {
-            const stat = await lstat(root);
-            if (stat.isSymbolicLink() || !stat.isDirectory())
-                return false;
-            const digest = await computePluginDirectoryDigest(root, {
-                pathPolicy: entry.plugin.manifestKind === 'MINIMAX' ? 'minimax-portable' : 'agent-plugin',
-            });
-            return digest.contentDigest === entry.contentDigest;
-        }
-        catch {
-            return false;
         }
     }
     async stageAcceptedLocalRoot(canonicalRoot) {
@@ -622,7 +595,7 @@ async function inspectHookCacheEntry(cacheRoot, name, leasedCacheKeys, processIs
     const isCacheRoot = HOOK_CACHE_KEY.test(name);
     const temporaryOwnerPid = temporaryRootOwnerPid(name);
     const isTemporaryRoot = name.startsWith('.tmp-');
-    if (!isCacheRoot && !isTemporaryRoot)
+    if (!isCacheRoot && !isTemporaryRoot && !QUARANTINED_ROOT.test(name))
         return undefined;
     const rootPath = path.join(cacheRoot, name);
     const tree = await inspectHookCacheTree(rootPath);

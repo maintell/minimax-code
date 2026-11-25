@@ -1,5 +1,7 @@
-import { isMiniAppHostAccess } from './miniapp-host.js';
+import { isMiniAppHostAccess, } from './miniapp-host.js';
 export * from './miniapp-host.js';
+/** The side-panel owner id of the Home page; Mini App tabs hosted there carry it as `sessionId`. */
+export const HOME_PANEL_OWNER = 'home';
 export function isMiniAppPageSnapshot(value) {
     if (!value || typeof value !== 'object')
         return false;
@@ -26,6 +28,148 @@ export const MINIAPP_MEMORY_PROTECTIONS = Object.freeze([
 ]);
 export function isMiniAppMemoryProtection(value) {
     return MINIAPP_MEMORY_PROTECTIONS.includes(value);
+}
+export const MINIAPP_FILE_HANDLER_ID = /^[a-z0-9-]{1,32}$/u;
+export const MINIAPP_FILE_EXTENSION = /^\.[a-z0-9]{1,16}$/u;
+export const MINIAPP_FILE_HANDLERS_MAX = 256;
+export const MINIAPP_FILE_HANDLER_EXTENSIONS_MAX = 256;
+/** Extensions summed over every handler of one manifest. */
+export const MINIAPP_FILE_HANDLER_TOTAL_EXTENSIONS_MAX = 512;
+export const MINIAPP_FILE_OPEN_MAX_PATHS = 64;
+export const MINIAPP_FILE_HANDLER_PATH_MAX_LENGTH = 4096;
+/**
+ * A normalized `fileHandlers[].path`: host-relative (`/`, not `//`, no `://`), no backslash,
+ * query or fragment, canonical (no `.` / `..` / empty segment except a trailing `/`), at most
+ * `MINIAPP_FILE_HANDLER_PATH_MAX_LENGTH` characters and free of control characters. The manifest
+ * reader and the Main broker both apply it, so a handler one accepts the other cannot refuse.
+ */
+export function isMiniAppFileHandlerPath(value) {
+    if (typeof value !== 'string' ||
+        value.length > MINIAPP_FILE_HANDLER_PATH_MAX_LENGTH ||
+        !value.startsWith('/') ||
+        value.startsWith('//') ||
+        value.includes('://') ||
+        /[\\?#\u0000-\u001f\u007f]/u.test(value)) {
+        return false;
+    }
+    const segments = value.slice(1).split('/');
+    return segments.every((segment, index) => segment !== '.' && segment !== '..' && (segment !== '' || index === segments.length - 1));
+}
+const MINIAPP_FILE_HANDLER_FIELDS = new Set(['id', 'path', 'extensions']);
+/**
+ * The full `fileHandlers` rule set, shared by the manifest reader and the Electron broker (which
+ * re-validates instead of trusting the Utility side). `path` must already be normalized: the
+ * reader applies its `surface.path` normalization first. Returns a copy holding only the
+ * declared fields.
+ */
+export function validateMiniAppFileHandlers(value) {
+    const fail = (reason, path, kind = 'handlers') => ({
+        ok: false,
+        kind,
+        reason,
+        ...(path === undefined ? {} : { path }),
+    });
+    if (!Array.isArray(value) || value.length === 0) {
+        return fail('fileHandlers must be a non-empty array');
+    }
+    if (value.length > MINIAPP_FILE_HANDLERS_MAX) {
+        return fail(`fileHandlers supports at most ${MINIAPP_FILE_HANDLERS_MAX} handlers`);
+    }
+    const ids = new Set();
+    const extensions = new Set();
+    const handlers = [];
+    for (const [index, item] of value.entries()) {
+        const label = `fileHandlers[${index}]`;
+        if (!isPlainRecord(item) ||
+            Object.keys(item).some((key) => !MINIAPP_FILE_HANDLER_FIELDS.has(key))) {
+            return fail(`${label} must contain only id, path and extensions`, label);
+        }
+        if (typeof item.id !== 'string' || !MINIAPP_FILE_HANDLER_ID.test(item.id) || ids.has(item.id)) {
+            return fail(`${label}.id must match [a-z0-9-]{1,32} and be unique`, `${label}.id`);
+        }
+        ids.add(item.id);
+        if (!isMiniAppFileHandlerPath(item.path)) {
+            return fail(`${label}.path must be a canonical host-relative route of at most ${MINIAPP_FILE_HANDLER_PATH_MAX_LENGTH} characters without an origin, query, fragment, backslash or control characters`, `${label}.path`, 'path');
+        }
+        if (!Array.isArray(item.extensions) ||
+            item.extensions.length === 0 ||
+            item.extensions.length > MINIAPP_FILE_HANDLER_EXTENSIONS_MAX) {
+            return fail(`${label}.extensions must be a non-empty array of at most ${MINIAPP_FILE_HANDLER_EXTENSIONS_MAX} extensions`, `${label}.extensions`);
+        }
+        for (const [extensionIndex, extension] of item.extensions.entries()) {
+            const extensionLabel = `${label}.extensions[${extensionIndex}]`;
+            if (typeof extension !== 'string' || !MINIAPP_FILE_EXTENSION.test(extension)) {
+                return fail(`${extensionLabel} must look like ".stl"`, extensionLabel);
+            }
+            if (extensions.has(extension)) {
+                return fail(`${extensionLabel} repeats ${extension}`, extensionLabel);
+            }
+            if (extensions.size === MINIAPP_FILE_HANDLER_TOTAL_EXTENSIONS_MAX) {
+                return fail(`fileHandlers supports at most ${MINIAPP_FILE_HANDLER_TOTAL_EXTENSIONS_MAX} extensions in total`, extensionLabel);
+            }
+            extensions.add(extension);
+        }
+        handlers.push({ id: item.id, path: item.path, extensions: [...item.extensions] });
+    }
+    return { ok: true, value: handlers };
+}
+/** Last dotted segment, lower-cased, of a file name or path on either platform. */
+export function miniAppFileExtension(fileName) {
+    const base = fileName.split(/[\\/]/u).pop() ?? '';
+    const dot = base.lastIndexOf('.');
+    if (dot <= 0 || dot === base.length - 1)
+        return null;
+    const extension = base.slice(dot).toLowerCase();
+    return MINIAPP_FILE_EXTENSION.test(extension) ? extension : null;
+}
+const WINDOWS_ABSOLUTE = /^(?:[a-zA-Z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/u;
+function isAbsoluteFilePath(value) {
+    return value.startsWith('/') || WINDOWS_ABSOLUTE.test(value);
+}
+/** A path a file open may carry: POSIX, drive or UNC absolute, as Main checks it. */
+export function isMiniAppFileOpenPath(value) {
+    return (value.length > 0 &&
+        isAbsoluteFilePath(value) &&
+        !value.split(/[\\/]/u).some((segment) => segment === '.' || segment === '..'));
+}
+export function readMiniAppFileOpenInput(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return null;
+    const record = value;
+    if (Object.keys(record).some((key) => key !== 'handlerId' && key !== 'paths'))
+        return null;
+    const { handlerId, paths } = record;
+    if (typeof handlerId !== 'string' || !MINIAPP_FILE_HANDLER_ID.test(handlerId))
+        return null;
+    if (!Array.isArray(paths) ||
+        paths.length === 0 ||
+        paths.length > MINIAPP_FILE_OPEN_MAX_PATHS ||
+        !paths.every((item) => typeof item === 'string' && isMiniAppFileOpenPath(item)))
+        return null;
+    return { handlerId, paths: [...paths] };
+}
+export function isMiniAppFileOpen(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value))
+        return false;
+    const record = value;
+    if (Object.keys(record).some((key) => key !== 'handlerId' && key !== 'files'))
+        return false;
+    if (typeof record.handlerId !== 'string' || !MINIAPP_FILE_HANDLER_ID.test(record.handlerId))
+        return false;
+    const files = record.files;
+    if (!Array.isArray(files) || files.length === 0)
+        return false;
+    return files.every((file) => {
+        if (!file || typeof file !== 'object' || Array.isArray(file))
+            return false;
+        const entry = file;
+        if (Object.keys(entry).some((key) => !['path', 'name', 'extension'].includes(key)))
+            return false;
+        return (typeof entry.path === 'string' &&
+            typeof entry.name === 'string' &&
+            typeof entry.extension === 'string' &&
+            MINIAPP_FILE_EXTENSION.test(entry.extension));
+    });
 }
 /**
  * Why the Host put a Mini App (or one of its pages) to sleep. `count-cap`: the user opened
@@ -189,6 +333,7 @@ export const MINIAPP_HOST_CAPABILITIES = Object.freeze([
     'agent.run',
     'agent.session',
     'agent.sessions',
+    'files.subscribe',
     'host.navigation.getState',
     'host.navigation.open',
     'host.navigation.subscribe',

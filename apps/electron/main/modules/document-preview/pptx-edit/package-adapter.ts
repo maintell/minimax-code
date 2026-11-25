@@ -1,9 +1,8 @@
 import { validatePptPackageClosure } from "./package-closure";
 import { createHash } from "node:crypto";
-import jszip from "jszip";
 import { SaxesParser } from "saxes";
 import { PPTX_PREVIEW_LIMITS_V1 } from "@mavis/shared/document-preview";
-import { validatePptxWriteArchive } from "../pptx-notes-writer";
+import { loadPptxWriteArchive, validatePptxWriteArchive } from "../pptx-notes-writer";
 function sha(bytes) {
     return `sha256:${createHash('sha256').update(bytes).digest('hex')}`;
 }
@@ -21,10 +20,9 @@ export async function applyCorePptxPatch(original, input) {
         throw new Error('invalid_patch_plan');
     if (plan.replacements.length === 0)
         return original;
-    await validatePptxWriteArchive(original);
     const seen = new Set();
     let total = 0;
-    const zip = await jszip.loadAsync(original, { checkCRC32: true });
+    const zip = await loadPptxWriteArchive(original, true);
     for (const replacement of plan.replacements) {
         if (!replacement ||
             typeof replacement.partUri !== 'string' ||

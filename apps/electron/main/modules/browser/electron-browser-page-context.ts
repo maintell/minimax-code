@@ -22,6 +22,11 @@ export class ElectronBrowserPageContext {
     get isDisposed() {
         return this.disposed;
     }
+    /** The click projection found that the last write may have had a side effect. */
+    markLastWriteUncertain(reason) {
+        if (!this.disposed)
+            this.options.coreSession.markLastWriteUncertain(reason);
+    }
     bindLifecycle() {
         if (this.lifecycleBound || this.disposed)
             return;
@@ -58,6 +63,18 @@ export class ElectronBrowserPageContext {
                 this.poisoned = true;
             throw error;
         }
+    }
+    /**
+     * One op of a Browser program. Browser Core answers every outcome as a
+     * result; only a session that needs recreation poisons this page, as for
+     * an action.
+     */
+    async executeOp(op, signal) {
+        this.assertUsable();
+        const result = await this.options.coreSession.executeOp(op, signal);
+        if (this.options.coreSession.requiresRecreation)
+            this.poisoned = true;
+        return result;
     }
     assertUsable() {
         if (this.poisoned)

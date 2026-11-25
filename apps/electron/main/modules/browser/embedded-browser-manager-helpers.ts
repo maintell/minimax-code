@@ -27,7 +27,7 @@ export let COMMENT_KEY_MAX_ENTRIES = 500;
 export let COMMENT_KEY_MAX_LENGTH = 200;
 export let HIDDEN_LOADING_GRACE_MS = 2 * 60 * 1000;
 export let HIDDEN_SWEEP_INTERVAL_MS = 60 * 1000;
-export let MAX_HIDDEN_TABS = 12;
+export let MAX_HIDDEN_TABS = 32;
 /**
  * How long each session's selected tab stays alive after it was hidden, so
  * returning to a conversation shows the same live page instead of a reload.
@@ -123,6 +123,18 @@ export function urlHost(value) {
         return null;
     try {
         return new URL(value).host || null;
+    }
+    catch {
+        return null;
+    }
+}
+/** Web origin of an http(s)/file URL; null for opaque origins such as about:blank. */
+export function urlOrigin(value) {
+    if (!value)
+        return null;
+    try {
+        const origin = new URL(value).origin;
+        return origin && origin !== 'null' ? origin : null;
     }
     catch {
         return null;

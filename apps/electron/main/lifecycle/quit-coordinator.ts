@@ -25,7 +25,11 @@ export function createElectronTerminalActionAdapters(input) {
             exit: (code) => app.exit(code),
         },
         updater: {
-            quitAndInstall: (isSilent, isForceRunAfter) => autoUpdater.quitAndInstall(isSilent, isForceRunAfter),
+            quitAndInstall: (isSilent, isForceRunAfter) => {
+                // MacUpdater ignores the arguments and reads this property instead.
+                autoUpdater.autoRunAppAfterInstall = isForceRunAfter;
+                autoUpdater.quitAndInstall(isSilent, isForceRunAfter);
+            },
         },
     };
 }
@@ -76,6 +80,8 @@ function rejectedInstall(error) {
 export class QuitCoordinator {
     constructor(dependencies) {
         this.beforeQuitHandled = false;
+        this.preparingWindowClose = false;
+        this.windowClosePrepared = false;
         this.rendererAckPending = false;
         this.rendererCloseCompleted = false;
         this.rendererAckOutcome = 'not-required';
@@ -116,6 +122,11 @@ export class QuitCoordinator {
         }
         if (!this.owned) {
             this.claimPlan(this.resolveNormalPlan(), false, 'external', 'external-before-quit');
+        }
+        if (this.dependencies.prepareWindowClose && !this.windowClosePrepared && event) {
+            event.preventDefault();
+            this.requestWindowClose();
+            return;
         }
         if (this.beforeQuitHandled)
             return;
@@ -247,16 +258,42 @@ export class QuitCoordinator {
             settled: false,
         };
         this.logPlanClaim(this.owned);
-        if (callAppQuit) {
-            try {
-                this.dependencies.app.quit();
-            }
-            catch (error) {
-                this.logError('Electron app.quit failed; starting cleanup directly', error);
-                this.startCleanup();
-            }
-        }
+        if (callAppQuit)
+            this.requestWindowClose();
         return this.owned.promise;
+    }
+    requestWindowClose() {
+        const prepare = this.dependencies.prepareWindowClose;
+        if (prepare && !this.windowClosePrepared) {
+            if (this.preparingWindowClose)
+                return;
+            this.preparingWindowClose = true;
+            const complete = () => {
+                if (this.windowClosePrepared)
+                    return;
+                this.windowClosePrepared = true;
+                this.dependencies.timers.clearTimeout(deadline);
+                this.requestWindowClose();
+            };
+            const deadline = this.dependencies.timers.setTimeout(() => {
+                this.logWarn('Window preparation timed out; continuing quit');
+                complete();
+            }, prepare.timeoutMs);
+            void Promise.resolve()
+                .then(prepare.run)
+                .then(complete, (error) => {
+                this.logError('Failed to prepare windows for quit', error);
+                complete();
+            });
+            return;
+        }
+        try {
+            this.dependencies.app.quit();
+        }
+        catch (error) {
+            this.logError('Electron app.quit failed; starting cleanup directly', error);
+            this.startCleanup();
+        }
     }
     armRendererAckTimer() {
         if (this.rendererAckPending || this.rendererCloseCompleted)

@@ -115,18 +115,47 @@ function parseObjectCandidate(candidate) {
     }
     return isPlainObject(parsed) ? parsed : null;
 }
-/** Prefers fenced code blocks, then falls back to the first balanced object in the text. */
+/**
+ * Prefers the LAST parseable fenced code block, then falls back to the first balanced object in
+ * the text.
+ *
+ * The review contract asks for the verdict block at the end of the reply, and the same contract
+ * tells the reviewer to quote the material it read verbatim — including any fenced JSON the
+ * reviewed task planted in its own final reply or delivered files. Reading the first parseable
+ * block therefore let untrusted reviewed content outrank the reviewer's own conclusion: a quoted
+ * `{"outcome":"pass"}` ahead of a real `fail` decided the gate. Taking the last parseable block
+ * matches the contract and keeps the reviewer's own conclusion authoritative.
+ */
 function extractVerdictObject(text) {
     const segments = text.split('```');
-    for (let index = 1; index < segments.length; index += 2) {
+    // Odd indices hold fenced block contents; start from the last odd index and walk backwards.
+    let index = segments.length - 1;
+    if (index % 2 === 0)
+        index -= 1;
+    let lastParsed = null;
+    for (; index >= 1; index -= 2) {
         const segment = segments[index];
         if (segment === undefined)
             continue;
         const parsed = parseObjectCandidate(segment);
-        if (parsed !== null)
-            return parsed;
+        if (parsed === null)
+            continue;
+        // The contract puts the verdict last, so the last block that names an outcome is the
+        // reviewer's own conclusion and the search stops there. Blocks naming neither key (a quoted
+        // config snippet, a log) are skipped so they cannot mask it. A conclusion that names one but
+        // states it wrong ends the search as unparseable rather than letting an earlier quoted block
+        // decide the gate in its place.
+        if (!namesOutcome(parsed)) {
+            lastParsed ??= parsed;
+            continue;
+        }
+        return readOutcome(parsed) === null ? null : parsed;
     }
-    return parseObjectCandidate(text);
+    return lastParsed ?? parseObjectCandidate(text);
+}
+/** Whether a candidate claims to be a verdict at all, whatever it says the outcome is. */
+function namesOutcome(candidate) {
+    return candidate.outcome !== undefined || candidate.verdict !== undefined;
 }
 function readOutcome(candidate) {
     const value = candidate.outcome !== undefined ? candidate.outcome : candidate.verdict;

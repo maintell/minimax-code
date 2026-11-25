@@ -2,6 +2,7 @@
  * Tool-level permission checkers barrel export.
  */
 import { BashToolPermissionChecker } from './bash-checker.js';
+import { ExtensionToolPermissionChecker } from './extension-checker.js';
 import { FsToolPermissionChecker } from './fs-checker.js';
 /**
  * Register the built-in tool permission checkers with an engine.
@@ -19,6 +20,7 @@ export function registerDefaultCheckers(engine) {
     engine.registerToolPermissionChecker('glob', fsChecker);
     engine.registerToolPermissionChecker('grep', fsChecker);
     engine.registerToolPermissionChecker('list', fsChecker);
+    engine.registerToolPermissionChecker('extension', new ExtensionToolPermissionChecker());
 }
 export { BashToolPermissionChecker } from './bash-checker.js';
 export { FsToolPermissionChecker } from './fs-checker.js';

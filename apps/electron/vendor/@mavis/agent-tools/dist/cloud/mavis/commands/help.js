@@ -4,8 +4,7 @@
  *
  * Why a help tier: the tool description in `mavis-tool-def.ts` only shows
  * high-frequency commands inline so the static prompt stays small. Low-
- * frequency commands (`agent update`, `cron trigger`,
- * `drive nodes move/rename`, ...) live here — the LLM pays the token cost
+ * frequency commands (`agent update`, `cron trigger`, ...) live here — the LLM pays the token cost
  * only when it explicitly calls `mavis({ command: "<group> help" })`.
  *
  * Help OUTPUT is a structured JSON object the LLM can parse field-by-field
@@ -85,7 +84,12 @@ const AGENT_GROUP = {
                     required: false,
                     description: 'One-line description for the listing UI.',
                 },
-                { name: 'avatar', type: 'string', required: false, description: 'Avatar URL or emoji.' },
+                {
+                    name: 'avatar',
+                    type: 'string',
+                    required: false,
+                    description: 'Omit to select and save a portrait from the ten built-in avatars. To select one explicitly, use mavis-agent-avatar://default/v1/<0-9>. Existing server-allowed legacy image URLs remain supported; do not supply emoji or invent URLs.',
+                },
                 {
                     name: 'creation_source',
                     type: '"Manual"|"Auto"|"Builtin"',
@@ -129,7 +133,7 @@ const AGENT_GROUP = {
                     name: 'avatar',
                     type: 'string',
                     required: false,
-                    description: 'New avatar URL or emoji.',
+                    description: 'Use mavis-agent-avatar://default/v1/<0-9> to select a built-in portrait. Omit to keep the existing avatar; an empty string clears it. Existing server-allowed legacy image URLs remain supported; do not supply emoji or invent URLs.',
                 },
             ],
             examples: [
@@ -425,146 +429,18 @@ const SESSION_GROUP = {
     summary: 'Session list, get, update, and messages moved to on-demand tools session_list, session_get, session_update, and session_messages. Search for session_* with tool_search, then call mcp_invoke.',
     commands: [],
 };
-// ─── drive ──────────────────────────────────────────────────────────────
-const DRIVE_GROUP = {
-    group: 'drive',
-    summary: 'User drive — files, folders, websites, quota.',
-    commands: [
-        {
-            command: 'drive files list',
-            summary: 'List files / folders under a parent (empty parent = root).',
-            args: [
-                {
-                    name: 'parent_id',
-                    type: 'string',
-                    required: false,
-                    description: 'Parent folder node_id. Empty / omitted = root.',
-                },
-                {
-                    name: 'node_type',
-                    type: '"Folder"|"File"',
-                    required: false,
-                    description: 'Filter by node type.',
-                },
-                {
-                    name: 'offset',
-                    type: 'number',
-                    required: false,
-                    description: 'Offset-based pagination.',
-                },
-                { name: 'limit', type: 'number', required: false, description: 'Page size.' },
-            ],
-            examples: ['mavis({ command: "drive files list", args: { parent_id: "" } })'],
-        },
-        {
-            command: 'drive files get',
-            summary: 'Fetch one drive node (file or folder) by id.',
-            args: [{ name: 'node_id', type: 'string', required: true, description: 'Drive node id.' }],
-            examples: ['mavis({ command: "drive files get", args: { node_id: "drv_..." } })'],
-        },
-        {
-            command: 'drive files delete',
-            summary: 'Delete one file or folder by id (recursive for folders).',
-            args: [{ name: 'node_id', type: 'string', required: true, description: 'Drive node id.' }],
-            examples: ['mavis({ command: "drive files delete", args: { node_id: "drv_..." } })'],
-        },
-        {
-            command: 'drive files search',
-            summary: 'Search drive by keyword, category, source, session, or favorite flag.',
-            args: [
-                {
-                    name: 'keyword',
-                    type: 'string',
-                    required: false,
-                    description: 'Substring match on file name.',
-                },
-                {
-                    name: 'category',
-                    type: '"documents"|"excel"|"ppt"|"images"|"videos"|"audio"|"other"',
-                    required: false,
-                    description: 'Coarse category filter.',
-                },
-                {
-                    name: 'source',
-                    type: '"UserUpload"|"AgentDeliverable"|"SystemGenerated"',
-                    required: false,
-                    description: 'Origin filter.',
-                },
-                {
-                    name: 'session_id',
-                    type: 'string',
-                    required: false,
-                    description: 'Limit to files associated with this session.',
-                },
-                { name: 'is_favorited', type: 'boolean', required: false, description: 'Only favorites.' },
-                {
-                    name: 'offset',
-                    type: 'number',
-                    required: false,
-                    description: 'Offset-based pagination.',
-                },
-                { name: 'limit', type: 'number', required: false, description: 'Page size.' },
-            ],
-            examples: [
-                'mavis({ command: "drive files search", args: { keyword: "weekly-report", category: "documents" } })',
-            ],
-        },
-        {
-            command: 'drive files download',
-            summary: 'Get a download URL for one file. Returns `{ download_url }`.',
-            args: [
-                {
-                    name: 'node_id',
-                    type: 'string',
-                    required: true,
-                    description: 'Drive node id of a File.',
-                },
-            ],
-            examples: ['mavis({ command: "drive files download", args: { node_id: "drv_..." } })'],
-        },
-        {
-            command: 'drive nodes move',
-            summary: 'Move one node to a new parent folder. Empty `new_parent_id` = root.',
-            args: [
-                { name: 'node_id', type: 'string', required: true, description: 'Node to move.' },
-                {
-                    name: 'new_parent_id',
-                    type: 'string',
-                    required: true,
-                    description: 'Target parent folder id. Empty string = root.',
-                },
-            ],
-            examples: [
-                'mavis({ command: "drive nodes move", args: { node_id: "drv_...", new_parent_id: "" } })',
-            ],
-        },
-        {
-            command: 'drive nodes rename',
-            summary: 'Rename a drive node.',
-            args: [
-                { name: 'node_id', type: 'string', required: true, description: 'Node to rename.' },
-                { name: 'new_name', type: 'string', required: true, description: 'New display name.' },
-            ],
-            examples: [
-                'mavis({ command: "drive nodes rename", args: { node_id: "drv_...", new_name: "report-v2.md" } })',
-            ],
-        },
-    ],
-};
 const GROUPS = {
     agent: AGENT_GROUP,
     cron: CRON_GROUP,
     session: SESSION_GROUP,
-    drive: DRIVE_GROUP,
 };
-export const HELP_GROUPS = ['agent', 'cron', 'session', 'drive'];
+export const HELP_GROUPS = ['agent', 'cron', 'session'];
 function makeHelpHandler(group) {
     return async (ctx) => success(ctx.command, GROUPS[group]);
 }
 export const handleAgentHelp = makeHelpHandler('agent');
 export const handleCronHelp = makeHelpHandler('cron');
 export const handleSessionHelp = makeHelpHandler('session');
-export const handleDriveHelp = makeHelpHandler('drive');
 /**
  * Builds a validation failure for `<unknown> help`-style typos. Surfaces the
  * full list of valid help targets so the LLM can self-correct in one turn.

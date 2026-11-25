@@ -16,6 +16,11 @@ export const projects = sqliteTable('local_runtime_projects', {
     updatedAtMs: integer('updated_at_ms').notNull(),
     /** User-chosen name; NULL falls back to the directory basename (m0053). */
     displayName: text('display_name'),
+    /**
+     * When the project joined the sidebar list (m0070); the list shows the latest first and
+     * NULL falls back to `created_at_ms`. Activity never changes it.
+     */
+    listedAtMs: integer('listed_at_ms'),
 }, (table) => [
     check('local_runtime_projects_kind_check', sql `${table.projectKind} IN ('default', 'workspace')`),
     check('local_runtime_projects_identity_check', sql `(${table.projectKind} = 'default' AND ${table.workspaceDir} IS NULL) OR (${table.projectKind} = 'workspace' AND ${table.workspaceDir} IS NOT NULL AND trim(${table.workspaceDir}) <> '')`),

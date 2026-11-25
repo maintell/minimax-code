@@ -1,13 +1,28 @@
 import { captureBrowserScreenshot, observeBrowserDownload } from './browser-action-artifacts.js';
-import { buttonName, classifyBrowserNavigationEvent, waitExpression, } from './browser-action-helpers.js';
+import { buttonName, classifyBrowserNavigationEvent, waitExpression, waitSelectorTimeoutRecovery, } from './browser-action-helpers.js';
 import { BrowserActionTargetSupport } from './browser-action-targets.js';
+import { EDITABLE_FIELD_SOURCE } from './browser-editable-field.js';
+import { describeInputDiagnosis, diagnoseUnfocusedInput, unfocusedInputRecovery, } from './browser-input-diagnosis.js';
 import { browserPrintableKeyDescriptor } from './browser-keyboard.js';
-import { asNumber, asString, cdp, delay, describeCdpException, evaluate, resolveBrowserSnapshotElement, stringArray, } from './browser-state.js';
-import { isBrowserOperationInterruption } from './operation-timeout.js';
+import { aimAtProbe, probeBrowserClickTarget, targetNotFocusableResult, targetNotInteractableResult, } from './browser-click-interactability.js';
+import { answeredGetLoad, MainFrameNavigationPending, pendingLoadFacts, pendingNavigationResult, } from './browser-main-frame-load.js';
+import { sendMainFrameNavigationCommand, watchMainFrameNavigation, } from './browser-navigation-watch.js';
+import { asNumber, asString, cdp, delay, describeCdpException, evaluate, isRecord, resolveBrowserSnapshotElement, stringArray, } from './browser-state.js';
+import { isBrowserOperationInterruption, throwIfAborted } from './operation-timeout.js';
+import { uncertainWriteNext, unexpectedNavigationRetry } from './browser-write-record.js';
 const DEFAULT_WAIT_TIMEOUT_MS = 30_000;
+/** A request counts for wait kind "network" once it loaded, got an HTTP error or failed. */
+const FINISHED_NETWORK_STATUS = [
+    'success',
+    'failed',
+    '4xx',
+    '5xx',
+];
 const ACTION_SETTLE_DELAY_MS = 100;
 const CLICK_NAVIGATION_DETECTION_MS = 1_000;
 const NAVIGATION_READY_TIMEOUT_MS = 30_000;
+/** What a navigation keeps after its waits to settle and read the new page. */
+const NAVIGATION_RESULT_RESERVE_MS = 1_000;
 const MAX_NAVIGATION_READY_TIMEOUT_MS = 120_000;
 const HISTORY_READY_TIMEOUT_MS = 10_000;
 const SCROLL_BOUNDARY_EPSILON = 1;
@@ -65,6 +80,7 @@ function normalizeScrollSnapshot(value, axis) {
         clientWidth,
     };
 }
+/** Resolves with the main-document navigation event, or undefined at the timeout. */
 function observeMainDocumentNavigation(session, timeoutMs, mainFrameId) {
     const childSessionIds = new Set((session.transport.listAttachedFrames?.() ?? []).map((frame) => frame.sessionId));
     return new Promise((resolve) => {
@@ -119,30 +135,50 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
             throw new Error('Unsupported Browser URL: expected http(s), file, data, or about URL');
         }
         const startedAt = Date.now();
-        const before = await this.readPageSummary(session);
+        // A page still loading a document cannot be read (the read would wait for
+        // the commit): any document after this navigation then counts as new.
+        const loading = session.mainFrameLoad?.pending !== undefined;
+        const beforeUrl = loading ? undefined : (await this.readPageSummary(session)).url;
         // Register the shared diagnostics listener before the first external
         // navigation. Enabling Runtime/Network at the transport layer does not
         // buffer events for a CDPHelper listener that has not been attached yet.
         await session.cdpHelper.startDOMListener(session.commandSignal);
-        const beforeTimeOrigin = await this.evaluateMainDocument(session, 'performance.timeOrigin');
-        const navigation = await this.sendMainDocumentCommand(session, 'Page.navigate', { url });
-        const movedToNewDocument = (state) => state.url !== before.url || state.timeOrigin !== beforeTimeOrigin;
-        // Chromium answers ERR_ABORTED when a redirect or a cross-process swap
-        // replaces the requested load while the tab still commits the target
-        // document (typically the first cross-site navigate from about:blank).
-        // Only a tab that never reaches a new document has failed.
-        if (navigation.errorText &&
-            (navigation.errorText !== 'net::ERR_ABORTED' || navigation.isDownload === true)) {
-            throw new Error(`NAVIGATION_FAILED: ${navigation.errorText}`);
-        }
-        await this.waitForDocumentReady(session, movedToNewDocument, NAVIGATION_READY_TIMEOUT_MS).catch((error) => {
-            // Transport interruptions carry a code and keep their recovery path.
-            const transportInterruption = error instanceof Error && 'code' in error;
-            if (!navigation.errorText || session.commandSignal?.aborted || transportInterruption) {
-                throw error;
+        const beforeTimeOrigin = loading
+            ? undefined
+            : await this.evaluateMainDocument(session, 'performance.timeOrigin');
+        const movedToNewDocument = (state) => beforeUrl === undefined || state.url !== beforeUrl || state.timeOrigin !== beforeTimeOrigin;
+        try {
+            const navigation = await sendMainFrameNavigationCommand(session, 'Page.navigate', { url }, this.navigationBudgetMs(session));
+            // Chromium answers ERR_ABORTED when a redirect or a cross-process swap
+            // replaces the requested load while the tab still commits the target
+            // document. The retired Electron loadURL path ignored ERR_ABORTED for this
+            // reason; in one desktop evaluation the first cross-site navigate from an
+            // inspected about:blank failed in 35/43 tasks although the page had committed.
+            // Only a tab that never reaches a new document failed.
+            if (navigation.errorText &&
+                (navigation.errorText !== 'net::ERR_ABORTED' || navigation.isDownload === true)) {
+                throw new Error(`NAVIGATION_FAILED: ${navigation.errorText}`);
             }
-            throw new Error(`NAVIGATION_FAILED: ${navigation.errorText}`);
-        });
+            await this.waitForDocumentReady(session, movedToNewDocument, this.navigationBudgetMs(session)).catch((error) => {
+                // Transport interruptions carry a code and keep their recovery path.
+                const transportInterruption = error instanceof Error && 'code' in error;
+                if (!navigation.errorText ||
+                    session.commandSignal?.aborted ||
+                    transportInterruption ||
+                    error instanceof MainFrameNavigationPending) {
+                    throw error;
+                }
+                throw new Error(`NAVIGATION_FAILED: ${navigation.errorText}`);
+            });
+        }
+        catch (error) {
+            if (!(error instanceof MainFrameNavigationPending))
+                throw error;
+            this.invalidate(session);
+            return pendingNavigationResult('navigate', error.load, {
+                durationMs: Date.now() - startedAt,
+            });
+        }
         await delay(ACTION_SETTLE_DELAY_MS, session.commandSignal);
         this.invalidate(session);
         const page = await this.readPageSummary(session);
@@ -197,9 +233,22 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
         };
     }
     async reload(session) {
-        const beforeTimeOrigin = await this.evaluateMainDocument(session, 'performance.timeOrigin');
-        await this.sendMainDocumentCommand(session, 'Page.reload', { ignoreCache: false });
-        await this.waitForDocumentReady(session, (state) => state.timeOrigin !== beforeTimeOrigin, NAVIGATION_READY_TIMEOUT_MS);
+        const startedAt = Date.now();
+        const beforeTimeOrigin = session.mainFrameLoad?.pending === undefined
+            ? await this.evaluateMainDocument(session, 'performance.timeOrigin')
+            : undefined;
+        try {
+            await sendMainFrameNavigationCommand(session, 'Page.reload', { ignoreCache: false }, this.navigationBudgetMs(session));
+            await this.waitForDocumentReady(session, (state) => beforeTimeOrigin === undefined || state.timeOrigin !== beforeTimeOrigin, this.navigationBudgetMs(session));
+        }
+        catch (error) {
+            if (!(error instanceof MainFrameNavigationPending))
+                throw error;
+            this.invalidate(session);
+            return pendingNavigationResult('reload', error.load, {
+                durationMs: Date.now() - startedAt,
+            });
+        }
         await delay(ACTION_SETTLE_DELAY_MS, session.commandSignal);
         this.invalidate(session);
         const page = await this.readPageSummary(session);
@@ -211,9 +260,31 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
             navigation: { detected: true, loaded: true },
         };
     }
+    /**
+     * How long a navigation step may still wait: the readiness window, cut so
+     * that a slow document is reported (pending) before the action deadline
+     * fires, whose recovery resets the connection.
+     */
+    navigationBudgetMs(session) {
+        const untilDeadline = session.actionDeadlineAt === undefined
+            ? NAVIGATION_READY_TIMEOUT_MS
+            : session.actionDeadlineAt - Date.now() - NAVIGATION_RESULT_RESERVE_MS;
+        return Math.max(1, Math.min(NAVIGATION_READY_TIMEOUT_MS, untilDeadline));
+    }
     async waitForDocumentReady(session, acceptsUrl, timeoutMs) {
         const deadline = Date.now() + timeoutMs;
         while (Date.now() <= deadline) {
+            // Until the new document commits a renderer read would wait for it and
+            // run into its own deadline (a slow reload ended that way); wait for
+            // the commit with browser events instead.
+            const mainFrameLoad = session.mainFrameLoad;
+            if (mainFrameLoad?.pending) {
+                await mainFrameLoad.waitForCommit(Math.max(1, deadline - Date.now()), session.commandSignal);
+                throwIfAborted(session.commandSignal);
+                if (mainFrameLoad.pending)
+                    break;
+                continue;
+            }
             try {
                 const state = await this.evaluateMainDocument(session, '({ url: location.href, readyState: document.readyState, timeOrigin: performance.timeOrigin })');
                 if (acceptsUrl(state) &&
@@ -228,6 +299,9 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
             }
             await delay(50, session.commandSignal);
         }
+        const pending = answeredGetLoad(session.mainFrameLoad?.pending);
+        if (pending)
+            throw new MainFrameNavigationPending(pending);
         throw new Error(`ACTION_TIMEOUT: Browser navigation was not DOM-ready within ${timeoutMs}ms`);
     }
     assertNotChromeErrorPage(page, context) {
@@ -259,6 +333,51 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
                 throw error;
             return undefined;
         }
+    }
+    /**
+     * Watches for a main-frame navigation the page's own handlers start after
+     * an element input (a select whose change handler loads another URL).
+     * Browser events only, so it is safe while the new document is loading.
+     */
+    async watchInputNavigation(session) {
+        const mainFrameId = await this.readMainFrameId(session);
+        if (mainFrameId && session.mainFrameLoad)
+            session.mainFrameLoad.mainFrameId = mainFrameId;
+        return watchMainFrameNavigation(session);
+    }
+    /**
+     * Whether the page left its document after an input: a cross-document
+     * navigation was seen, a main-frame load is pending, or the page generation
+     * moved. The old element can no longer be read back then.
+     */
+    inputNavigated(session, facts, generation) {
+        return ((facts.detected && facts.sameDocument !== true) ||
+            session.mainFrameLoad?.pending !== undefined ||
+            session.generation !== generation);
+    }
+    /**
+     * The result of an element input whose page navigated: the input was
+     * applied and the page moved on, so it is a completed action with the same
+     * navigation facts as a navigating click, not a read-back failure.
+     */
+    navigatedByInputResult(session, action, facts, fields) {
+        this.invalidateObservation(session);
+        const load = facts.committed ? undefined : session.mainFrameLoad?.pending;
+        return {
+            success: true,
+            ...fields,
+            navigation: {
+                detected: true,
+                urlChanged: true,
+                generation: session.generation,
+                ...(facts.url ? { url: facts.url } : {}),
+                ...(load ? pendingLoadFacts(load) : {}),
+            },
+            message: `The ${action} made the page navigate${load ? '; the new page is still loading' : ''}. Refs from earlier snapshots are no longer valid.`,
+            recovery: load
+                ? 'Wait for the new page (wait with a url or load condition) or inspect it in a few seconds before the next interaction.'
+                : 'Inspect or query the new page before the next interaction.',
+        };
     }
     readNavigationHistory(session) {
         return this.sendMainDocumentCommand(session, 'Page.getNavigationHistory');
@@ -293,19 +412,40 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
         const navigationTimeoutMs = explicitNavigationTimeout === undefined
             ? (session.clickNavigationDetectionMs ?? CLICK_NAVIGATION_DETECTION_MS)
             : Math.max(CLICK_NAVIGATION_DETECTION_MS, Math.min(MAX_NAVIGATION_READY_TIMEOUT_MS, Math.floor(asNumber(explicitNavigationTimeout, CLICK_NAVIGATION_DETECTION_MS))));
-        const target = await this.resolveTarget(session, input);
         const coordinateTarget = input.position !== undefined || input.normalized_position !== undefined;
+        const clickCount = Math.max(1, Math.floor(asNumber(input.clickCount ?? input.click_count, 1)));
+        const pointerAction = clickCount > 2 ? 'triple_click' : clickCount > 1 ? 'double_click' : 'click';
+        const resolved = await this.resolveTarget(session, input).catch((error) => error instanceof Error ? error : new Error(String(error)));
+        if (resolved instanceof Error) {
+            // A ref whose element has no box at all (display: none, a collapsed
+            // menu) reads as stale; say what hides it when the element still exists.
+            if (!coordinateTarget && /no longer has a live box/u.test(resolved.message)) {
+                const hidden = await probeBrowserClickTarget(session, input);
+                if (hidden.blocked) {
+                    return targetNotInteractableResult(pointerAction, hidden.blocked, Date.now() - startedAt);
+                }
+            }
+            throw resolved;
+        }
+        // Pre-click hit test: a click whose center would land on another element
+        // (an overlay) or on nothing (a hidden target) is not dispatched.
+        const probe = coordinateTarget
+            ? {}
+            : await probeBrowserClickTarget(session, input);
+        if (probe.blocked) {
+            return targetNotInteractableResult(pointerAction, probe.blocked, Date.now() - startedAt);
+        }
+        // The click lands where the probe hit-tested the target (see aimAtProbe).
+        const target = aimAtProbe(resolved, probe);
         const hitTarget = coordinateTarget
             ? await this.inspectCoordinateHitTarget(session, target.contextX ?? target.x, target.contextY ?? target.y)
             : undefined;
-        const clickCount = Math.max(1, Math.floor(asNumber(input.clickCount ?? input.click_count, 1)));
-        await session.beforePointerAction?.({
-            action: clickCount > 2 ? 'triple_click' : clickCount > 1 ? 'double_click' : 'click',
-            point: { x: target.x, y: target.y },
-        }, session.commandSignal);
+        await session.beforePointerAction?.({ action: pointerAction, point: { x: target.x, y: target.y } }, session.commandSignal);
         const effectProbe = await this.startClickEffectProbe(session, target.contextX ?? target.x, target.contextY ?? target.y);
         const downloadEvent = observeBrowserDownload(session, { signal: session.commandSignal });
         const mainFrameId = await this.readMainFrameId(session);
+        if (mainFrameId && session.mainFrameLoad)
+            session.mainFrameLoad.mainFrameId = mainFrameId;
         const navigationEvent = observeMainDocumentNavigation(session, navigationTimeoutMs, mainFrameId);
         await this.dispatchMouse(session, target.x, target.y, 'mouseMoved');
         const delayMs = Math.max(0, Math.floor(asNumber(input.delay, 50)));
@@ -329,25 +469,35 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
         const navigationEventResult = await navigationEvent;
         await delay(ACTION_SETTLE_DELAY_MS, session.commandSignal);
         const download = await downloadEvent;
+        // The click started a main-frame navigation that has not committed (a
+        // submit whose next page is slow): renderer reads would wait for the
+        // commit, so the page is reported as the previous one with the pending
+        // load instead of being read.
+        const loading = session.mainFrameLoad?.pending;
         // A navigation can replace the execution context before the first
         // post-click summary is available. The navigation event is the source of
         // truth for click-and-wait; keep ordinary click bounded and let its caller
         // perform the full ready-state wait.
-        const after = await this.readPageSummary(session).catch((error) => {
-            if (isBrowserOperationInterruption(error))
-                throw error;
-            return before;
-        });
-        const effect = await this.finishClickEffectProbe(session, effectProbe).catch((error) => {
-            if (isBrowserOperationInterruption(error))
-                throw error;
-            return {
-                observed: false,
-                mutations: 0,
-                focusChanged: false,
-                targetStateChanged: false,
-            };
-        });
+        const after = loading
+            ? before
+            : await this.readPageSummary(session).catch((error) => {
+                if (isBrowserOperationInterruption(error))
+                    throw error;
+                return before;
+            });
+        const unobserved = {
+            observed: false,
+            mutations: 0,
+            focusChanged: false,
+            targetStateChanged: false,
+        };
+        const effect = loading
+            ? unobserved
+            : await this.finishClickEffectProbe(session, effectProbe).catch((error) => {
+                if (isBrowserOperationInterruption(error))
+                    throw error;
+                return unobserved;
+            });
         const navigationDetected = classifyBrowserNavigationEvent(navigationEventResult, session.transport, mainFrameId) ===
             'main' || before.url !== after.url;
         this.invalidateObservation(session);
@@ -367,6 +517,9 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
                         ...(hitTarget ? { hitTarget, rect: hitTarget.rect } : {}),
                     }
                     : {}),
+                // What the clicked control does (link, form submit, in-page), for the
+                // follow-up a caller suggests after a click that showed no navigation.
+                ...(probe.control ? { control: probe.control } : {}),
             },
             effect: {
                 ...effect,
@@ -378,6 +531,7 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
                 detected: navigationDetected,
                 urlChanged: navigationDetected,
                 generation: session.generation,
+                ...(loading ? pendingLoadFacts(loading) : {}),
             },
         };
         if (download) {
@@ -409,6 +563,12 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
             result.message =
                 'The click navigated the page. Refs from earlier snapshots are no longer valid.';
             result.recovery = 'Inspect or query the new page before the next interaction.';
+        }
+        if (loading && !navigationDetected && result.code !== 'DOWNLOAD_CANCELED') {
+            const status = loading.httpStatus ?? loading.redirectStatus;
+            result.message = `The click started a ${loading.requestMethod ?? 'page'} navigation that is still loading; the page shown is still the previous one.${status === undefined ? '' : ` The server already answered the request with HTTP ${status}.`}`;
+            result.recovery =
+                'Do not click or submit again. Wait for the new page (wait with a url condition) or inspect again in a few seconds; check the result on the site before any retry.';
         }
         return result;
     }
@@ -493,15 +653,15 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
     async type(session, input) {
         const startedAt = Date.now();
         const beforeGeneration = session.generation;
-        const target = await this.resolveTarget(session, input, true, false);
+        const target = await this.resolveTarget(session, input, true, false, true);
         const text = asString(input.text);
         const delayMs = Math.max(0, Math.floor(asNumber(input.delay, 0)));
         const unexpectedNavigation = (dispatched) => ({
             success: false,
             code: 'UNEXPECTED_NAVIGATION',
             error: 'Typing changed the active Browser page unexpectedly.',
-            retryable: true,
-            recovery: 'Inspect the current page before deciding whether to retry.',
+            // Retryable only before any input was sent (Browser Core rechecks the request method).
+            ...unexpectedNavigationRetry('type', { dispatched }),
             durationMs: Date.now() - startedAt,
             target: { resolved: true, rect: target.rect },
             effect: {
@@ -701,7 +861,21 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
             }
         }
         else {
-            await cdp(session, 'DOM.focus', { backendNodeId: target.backendNodeId });
+            try {
+                await cdp(session, 'DOM.focus', { backendNodeId: target.backendNodeId });
+            }
+            catch (error) {
+                if (isBrowserOperationInterruption(error))
+                    throw error;
+                if (!/element is not focusable/iu.test(error instanceof Error ? error.message : '')) {
+                    throw error;
+                }
+                // Nothing was typed. The hit test says whether an inert or collapsed
+                // group holds the field (open it first), the field is disabled, or the
+                // target is no field.
+                const probe = await probeBrowserClickTarget(session, input, { nativeDisabled: true });
+                return targetNotFocusableResult(input.clear === true ? 'fill' : 'type', probe.blocked, Date.now() - startedAt);
+            }
         }
         if (session.generation !== beforeGeneration)
             return unexpectedNavigation(inputDispatched);
@@ -746,6 +920,32 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
             if (session.generation !== beforeGeneration)
                 return unexpectedNavigation(inputDispatched);
         }
+        // The text went out: a read-back that fails for another reason than a
+        // timeout or a page change is no failed write the model may simply
+        // repeat (type would append the text a second time).
+        const readBackFailed = (error) => {
+            if (!inputDispatched)
+                throw error;
+            this.invalidateObservation(session);
+            const reason = `The text was sent, but the field could not be read back: ${error instanceof Error ? error.message : String(error)}`;
+            return {
+                success: false,
+                code: 'ACTION_VERIFICATION_UNAVAILABLE',
+                error: reason,
+                message: reason,
+                retryable: false,
+                recovery: uncertainWriteNext(input.clear === true ? 'fill' : 'type'),
+                durationMs: Date.now() - startedAt,
+                target: targetMetadata,
+                effect: {
+                    dispatched: true,
+                    verified: false,
+                    verificationRequired: true,
+                    expectedTextLength: text.length,
+                },
+                navigation: { detected: false, generation: session.generation },
+            };
+        };
         await delay(ACTION_SETTLE_DELAY_MS, session.commandSignal);
         const clear = input.clear === true;
         const samples = [];
@@ -766,7 +966,7 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
                 throw error;
             if (session.generation !== beforeGeneration)
                 return unexpectedNavigation(inputDispatched);
-            throw error;
+            return readBackFailed(error);
         }
         if (session.generation !== beforeGeneration)
             return unexpectedNavigation(inputDispatched);
@@ -785,13 +985,22 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
             : text.length === 0 || (changed && after.containsExpected === true);
         let focused = 'focused' in after ? after.focused === true : false;
         if (target.virtualEditor === true) {
-            const focusedState = await session.cdpHelper.inspectFocusedEditableStateByBackendNodeId(target.backendNodeId, inspectionOptions);
-            if (session.generation !== beforeGeneration)
-                return unexpectedNavigation(inputDispatched);
-            focused =
-                focusedState.editable === true &&
-                    focusedState.focused === true &&
-                    focusedState.withinTarget === true;
+            try {
+                const focusedState = await session.cdpHelper.inspectFocusedEditableStateByBackendNodeId(target.backendNodeId, inspectionOptions);
+                if (session.generation !== beforeGeneration)
+                    return unexpectedNavigation(inputDispatched);
+                focused =
+                    focusedState.editable === true &&
+                        focusedState.focused === true &&
+                        focusedState.withinTarget === true;
+            }
+            catch (error) {
+                if (isBrowserOperationInterruption(error))
+                    throw error;
+                if (session.generation !== beforeGeneration)
+                    return unexpectedNavigation(inputDispatched);
+                return readBackFailed(error);
+            }
         }
         const verified = target.virtualEditor === true && !focused
             ? false
@@ -809,6 +1018,11 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
                 ...(session.commandSessionId ? { commandSessionId: session.commandSessionId } : {}),
             };
         }
+        // Typed text that did not verify but changed the field (a mask, an
+        // upper-casing handler, an editor that dropped focus after taking the
+        // text) is in the field: typing it again appends it twice. The write
+        // record reads this fact; a fill replaces the whole value instead.
+        const appended = !verified && !clear && changed;
         const result = {
             success: verified,
             durationMs: Date.now() - startedAt,
@@ -823,6 +1037,7 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
                 textChanged: changed,
                 ...(clear ? { matchesExpected } : {}),
                 ...(!clear ? { containsExpected } : {}),
+                ...(appended ? { appended: true } : {}),
             },
             navigation: { detected: false, generation: session.generation },
         };
@@ -851,11 +1066,35 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
             result.code = code;
             result.error = error;
             result.message = error;
-            result.retryable = true;
-            result.recovery =
-                code === 'INPUT_FOCUS_REJECTED'
+            result.retryable = !appended;
+            // Text already in the field outranks the other advice: typing again appends it twice.
+            result.recovery = appended
+                ? 'The field changed; read it, then replace its whole value with fill.'
+                : code === 'INPUT_FOCUS_REJECTED'
                     ? 'Inspect the page again and choose the current visible editor ref.'
                     : 'Inspect the page and retry with the current editable ref.';
+        }
+        // The field never held focus: say which field takes input there instead,
+        // so the retry goes to that field rather than to this ref again.
+        if (!verified && target.virtualEditor !== true && !focused) {
+            const diagnosis = await diagnoseUnfocusedInput(session, backendNodeId, target.coordinateSpace === 'unavailable'
+                ? undefined
+                : { x: target.contextX ?? target.x, y: target.contextY ?? target.y });
+            if (diagnosis) {
+                result.inputTarget = diagnosis;
+                if (appended) {
+                    // The target itself changed: replacing it with fill stays the advice.
+                    result.recovery = `${String(result.recovery)} ${describeInputDiagnosis(diagnosis)}`;
+                }
+                else {
+                    if (!clear && diagnosis.focusMovedTo) {
+                        // Typed text went to the field focus moved to: typing again appends it there.
+                        result.effect.inputElsewhere = true;
+                        result.retryable = false;
+                    }
+                    result.recovery = unfocusedInputRecovery(diagnosis, clear ? 'fill' : 'type');
+                }
+            }
         }
         return result;
     }
@@ -1046,16 +1285,7 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
                 functionDeclaration: `function () {
           let active = this.ownerDocument?.activeElement || null;
           while (active?.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
-          const tag = String(active?.tagName || '').toLowerCase();
-          const role = String(active?.getAttribute?.('role') || '').toLowerCase();
-          const inputType = active instanceof HTMLInputElement
-            ? String(active.type || '').toLowerCase()
-            : '';
-          const editableInput = active instanceof HTMLInputElement && ![
-            'button', 'checkbox', 'file', 'hidden', 'image', 'radio', 'reset', 'submit'
-          ].includes(inputType);
-          const editable = editableInput || active instanceof HTMLTextAreaElement ||
-            active?.isContentEditable === true || role === 'textbox' || role === 'searchbox';
+          const editable = (${EDITABLE_FIELD_SOURCE})(active);
           let withinTarget = false;
           let cursor = active;
           while (cursor) {
@@ -1101,15 +1331,27 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
             session.commandSessionId = target.commandSessionId;
             await cdp(session, 'DOM.focus', { backendNodeId: target.backendNodeId });
         }
-        await this.dispatchKey(session, asString(input.key), stringArray(input.modifiers));
-        await delay(ACTION_SETTLE_DELAY_MS, session.commandSignal);
-        this.invalidateObservation(session);
-        return {
-            success: true,
-            durationMs: Date.now() - startedAt,
-            ...(target ? { target: { resolved: true, rect: target.rect } } : {}),
-            effect: { dispatched: true },
-        };
+        const generation = session.generation;
+        const watch = await this.watchInputNavigation(session);
+        try {
+            await this.dispatchKey(session, asString(input.key), stringArray(input.modifiers));
+            await delay(ACTION_SETTLE_DELAY_MS, session.commandSignal);
+            const fields = {
+                durationMs: Date.now() - startedAt,
+                ...(target ? { target: { resolved: true, rect: target.rect } } : {}),
+                effect: { dispatched: true },
+            };
+            // Enter in a search box or form submits it: say the page navigated.
+            const facts = await watch.settle();
+            if (this.inputNavigated(session, facts, generation)) {
+                return this.navigatedByInputResult(session, 'press_key', facts, fields);
+            }
+            this.invalidateObservation(session);
+            return { success: true, ...fields };
+        }
+        finally {
+            watch.dispose();
+        }
     }
     async inspectScrollSnapshot(session, point, axis) {
         const command = { point, axis };
@@ -1190,7 +1432,13 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
         const deltaX = direction === 'left' ? -distance : direction === 'right' ? distance : 0;
         const deltaY = direction === 'up' ? -distance : direction === 'down' ? distance : 0;
         const hasExplicitTarget = ['ref', 'selector', 'position', 'normalized_position'].some((key) => Object.prototype.hasOwnProperty.call(input, key));
-        const target = hasExplicitTarget ? await this.resolveTarget(session, input, false) : undefined;
+        // body, html or the scrolling element as the target means the page
+        // itself: their box is the whole document, so its center is usually below
+        // the viewport and a wheel there reported "outside the current viewport".
+        const documentTarget = hasExplicitTarget && (await this.targetsWholeDocument(session, input));
+        const target = hasExplicitTarget && !documentTarget
+            ? await this.resolveTarget(session, input, false)
+            : undefined;
         if (target &&
             (!Number.isFinite(target.x) ||
                 !Number.isFinite(target.y) ||
@@ -1302,6 +1550,24 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
             effect,
         };
     }
+    /** Whether a scroll target names body, html or the document scrolling element. */
+    async targetsWholeDocument(session, input) {
+        const ref = asString(input.ref);
+        if (ref) {
+            const element = resolveBrowserSnapshotElement(session, ref)?.element;
+            return (element !== undefined &&
+                (!element.frameId || element.frameId === 'main') &&
+                /^(?:body|html)$/iu.test(element.tag));
+        }
+        const selector = asString(input.selector);
+        if (!selector)
+            return false;
+        return ((await evaluate(session, `(() => { try { const element = document.querySelector(${JSON.stringify(selector)}); return element !== null && (element === document.body || element === document.documentElement || element === document.scrollingElement); } catch { return false; } })()`).catch((error) => {
+            if (isBrowserOperationInterruption(error))
+                throw error;
+            return false;
+        })) === true);
+    }
     async waitFor(session, input) {
         const kind = asString(input.kind);
         const timeoutMs = Math.max(0, Math.floor(asNumber(input.timeout, DEFAULT_WAIT_TIMEOUT_MS)));
@@ -1309,6 +1575,8 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
             await delay(timeoutMs, session.commandSignal);
             return { success: true, kind: 'timeout', waitedMs: timeoutMs };
         }
+        if (kind === 'network')
+            return this.waitForNetwork(session, input, timeoutMs);
         const selector = asString(input.selector);
         const text = asString(input.text);
         const url = asString(input.url);
@@ -1323,26 +1591,125 @@ export class BrowserActionSupport extends BrowserActionTargetSupport {
         if (!selector && !text && !url && !load)
             throw new Error('WAIT_REQUIRES_CONDITION');
         const deadline = Date.now() + timeoutMs;
+        let poll = { met: false };
         while (Date.now() <= deadline) {
-            const matches = await evaluate(session, waitExpression(input));
-            if (matches)
+            // A transport that answers the expression with a bare boolean (or
+            // nothing) still decides the poll; only the counts are then missing.
+            const value = await evaluate(session, waitExpression(input));
+            poll = isRecord(value) ? value : { met: value === true };
+            if (poll.met)
                 return { success: true, waitedMs: timeoutMs - Math.max(0, deadline - Date.now()) };
             await delay(50, session.commandSignal);
         }
-        return { success: false, code: 'ACTION_TIMEOUT', error: 'Browser wait condition timed out.' };
+        const recovery = selector
+            ? waitSelectorTimeoutRecovery(selector, asString(input.state, 'visible'), poll)
+            : undefined;
+        return {
+            success: false,
+            code: 'ACTION_TIMEOUT',
+            error: 'Browser wait condition timed out.',
+            ...(poll.matched !== undefined ? { matched: poll.matched } : {}),
+            ...(poll.visible !== undefined ? { visible: poll.visible } : {}),
+            ...(recovery ? { recovery } : {}),
+        };
+    }
+    /**
+     * kind "network" (a SPA page was read before its data request
+     * finished): waits until a request whose sanitized URL contains `filter` has
+     * finished, optionally narrowed by status, resource type and an
+     * `afterSequence` checkpoint. A matching request that already finished when
+     * the wait starts satisfies it at once, so a wait right after navigate does
+     * not miss a fast response.
+     */
+    async waitForNetwork(session, input, timeoutMs) {
+        const filter = asString(input.filter);
+        if (!filter)
+            throw new Error('WAIT_REQUIRES_FILTER');
+        const cdpHelper = session.cdpHelper;
+        const ready = await cdpHelper.ensureNetworkDiagnosticsReady(session.commandSignal);
+        if (!ready || !cdpHelper.isNetworkDiagnosticsAvailable()) {
+            return {
+                success: false,
+                code: 'NETWORK_DIAGNOSTICS_UNAVAILABLE',
+                error: 'Network diagnostics are unavailable for the current Browser tab.',
+                recovery: 'Keep the current Browser tab open and retry once it finishes initializing.',
+            };
+        }
+        const requestedStatus = stringArray(input.status).filter((status) => status !== 'pending');
+        const query = {
+            filter,
+            ...(input.resourceTypes !== undefined
+                ? { resourceTypes: stringArray(input.resourceTypes) }
+                : {}),
+            ...(input.afterSequence !== undefined
+                ? { afterSequence: Math.max(0, Math.floor(asNumber(input.afterSequence))) }
+                : {}),
+            limit: 200,
+        };
+        const status = requestedStatus.length > 0 ? requestedStatus : FINISHED_NETWORK_STATUS;
+        const startedAt = Date.now();
+        const deadline = startedAt + timeoutMs;
+        for (;;) {
+            const page = cdpHelper.getNetworkDiagnostics({ ...query, status });
+            // A status class can match a request whose body is still loading; take
+            // the newest finished one.
+            const entry = [...page.entries]
+                .reverse()
+                .find((candidate) => candidate.outcome !== 'pending');
+            if (entry) {
+                return {
+                    success: true,
+                    kind: 'network',
+                    waitedMs: Date.now() - startedAt,
+                    entry,
+                    lastSequence: page.lastSequence,
+                };
+            }
+            if (Date.now() >= deadline) {
+                const pending = cdpHelper.getNetworkDiagnostics({ ...query, status: ['pending'] });
+                return {
+                    success: false,
+                    code: 'ACTION_TIMEOUT',
+                    kind: 'network',
+                    error: `No finished request whose URL contains "${filter}" was observed within ${timeoutMs} ms.`,
+                    pendingMatches: pending.totalEntries,
+                    lastSequence: page.lastSequence,
+                    recovery: pending.totalEntries > 0
+                        ? 'A matching request is still loading; wait again with a longer timeout.'
+                        : 'No matching request was sent. Check the filter with query kind "network" without filter, or repeat the page action that sends the request and wait with afterSequence set to this lastSequence.',
+                };
+            }
+            await delay(Math.min(100, deadline - Date.now()), session.commandSignal);
+        }
     }
     async screenshot(session, input) {
+        const startedAt = Date.now();
         if (session.captureScreenshot) {
             if (!session.commandSignal || session.commandTimeoutMs === undefined) {
                 throw new Error('SCREENSHOT_CAPTURE_CONTEXT_UNAVAILABLE');
             }
-            return session.captureScreenshot(input, {
+            const captured = await session.captureScreenshot(input, {
                 signal: session.commandSignal,
                 timeoutMs: session.commandTimeoutMs,
             });
+            return withScreenshotCaptureTiming(captured, Date.now() - startedAt);
         }
-        return captureBrowserScreenshot(session, input, () => this.readPageSummary(session));
+        const captured = await captureBrowserScreenshot(session, input, () => this.readPageSummary(session));
+        return withScreenshotCaptureTiming(captured, Date.now() - startedAt);
     }
+}
+/**
+ * Provider-side screenshot timing, read by the runtime's post-action visual
+ * metrics and removed by the Browser tool before any model-visible result.
+ * A provider seam that already split capture from encoding keeps its split;
+ * otherwise the whole provider capture (CDP encodes inside Chrome) is capture.
+ */
+function withScreenshotCaptureTiming(result, elapsedMs) {
+    if (!isRecord(result) || result.success === false)
+        return result;
+    if (isRecord(result.captureTiming))
+        return result;
+    return { ...result, captureTiming: { captureMs: Math.max(0, elapsedMs) } };
 }
 function isSupportedBrowserUrl(url) {
     return /^(?:https?|file|data|about):/iu.test(url.trim());

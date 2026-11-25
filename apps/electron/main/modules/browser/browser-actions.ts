@@ -1598,37 +1598,44 @@ export class BrowserActions {
             }
             const state = params.state || 'visible';
             const selectorJson = JSON.stringify(params.selector);
+            // Every match counts, as in Browser Core's wait: the first match being a
+            // hidden input or template row must not hide a visible one.
+            let last = { matched: 0, visible: 0 };
             try {
                 await this.poll(async () => {
-                    const result = await wc.executeJavaScript(`
+                    last = await wc.executeJavaScript(`
               (function() {
-                const selector = ${selectorJson};
-                const el = document.querySelector(selector);
-                if (!el) return { exists: false, visible: false };
-                const style = window.getComputedStyle(el);
-                const visible = style.display !== 'none' &&
-                               style.visibility !== 'hidden' &&
-                               style.opacity !== '0';
-                return { exists: true, visible };
+                const elements = Array.from(document.querySelectorAll(${selectorJson}));
+                const visible = elements.filter((el) => {
+                  const style = window.getComputedStyle(el);
+                  return style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    style.opacity !== '0';
+                }).length;
+                return { matched: elements.length, visible };
               })();
             `);
                     switch (state) {
-                        case 'attached':
-                            return result.exists;
                         case 'detached':
-                            return !result.exists;
+                            return last.matched === 0;
                         case 'visible':
-                            return result.exists && result.visible;
+                            return last.visible > 0;
                         case 'hidden':
-                            return !result.exists || !result.visible;
+                            return last.visible === 0;
                         default:
-                            return result.exists;
+                            return last.matched > 0;
                     }
                 }, timeout, 100);
                 return { success: true, duration: Date.now() - startTime };
             }
             catch (error) {
-                return { success: false, error: String(error), duration: Date.now() - startTime };
+                return {
+                    success: false,
+                    error: String(error),
+                    matched: last.matched,
+                    visible: last.visible,
+                    duration: Date.now() - startTime,
+                };
             }
         }
         else if (params.text) {

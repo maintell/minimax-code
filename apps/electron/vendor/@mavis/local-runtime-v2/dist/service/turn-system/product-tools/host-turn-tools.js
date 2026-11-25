@@ -53,6 +53,11 @@ export async function buildLocalTurnToolSourcesForHost(input) {
             ? { mavisCronAdapter: input.mavisCronAdapter }
             : {}),
         mavisSessionAdapter: input.mavisSessionAdapter,
+        sidebarToolsAdapter: input.sidebarToolsAdapter,
+        sidebarManageAdapter: input.sidebarManageAdapter,
+        sessionManageAdapter: input.sessionManageAdapter,
+        appManageAdapter: input.appManageAdapter,
+        uiRequestAdapter: input.uiRequestAdapter,
         ...optionalToolCapabilities(input),
     });
     observeToolCatalog(input, sources);
@@ -109,6 +114,7 @@ function optionalToolCapabilities(input) {
             : {}),
         ...(input.resumeCodexAvailable === true ? { resumeCodexAvailable: true } : {}),
         ...(input.codeReviewAdapter ? { codeReviewAdapter: input.codeReviewAdapter } : {}),
+        ...(input.coordination ? { coordination: input.coordination } : {}),
     };
 }
 function observeToolCatalog(input, sources) {

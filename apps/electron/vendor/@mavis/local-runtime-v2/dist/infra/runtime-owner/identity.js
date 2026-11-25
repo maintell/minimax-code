@@ -1,11 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { statSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
+import { uptime } from 'node:os';
 import { join } from 'node:path';
 import lockfile from 'proper-lockfile';
+import { settleInBackground } from '../async/settle.js';
 import { readProcessStartToken } from './process-start-time.js';
-import { serializeRuntimeOwnerLease } from './runtime-owner-lease.js';
+import { parseRuntimeOwnerLease, serializeRuntimeOwnerLease } from './runtime-owner-lease.js';
 const DEFAULT_RUNTIME_OWNER_STALE_MS = 10_000;
+// Uptime has whole-second resolution and the wall clock may be stepped after boot, so only a
+// heartbeat clearly older than this boot proves that its owner belonged to a previous boot.
+const BOOT_TIME_TOLERANCE_MS = 5_000;
 const OWNER_DIRECTORY = join('v2', 'runtime-owner-leases');
 const OWNER_KINDS = new Set([
     'turn-lease',
@@ -34,6 +39,11 @@ function createRuntimeOwnerLiveness(options) {
             return false;
         // A delayed heartbeat is not proof that this exact foreign owner died.
         // Its process must close the lease or exit before another Runtime may recover its work.
+        // A stale lease left behind by a reboot or a hard kill may name a PID that another
+        // process has since reused; that is proof of exit, not of a delayed heartbeat.
+        if (leaseState === 'stale' && staleOwnerExited(options, parsed.instanceId, parsed.pid)) {
+            return false;
+        }
         return true;
     };
 }
@@ -48,7 +58,9 @@ export async function createRuntimeOwnerIdentity(options) {
     // process that reuses its PID. It is best-effort by design: `readProcessStartToken`
     // degrades to `undefined` instead of throwing, and a lease without a token is read back
     // as the historical PID-only lease rather than blocking the Runtime from starting.
-    const { token: startToken } = await readProcessStartToken(pid);
+    const readStartToken = options.readProcessStartToken ?? readProcessStartToken;
+    const bootTimeMs = options.bootTimeMs ?? (() => Date.now() - uptime() * 1_000);
+    const { token: startToken } = await readStartToken(pid);
     await writeFile(targetPath, serializeRuntimeOwnerLease({ pid, startToken }), {
         flag: 'wx',
         mode: 0o600,
@@ -100,6 +112,8 @@ export async function createRuntimeOwnerIdentity(options) {
                 return 'stale';
             }
         },
+        isOwnerFromPreviousBoot: (candidate) => heartbeatPredatesBoot(ownerLeasePath(ownerDirectory, candidate), bootTimeMs()),
+        isOwnerProcessReplaced: createReplacedOwnerProbe(ownerDirectory, readStartToken),
     });
     let closePromise;
     function markCompromised(error) {
@@ -166,6 +180,73 @@ export function createProcessLocalRuntimeOwnerIdentity(options = {}) {
             void closed;
         },
     };
+}
+function staleOwnerExited(options, instanceId, pid) {
+    // The boot check is synchronous and works without a start-time probe (Windows, legacy
+    // leases), so it decides the reboot case on the first observation.
+    if (options.isOwnerFromPreviousBoot?.(instanceId))
+        return true;
+    return options.isOwnerProcessReplaced?.(instanceId, pid) === true;
+}
+/**
+ * Reads the lock heartbeat, which proper-lockfile refreshes while the owner lives. A missing
+ * lock directory proves nothing here, so it never reports a previous boot.
+ */
+function heartbeatPredatesBoot(leasePath, bootAtMs) {
+    let heartbeatMs;
+    try {
+        heartbeatMs = statSync(`${leasePath}.lock`).mtimeMs;
+    }
+    catch {
+        return false;
+    }
+    return heartbeatMs < bootAtMs - BOOT_TIME_TOLERANCE_MS;
+}
+/**
+ * Compares a stale lease's recorded start token with the process that now holds its PID.
+ *
+ * `isOwnerAlive` runs inside synchronous DB transactions while the macOS probe spawns `ps`,
+ * so the probe runs in the background and only a proven replacement is remembered; until then
+ * the owner keeps the PID-only answer and the caller's recovery retry observes the verdict.
+ * A legacy lease or an unavailable probe never proves replacement, matching the generation
+ * fence's degrade rules.
+ */
+function createReplacedOwnerProbe(ownerDirectory, readStartToken) {
+    const replaced = new Set();
+    const probing = new Set();
+    return (instanceId, pid) => {
+        const key = `${instanceId}:${String(pid)}`;
+        if (replaced.has(key))
+            return true;
+        if (probing.has(key))
+            return false;
+        const recorded = readRecordedStartToken(ownerLeasePath(ownerDirectory, instanceId), pid);
+        if (recorded === undefined)
+            return false;
+        probing.add(key);
+        settleInBackground((async () => {
+            try {
+                const probe = await readStartToken(pid);
+                if (probe.token !== undefined && probe.token !== recorded)
+                    replaced.add(key);
+            }
+            finally {
+                probing.delete(key);
+            }
+        })());
+        return false;
+    };
+}
+function readRecordedStartToken(leasePath, pid) {
+    let text;
+    try {
+        text = readFileSync(leasePath, 'utf8');
+    }
+    catch {
+        return undefined;
+    }
+    const lease = parseRuntimeOwnerLease(text);
+    return lease.format === 'structured' && lease.pid === pid ? lease.startToken : undefined;
 }
 function assertOwnerIdentityActive(closed, compromise) {
     if (compromise)

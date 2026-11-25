@@ -261,7 +261,11 @@ export class McpConnectionPool {
                 // turn stops waiting on the remote MCP server instantly instead of
                 // ticking down the pool timeout. `timeout` is still honoured as a
                 // belt-and-suspenders bound.
-                const result = await withTimeout(conn.client.callTool({ name: toolName, arguments: args }, undefined, {
+                const result = await withTimeout(conn.client.callTool({
+                    name: toolName,
+                    arguments: args,
+                    ...(options?.meta ? { _meta: options.meta } : {}),
+                }, undefined, {
                     timeout: timeoutMs,
                     ...(options?.signal ? { signal: options.signal } : {}),
                 }), timeoutMs, `MCP tool call "${toolName}" on "${serverName}" timed out after ${timeoutMs}ms`);

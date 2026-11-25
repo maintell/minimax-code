@@ -1,5 +1,5 @@
 {
   "schema": "mavis.pptx_wasm_runtime_selector.v1",
-  "runtimeHash": "sha256:ed87f358b1a3d5f7ba1f24301367ade1be1b98d20d32b5d9367826016bfb7175",
-  "workerPath": "/_mavis/pptx-core/ed87f358b1a3d5f7ba1f24301367ade1be1b98d20d32b5d9367826016bfb7175/worker.js"
+  "runtimeHash": "sha256:dcaa6187c853c8862a8188e29f689e8ae2ab546ed4b151829a0fd9151a060c90",
+  "workerPath": "/_mavis/pptx-core/dcaa6187c853c8862a8188e29f689e8ae2ab546ed4b151829a0fd9151a060c90/worker.js"
 }

@@ -228,6 +228,7 @@ export function setupLoginMenu() {
                 { role: 'cut', label: isEn ? 'Cut' : '剪切' },
                 { role: 'copy', label: isEn ? 'Copy' : '复制' },
                 { role: 'paste', label: isEn ? 'Paste' : '粘贴' },
+                { role: 'pasteAndMatchStyle', label: isEn ? 'Paste as Plain Text' : '粘贴为文字' },
                 { role: 'selectAll', label: isEn ? 'Select All' : '全选' },
             ],
         },
@@ -310,6 +311,7 @@ export function setupArchonMenu() {
                 { role: 'cut', label: isEn ? 'Cut' : '剪切' },
                 { role: 'copy', label: isEn ? 'Copy' : '复制' },
                 { role: 'paste', label: isEn ? 'Paste' : '粘贴' },
+                { role: 'pasteAndMatchStyle', label: isEn ? 'Paste as Plain Text' : '粘贴为文字' },
                 { role: 'delete', label: isEn ? 'Delete' : '删除' },
                 { role: 'selectAll', label: isEn ? 'Select All' : '全选' },
                 // Windows: Settings shortcut (macOS has it in the app menu)

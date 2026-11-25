@@ -1,0 +1,110 @@
+{
+  "observed": {
+    "turn": [
+      {
+        "event": null,
+        "data": {
+          "type": 10
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "type": 2,
+          "agent_message": {
+            "msg_id": "<msg-1>",
+            "role": "user",
+            "msg_content": "Say hello.",
+            "msg_type": 1,
+            "timestamp": 0,
+            "query_key": "turn:turn-review-unavailable",
+            "turnId": "turn-review-unavailable",
+            "source": "api"
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "type": "query_collapse_view",
+          "query_collapse_view": {
+            "query_key": "turn:turn-review-unavailable",
+            "current_turn_id": "turn-review-unavailable",
+            "force_expanded": false,
+            "processing_started_at_ms": 0
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "schema": "archon.runtime.event.v1",
+          "event_id": "evt_turn-review-unavailable_coding_running_status_1",
+          "session_id": "<session>",
+          "turn_id": "turn-review-unavailable",
+          "type": 3,
+          "payload": {
+            "status": 1
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "type": "messages-rewound",
+          "data": {
+            "messageIds": [
+              "<msg-1>"
+            ],
+            "variant": "network"
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "type": "query_collapse_view",
+          "query_collapse_view": {
+            "query_key": "turn:turn-review-unavailable",
+            "current_turn_id": "turn-review-unavailable",
+            "force_expanded": true,
+            "processing_started_at_ms": 0
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "type": "query_collapse_view",
+          "query_collapse_view": {
+            "query_key": "turn:turn-review-unavailable",
+            "current_turn_id": "turn-review-unavailable",
+            "force_expanded": true,
+            "processing_started_at_ms": 0,
+            "processing_finished_at_ms": 0
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": {
+          "type": "session_status",
+          "session_status": {
+            "type": "finished"
+          }
+        }
+      },
+      {
+        "event": null,
+        "data": "[DONE]"
+      }
+    ]
+  },
+  "history": [],
+  "display": {
+    "messages": [],
+    "hasMore": false,
+    "queryCollapseViews": []
+  },
+  "requests": []
+}

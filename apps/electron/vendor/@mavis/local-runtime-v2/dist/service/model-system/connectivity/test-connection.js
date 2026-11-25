@@ -4,11 +4,14 @@
 // `provider_error` / `invalid_response`. Structured upstream failures retain
 // their reason after removing configured secrets and common credential shapes.
 import { getSimpleGoogleThinkingConfig, } from '@earendil-works/pi-ai/google';
+import { logger } from '@mavis/shared/local-runtime-logging';
+import { describeFetchFailure } from './fetch-failure.js';
 import { buildProviderHeaders, providerCompletionUrl } from './provider-request.js';
 import { resolveMiniMaxM3ThinkingProtocol, resolveModelThinkingProtocol, } from '../resolution/model-ref.js';
 import { byokEffectiveOutputLimit } from '../resolution/model-resolver-byok.js';
-const DEFAULT_TIMEOUT_MS = 10_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_UPSTREAM_ERROR_CHARS = 1_200;
+const MAX_GEMINI_PROBE_STREAM_CHARS = 256 * 1_024;
 export class ModelConnectionTester {
     fetchImpl;
     timeoutMs;
@@ -65,6 +68,7 @@ export class ModelConnectionTester {
                     errorMessage: `Request timed out after ${this.timeoutMs}ms`,
                 };
             }
+            logger.warn({ event: 'model_provider_request_failed', op: 'test', ...describeFetchFailure(err, url) }, 'Model provider request failed');
             return { ok: false, errorCode: 'network', errorMessage: 'Network error' };
         }
         finally {
@@ -259,7 +263,7 @@ function geminiProbeThinkingConfig(target) {
         provider: 'byok-probe',
         baseUrl: target.baseUrl,
         reasoning: true,
-        ...(enabled ? { thinkingLevelMap: thinking.thinkingLevelMap } : {}),
+        thinkingLevelMap: thinking.thinkingLevelMap,
         input: ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 0,
@@ -269,6 +273,9 @@ function geminiProbeThinkingConfig(target) {
     return getSimpleGoogleThinkingConfig(model, reasoning);
 }
 async function validateSuccessResponse(response, api, target) {
+    if (api === 'google-generative-ai') {
+        return validateGeminiStreamResponse(response, target);
+    }
     const payload = await readJsonBody(response);
     const providerError = extractExplicitProviderErrorReason(readRecord(payload));
     if (providerError) {
@@ -281,11 +288,124 @@ async function validateSuccessResponse(response, api, target) {
     if (SUCCESS_RESPONSE_SHAPES[api](payload)) {
         return { ok: true };
     }
+    return invalidProviderResponse();
+}
+function invalidProviderResponse() {
     return {
         ok: false,
         errorCode: 'invalid_response',
         errorMessage: 'Invalid response from model provider',
     };
+}
+function inspectGeminiProbePayload(payload, target) {
+    const items = Array.isArray(payload) ? payload : [payload];
+    for (const item of items) {
+        const providerError = extractExplicitProviderErrorReason(readRecord(item));
+        if (providerError) {
+            return {
+                ok: false,
+                errorCode: 'provider_error',
+                errorMessage: redactConnectionTestError(providerError, target) ?? 'Model provider error',
+            };
+        }
+        if (isGeminiGenerateContentResponse(item)) {
+            return { ok: true };
+        }
+    }
+    return undefined;
+}
+function inspectGeminiSseBlock(block, target) {
+    const dataLines = [];
+    for (const line of block.split(/\r?\n/u)) {
+        if (line.startsWith('data:')) {
+            dataLines.push(line.slice('data:'.length).trimStart());
+        }
+    }
+    if (dataLines.length === 0)
+        return { sawDataLine: false };
+    const joined = dataLines.join('\n').trim();
+    if (!joined || joined === '[DONE]')
+        return { sawDataLine: true };
+    try {
+        return {
+            sawDataLine: true,
+            verdict: inspectGeminiProbePayload(JSON.parse(joined), target),
+        };
+    }
+    catch {
+        return { sawDataLine: true };
+    }
+}
+async function cancelStreamReaderQuietly(reader) {
+    try {
+        await reader.cancel();
+    }
+    catch {
+        // Closing an already-settled or aborted stream is harmless.
+    }
+}
+function consumeGeminiProbeChunk(state, chunk, target) {
+    state.raw += chunk;
+    state.pendingSse += chunk;
+    const blocks = state.pendingSse.split(/\r?\n\r?\n/u);
+    state.pendingSse = blocks.pop() ?? '';
+    for (const block of blocks) {
+        const { sawDataLine, verdict } = inspectGeminiSseBlock(block, target);
+        if (sawDataLine)
+            state.sawSseDataLine = true;
+        if (verdict)
+            return verdict;
+    }
+    if (state.raw.length > MAX_GEMINI_PROBE_STREAM_CHARS) {
+        return invalidProviderResponse();
+    }
+    return undefined;
+}
+function finalizeGeminiProbeBuffer(state, target) {
+    if (state.pendingSse.trim()) {
+        const { sawDataLine, verdict } = inspectGeminiSseBlock(state.pendingSse, target);
+        if (sawDataLine)
+            state.sawSseDataLine = true;
+        if (verdict)
+            return verdict;
+    }
+    if (!state.sawSseDataLine && state.raw.trim()) {
+        try {
+            return (inspectGeminiProbePayload(JSON.parse(state.raw.trim()), target) ?? invalidProviderResponse());
+        }
+        catch {
+            return invalidProviderResponse();
+        }
+    }
+    return invalidProviderResponse();
+}
+async function readGeminiProbeStream(reader, target) {
+    const decoder = new TextDecoder('utf-8');
+    const state = { raw: '', pendingSse: '', sawSseDataLine: false };
+    for (;;) {
+        const { value, done } = await reader.read();
+        const chunk = value ? decoder.decode(value, { stream: !done }) : decoder.decode();
+        const verdict = chunk ? consumeGeminiProbeChunk(state, chunk, target) : undefined;
+        if (verdict) {
+            await cancelStreamReaderQuietly(reader);
+            return verdict;
+        }
+        if (done)
+            return finalizeGeminiProbeBuffer(state, target);
+    }
+}
+async function validateGeminiStreamResponse(response, target) {
+    if (!response.body)
+        return invalidProviderResponse();
+    const reader = response.body.getReader();
+    try {
+        return await readGeminiProbeStream(reader, target);
+    }
+    catch (err) {
+        if (isAbortError(err))
+            throw err;
+        return invalidProviderResponse();
+    }
 }
 const SUCCESS_RESPONSE_SHAPES = {
     'anthropic-messages': isMessagesResponse,

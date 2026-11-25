@@ -31,6 +31,8 @@ import { checkBashPermission, evaluateBashStatic, splitCommand, parseRmCommand, 
 import { findHeredocBodyRanges } from './bash-split.js';
 import { commandChangesDirectory, evaluatePathCapability, extractBashPathIntents, isRelativeTraversalOperand, READ_PATH_COMMANDS, SEARCH_PATH_COMMANDS, } from './path-capability.js';
 import { pureReadFirstWord } from './bash-fast-allow.js';
+import { powerShellReadsAreAllowed } from './powershell-read-only.js';
+import { powerShellCopyMoveIsAllowed } from './powershell-copy-move.js';
 import { rewritePosixRm, readPosixTrashExecution, withPosixTrashExecution, } from './rm-shell-rewrite.js';
 const ENV_VAR_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 function parseSingleTopLevelCommand(command) {
@@ -745,7 +747,7 @@ export class BashToolPermissionChecker {
         }
         if (decision.behavior === 'ask' &&
             pathIntents.length > 0 &&
-            isSimpleAuthorizedWriteRedirect(command, pathIntents, decision)) {
+            isSimpleAuthorizedWriteRedirect(command, pathIntents, decision, context)) {
             decision = {
                 behavior: 'allow',
                 reason: {
@@ -778,6 +780,10 @@ export class BashToolPermissionChecker {
                 bypassImmune: false,
             };
         }
+        const powerShellAllow = powerShellReadOnlyAllow(decision, command, context, _toolName) ??
+            powerShellCopyMoveAllow(decision, command, context, _toolName);
+        if (powerShellAllow)
+            return powerShellAllow;
         // HARD_BLOCKED matches produce `deny`
         // directly from `checkBashPermission`. The bash-checker propagates the
         // deny verbatim — bypass mode is irrelevant for `deny`. The
@@ -1067,6 +1073,60 @@ function decisionFromUserRule(decision) {
     }
     return false;
 }
+/**
+ * Windows PowerShell counterpart of the knownSafeCommand downgrade: a
+ * heuristic ASK on a provably read-only PowerShell command becomes ALLOW once
+ * every operand passes the read path capability. User rule asks, HARD-flagged
+ * asks and Full mode keep their existing handling.
+ */
+function powerShellReadOnlyAllow(decision, command, context, toolName) {
+    if (decision.behavior !== 'ask')
+        return undefined;
+    if (context.platform !== 'win32' || context.shellFamily !== 'powershell')
+        return undefined;
+    if (context.mode === 'bypassPermissions')
+        return undefined;
+    if (decisionFromUserRule(decision) || decisionContainsHardBlocked(decision))
+        return undefined;
+    if (!powerShellReadsAreAllowed(command, context, toolName))
+        return undefined;
+    return {
+        behavior: 'allow',
+        reason: {
+            type: 'safetyCheck',
+            description: 'Known read-only PowerShell command with allowed read paths.',
+            category: 'knownSafePowerShellCommand',
+        },
+        bypassImmune: false,
+    };
+}
+/**
+ * PowerShell counterpart of the `cp` / `mv` write-target gate: a heuristic
+ * ASK on a static Copy-Item / Move-Item becomes ALLOW once its sources pass
+ * the read (and, for a move, delete) capability and its destination passes
+ * the write capability. Guards match {@link powerShellReadOnlyAllow}.
+ */
+function powerShellCopyMoveAllow(decision, command, context, toolName) {
+    if (decision.behavior !== 'ask')
+        return undefined;
+    if (context.platform !== 'win32' || context.shellFamily !== 'powershell')
+        return undefined;
+    if (context.mode === 'bypassPermissions')
+        return undefined;
+    if (decisionFromUserRule(decision) || decisionContainsHardBlocked(decision))
+        return undefined;
+    if (!powerShellCopyMoveIsAllowed(command, context, toolName))
+        return undefined;
+    return {
+        behavior: 'allow',
+        reason: {
+            type: 'safetyCheck',
+            description: 'PowerShell copy or move with allowed source and destination paths.',
+            category: 'authorizedPowerShellCopyMove',
+        },
+        bypassImmune: false,
+    };
+}
 function isAuthorizedLocalScriptCommand(command, intents) {
     if (!intents.some((intent) => intent.action === 'execute'))
         return false;
@@ -1089,7 +1149,7 @@ function isAuthorizedLocalScriptCommand(command, intents) {
         trimmed.startsWith('zsh ') ||
         trimmed.startsWith('dash '));
 }
-function isSimpleAuthorizedWriteRedirect(command, intents, decision) {
+function isSimpleAuthorizedWriteRedirect(command, intents, decision, shell) {
     // Reached only after the path-capability loop allowed EVERY intent, so the
     // remaining question is purely whether the OLD classifier's ASK was a
     // write-target / sed-i danger that the new resolver already vetted. cp/mv
@@ -1107,7 +1167,9 @@ function isSimpleAuthorizedWriteRedirect(command, intents, decision) {
     // single /tmp/workspace write back to ASK/LLM.
     if (splitCommand(command).length !== 1)
         return false;
-    const firstWord = pureReadFirstWord(command);
+    // Same shell facts as the Step 9 fast allow, so a path-spelled binary
+    // (`/c/tools/cat`) never inherits a read-only name here either.
+    const firstWord = pureReadFirstWord(command, shell);
     if (!firstWord)
         return false;
     // A dynamic operand (`$VAR`, `${VAR}`, `$(…)`, backticks) OR a shell

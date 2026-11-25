@@ -1,3 +1,4 @@
+import { onLocalConfigUpdated } from './infra/config/update.js';
 import { EventBus } from './infra/event-bus/index.js';
 import { startHeapUsageMetrics } from './infra/observability/heap-usage-metrics.js';
 import { createForkWorktreeAdapter } from './infra/git/fork-worktree-adapter.js';
@@ -143,6 +144,7 @@ export async function createBackgroundRuntime(options) {
             eventBus,
             runtimeOwnerIdentity,
             forkWorktree,
+            subscribeConfigChanges: onLocalConfigUpdated,
         },
         reportActiveTurnCount: (count) => powerDemand.setActiveTurnCount(count),
         start,

@@ -2,7 +2,7 @@ import { posix } from "node:path";
 import jszip from "jszip";
 import yauzl from "yauzl";
 import { SaxesParser } from "saxes";
-import { PPTX_PREVIEW_LIMITS_V1 } from "@mavis/shared/document-preview";
+import { PPTX_PREVIEW_LIMITS_V1, isPptxStoredMediaEntryV1 } from "@mavis/shared/document-preview";
 const P = 'http://schemas.openxmlformats.org/presentationml/2006/main';
 const A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
 const R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
@@ -108,6 +108,8 @@ export function validatePptxWriteArchive(bytes) {
                 return;
             }
             let total = 0;
+            let mediaBytes = 0;
+            const largeStoredMedia = new Set();
             const names = new Set();
             const fail = () => {
                 zip.close();
@@ -116,10 +118,20 @@ export function validatePptxWriteArchive(bytes) {
             zip.on('error', fail);
             zip.on('entry', (entry) => {
                 total += entry.uncompressedSize;
+                if (entry.fileName.toLowerCase().startsWith('ppt/media/'))
+                    mediaBytes += entry.uncompressedSize;
+                if (entry.uncompressedSize > PPTX_PREVIEW_LIMITS_V1.maxEntryUncompressedBytes &&
+                    isPptxStoredMediaEntryV1(entry.fileName, entry.compressionMethod) &&
+                    entry.compressedSize === entry.uncompressedSize &&
+                    entry.uncompressedSize <= PPTX_PREVIEW_LIMITS_V1.maxStoredMediaEntryBytes) {
+                    largeStoredMedia.add(entry.fileName);
+                }
                 if (names.has(entry.fileName) ||
                     names.size >= PPTX_PREVIEW_LIMITS_V1.maxEntries ||
                     entry.isEncrypted() ||
-                    entry.uncompressedSize > PPTX_PREVIEW_LIMITS_V1.maxEntryUncompressedBytes ||
+                    (entry.uncompressedSize > PPTX_PREVIEW_LIMITS_V1.maxEntryUncompressedBytes &&
+                        !largeStoredMedia.has(entry.fileName)) ||
+                    mediaBytes > PPTX_PREVIEW_LIMITS_V1.maxMediaBytes ||
                     total > PPTX_PREVIEW_LIMITS_V1.maxTotalUncompressedBytes ||
                     entry.fileName.startsWith('_xmlsignatures/')) {
                     fail();
@@ -130,11 +142,22 @@ export function validatePptxWriteArchive(bytes) {
             });
             zip.on('end', () => {
                 zip.close();
-                resolve();
+                resolve(largeStoredMedia);
             });
             zip.readEntry();
         });
     });
+}
+export async function loadPptxWriteArchive(bytes, checkCRC32 = false) {
+    const stored = await validatePptxWriteArchive(bytes);
+    const zip = await jszip.loadAsync(bytes, { checkCRC32 });
+    for (const path of stored) {
+        const entry = zip.file(path);
+        if (!entry)
+            throw invalid();
+        entry.options.compression = 'STORE';
+    }
+    return zip;
 }
 function bodyXml(text, p, a, retained = '') {
     return `<p:txBody xmlns:p="${p}" xmlns:a="${a}">${retained || '<a:bodyPr/><a:lstStyle/>'}${text
@@ -161,9 +184,16 @@ export async function updatePptxNotes(bytes, edits) {
             edit.text.split('\n').some((line) => Buffer.byteLength(line) > 256 * 1024))
             throw invalid();
     }
-    await validatePptxWriteArchive(bytes);
-    const zip = await jszip.loadAsync(bytes);
-    const presentation = parse(await xmlPart(zip, 'ppt/presentation.xml'));
+    const zip = await loadPptxWriteArchive(bytes);
+    const rootRels = await rels(zip, '');
+    const documents = rootRels.rows.filter((row) => [
+        `${R}/officeDocument`,
+        'http://purl.oclc.org/ooxml/officeDocument/relationships/officeDocument',
+    ].includes(row.attrs.Type ?? ''));
+    if (documents.length !== 1 || (documents[0].attrs.TargetMode ?? 'Internal') !== 'Internal')
+        throw invalid();
+    const presentationPart = targetPart('', documents[0].attrs.Target ?? '');
+    const presentation = parse(await xmlPart(zip, presentationPart));
     const p = presentation.uri;
     if (presentation.local !== 'presentation' ||
         ![P, 'http://purl.oclc.org/ooxml/presentationml/main'].includes(p))
@@ -173,13 +203,13 @@ export async function updatePptxNotes(bytes, edits) {
     const slides = presentation.children
         .filter((node) => node.uri === p && node.local === 'sldIdLst')
         .flatMap((node) => node.children.filter((child) => child.uri === p && child.local === 'sldId'));
-    const presentationRels = await rels(zip, 'ppt/presentation.xml');
+    const presentationRels = await rels(zip, presentationPart);
     const slideParts = slides.map((slide) => {
         const rid = slide.attrs[`{${r}}id`];
         const rel = presentationRels.rows.find((row) => row.attrs.Id === rid && row.attrs.Type === `${r}/slide`);
         if (!rel || rel.attrs.TargetMode === 'External')
             throw invalid();
-        return targetPart('ppt/presentation.xml', rel.attrs.Target);
+        return targetPart(presentationPart, rel.attrs.Target);
     });
     if (new Set(slideParts).size !== slideParts.length)
         throw invalid();
@@ -253,7 +283,7 @@ export async function updatePptxNotes(bytes, edits) {
             zip.file(relationshipPart(slidePart), append(slideRels.xml, slideRels.root, `<Relationship xmlns="${PKG}" Id="rId${relId}" Type="${r}/notesSlide" Target="${escapeXml(posix.relative(posix.dirname(slidePart), notesPart))}"/>`));
             zip.file(notesPart, `<p:notes xmlns:p="${p}" xmlns:a="${a}"><p:cSld><p:spTree><p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr/>${shapeXml(2, bodyXml(edit.text, p, a), p)}</p:spTree></p:cSld><p:clrMapOvr><a:masterClrMapping/></p:clrMapOvr></p:notes>`);
             const master = presentationRels.rows.find((row) => row.attrs.Type === `${r}/notesMaster` && row.attrs.TargetMode !== 'External');
-            zip.file(relationshipPart(notesPart), `<Relationships xmlns="${PKG}"><Relationship Id="rId1" Type="${r}/slide" Target="${escapeXml(posix.relative(posix.dirname(notesPart), slidePart))}"/>${master ? `<Relationship Id="rId2" Type="${r}/notesMaster" Target="${escapeXml(posix.relative(posix.dirname(notesPart), targetPart('ppt/presentation.xml', master.attrs.Target)))}"/>` : ''}</Relationships>`);
+            zip.file(relationshipPart(notesPart), `<Relationships xmlns="${PKG}"><Relationship Id="rId1" Type="${r}/slide" Target="${escapeXml(posix.relative(posix.dirname(notesPart), slidePart))}"/>${master ? `<Relationship Id="rId2" Type="${r}/notesMaster" Target="${escapeXml(posix.relative(posix.dirname(notesPart), targetPart(presentationPart, master.attrs.Target)))}"/>` : ''}</Relationships>`);
             const contentTypes = await xmlPart(zip, '[Content_Types].xml');
             const root = parse(contentTypes);
             if (root.uri !== CT || root.local !== 'Types')

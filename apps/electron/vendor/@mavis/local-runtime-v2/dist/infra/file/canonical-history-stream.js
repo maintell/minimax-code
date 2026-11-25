@@ -1,6 +1,6 @@
 import { decodeCanonicalHistoryEnvelope, newSequenceState, sequenceError, sequenceInspection, validateSequenceRecord, } from './canonical-history-jsonl.js';
 import { createRevisionHasher } from './canonical-history-revision.js';
-import { forEachJsonlRecord, publishFileCopyIfAbsent, publishJsonlStreamIfAbsent, } from './jsonl.js';
+import { forEachJsonlRecord, publishFileCopyIfAbsent } from './jsonl.js';
 /**
  * Reads a canonical history file one record at a time. Decoding, sequence checks and the
  * revision match readStrict (`settled`) or readActiveStrict (`pending-allowed`) followed by
@@ -48,31 +48,6 @@ export async function copyCanonicalHistorySnapshotFile(sourcePath, targetPath, e
         await assertExistingSnapshotRevision(targetPath, expectedRevision);
     }
     return status;
-}
-/**
- * Publishes a snapshot whose records are rewritten one at a time from a source snapshot that
- * must still have `sourceRevision`. Returns the revision of the rewritten records.
- */
-export async function rewriteCanonicalHistorySnapshotFile(source, targetPath, rewrite) {
-    let revision;
-    const status = await publishJsonlStreamIfAbsent(targetPath, async (write) => {
-        const hasher = createRevisionHasher();
-        await verifyCanonicalHistorySnapshotFile(source.path, source.revision, async (envelope, index) => {
-            const rewritten = decodeCanonicalHistoryEnvelope(rewrite(envelope, index));
-            hasher.add(rewritten);
-            await write(rewritten);
-        });
-        revision = hasher.digest();
-    }, async (temporaryPath) => {
-        if (revision === undefined)
-            throw new Error('Rewritten snapshot produced no revision');
-        await verifyCanonicalHistorySnapshotFile(temporaryPath, revision);
-    });
-    if (revision === undefined)
-        throw new Error('Rewritten snapshot produced no revision');
-    if (status === 'already-exists')
-        await assertExistingSnapshotRevision(targetPath, revision);
-    return revision;
 }
 async function assertExistingSnapshotRevision(targetPath, expectedRevision) {
     try {

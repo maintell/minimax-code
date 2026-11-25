@@ -19,5 +19,9 @@ export class MemorySubscriptionQuota {
         }
         return result;
     }
+    /** 账户订阅档位事实，供上线时的一次性默认处理判断最低档（memory-system/rollout.ts）。 */
+    readPlan() {
+        return this.quota.readPlan();
+    }
 }
 //# sourceMappingURL=memory-quota.js.map

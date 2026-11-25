@@ -1,8 +1,7 @@
 import { Type } from '@sinclair/typebox';
 import { defineRuntimeTool } from '@mavis/agent-core/tools';
 import { logger } from '@mavis/shared/local-runtime-logging/logger';
-import { LocalAskUserToolDef } from '../desktop/builtin-defs.js';
-import { prepareAskUserArguments } from '../desktop/prepare-ask-user-arguments.js';
+import { LocalAskUserToolDef, prepareAskUserArguments, } from '../ask-user/index.js';
 /**
  * Why the cloud definition owns its description and schema instead of spreading
  * `LocalAskUserToolDef`: AskUser v2 gave the shared definition an async mode
@@ -38,6 +37,29 @@ const CLOUD_ASK_USER_DESCRIPTION = [
     '- Describe only what this turn actually delivers. Work finished before asking is delivered; work merely promised is not.',
     '- The answer arrives later as a new message. Ask each question once.',
 ].join('\n');
+const DESKTOP_ASK_USER_OPENING = 'Ask the local desktop user structured questions';
+/**
+ * The ask_user description of the AskUser v2 questionnaire host
+ * (cloud-harness-server): the shared Desktop description with only "the local
+ * desktop user" changed to "the user". That host really supports `async` and
+ * the user policy override, so every other line is the Desktop wording and
+ * follows it automatically. Not the v1 contract above
+ * ({@link CLOUD_ASK_USER_DESCRIPTION}), where every call ends the Turn.
+ * cloud-harness-server's package boundary does not admit the `ask-user` entry,
+ * so it reads this through `@mavis/agent-tools/cloud`.
+ *
+ * If the Desktop opening ever changes, this does not throw at module load
+ * (that would break the whole cloud entry and the server's start-up): it
+ * falls back to replacing the audience phrase, and cloud-ask-user.test.ts,
+ * which asserts the opening, fails in CI instead.
+ */
+export const CLOUD_ASK_USER_V2_DESCRIPTION = cloudAskUserV2Description(LocalAskUserToolDef.description);
+function cloudAskUserV2Description(desktop) {
+    if (!desktop.startsWith(DESKTOP_ASK_USER_OPENING)) {
+        return desktop.replace('the local desktop user', 'the user');
+    }
+    return `Ask the user structured questions${desktop.slice(DESKTOP_ASK_USER_OPENING.length)}`;
+}
 // The cloud questionnaire is the shared questionnaire without the Desktop-only
 // async mode: mode / title / steps carry the whole payload. Naming the three
 // properties keeps a later addition to the shared schema from silently

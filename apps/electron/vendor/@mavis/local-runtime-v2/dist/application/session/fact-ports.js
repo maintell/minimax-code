@@ -60,7 +60,15 @@ export function createApplicationFactPorts(options) {
     const archiveTitleEvents = new RootArchiveTitleEventProjector({ publish: options.publish });
     return {
         session: {
-            handle: (fact) => sessionEvents.handle(fact),
+            handle: (fact) => {
+                sessionEvents.handle(fact);
+                try {
+                    options.observeSession?.(fact);
+                }
+                catch (error) {
+                    options.logger?.warn({ kind: fact.kind, reason: error instanceof Error ? error.message : String(error) }, 'session fact observer failed');
+                }
+            },
         },
         queue: {
             handle: (facts) => queueEvents.handle(facts),
@@ -71,6 +79,14 @@ export function createApplicationFactPorts(options) {
                     options.publish({
                         type: 'message.rewind',
                         payload: { sessionId: fact.sessionId, contextReset: true },
+                    });
+                    return;
+                }
+                if (fact.kind === 'reply-withdrawn') {
+                    // 只删了被拦的那一条回复：只提示，不发 message.rewind，也不带要放回输入框的原话。
+                    options.publish({
+                        type: 'content.retry.exceeded',
+                        payload: { sessionId: fact.sessionId, turnId: fact.turnId, variant: 'reply' },
                     });
                     return;
                 }

@@ -1,8 +1,9 @@
-import { Agent } from '@earendil-works/pi-agent-core';
+import { Agent, executeToolCall, } from '@earendil-works/pi-agent-core';
 import { projectAgentMessagesForModel } from './outbound-message-normalizer.js';
 import { resolveMaxImagesPerRequest } from './request-image-limit.js';
 import { failureReason } from './terminal.js';
 import { stripVideoAudioForModel } from './video-audio-strip.js';
+import { omitUnsampleableVideosForModel, PROVIDER_MAX_VIDEOS_PER_REQUEST, PROVIDER_VIDEO_SAMPLE_FPS, } from './video-sampling-guard.js';
 import { newRuntimeTool } from './tools.js';
 export function toPiUserMessage(input) {
     const message = {
@@ -70,7 +71,49 @@ export function newAgent(turn) {
                     max_images_per_request: resolveMaxImagesPerRequest(turn.llm.model),
                 }, '[pi-turn-runner] replaced older provider-bound images with placeholders');
             }
-            const stripped = await stripVideoAudioForModel(outbound.messages, turn.llm.model);
+            // Before the audio strip, so a video the provider would reject is not remuxed.
+            const sampled = await omitUnsampleableVideosForModel(outbound.messages, turn.llm.model);
+            if (sampled.omittedCount > 0) {
+                // The provider rejects the whole request for a video that breaks one of
+                // its rules (frame sampling, length, aspect ratio, pixel budget), and
+                // history replays it into every later request; only this request copy
+                // drops it.
+                turn.logger.warn({
+                    event: 'outbound_unsampleable_videos_omitted',
+                    session_id: turn.input.sessionId,
+                    turn_id: turn.input.turnId,
+                    provider: turn.llm.model.provider,
+                    omitted_video_count: sampled.omittedCount,
+                    video_rule_violations: sampled.ruleViolations,
+                    provider_video_sample_fps: PROVIDER_VIDEO_SAMPLE_FPS,
+                }, '[pi-turn-runner] replaced provider-bound videos that break a provider video rule with placeholders');
+            }
+            if (sampled.brokenCount > 0) {
+                // A broken container (no moov, no video track, an index pointing past
+                // the frames, no keyframe, not a video at all) fails the provider's
+                // probe and the whole request with it.
+                turn.logger.warn({
+                    event: 'outbound_broken_videos_omitted',
+                    session_id: turn.input.sessionId,
+                    turn_id: turn.input.turnId,
+                    provider: turn.llm.model.provider,
+                    omitted_video_count: sampled.brokenCount,
+                    video_container_problems: sampled.containerProblems,
+                }, '[pi-turn-runner] replaced provider-bound videos with a broken container with placeholders');
+            }
+            if (sampled.limitedCount > 0) {
+                // History keeps every video; only this request copy drops the oldest
+                // ones so it stays within the provider's per-request video limit.
+                turn.logger.info({
+                    event: 'outbound_videos_limited',
+                    session_id: turn.input.sessionId,
+                    turn_id: turn.input.turnId,
+                    provider: turn.llm.model.provider,
+                    omitted_video_count: sampled.limitedCount,
+                    max_videos_per_request: PROVIDER_MAX_VIDEOS_PER_REQUEST,
+                }, '[pi-turn-runner] replaced older provider-bound videos with placeholders');
+            }
+            const stripped = await stripVideoAudioForModel(sampled.messages, turn.llm.model);
             if (stripped.strippedCount > 0 || Object.keys(stripped.keptMimeTypes).length > 0) {
                 // The model cannot hear audio, so only this request copy drops the
                 // soundtrack; history keeps the original video.
@@ -126,32 +169,38 @@ function resolveMissingTool(turn, toolCall) {
  * Pi ends its loop on a provider error, so a response an afterLlmCall hook
  * recovered from (already removed from the transcript) is repeated here by
  * continuing from the same transcript.
+ *
+ * 网关 content_error（action=4）打回的回复同样已移出 transcript，这里按同一方式重发：
+ * 从同一份 transcript 继续，前面已执行的工具不会重跑；重发参数（引导词、请求头）只交给
+ * 这次 continue 的第一次真实请求。
  */
 async function repeatRecoveredRequest(agent, turn, convergeAtIdle) {
-    for (let recovery = turn.recovery.pending; recovery; recovery = turn.recovery.pending) {
+    for (;;) {
+        const recovery = turn.recovery.pending;
+        const regeneration = turn.contentReview.pending;
+        if (!recovery && !regeneration)
+            return;
         delete turn.recovery.pending;
+        delete turn.contentReview.pending;
         if (turn.input.signal?.aborted)
             return;
-        turn.recovery.active = recovery;
+        if (recovery)
+            turn.recovery.active = recovery;
+        if (regeneration)
+            turn.contentReview.active = regeneration;
         turn.metrics.forgetLLMFailureObservation();
         await agent.continue();
         await agent.waitForIdle();
+        // 没被消费的重发参数（例如这次被 hook 直接作答）作废，不能落到之后的调用上。
+        delete turn.contentReview.active;
         await convergeAtIdle?.();
         await agent.waitForIdle();
     }
 }
-export async function runAgent(agent, turn, convergeAtIdle) {
+export async function runAgent(agent, turn, convergeAtIdle, emit) {
     const startMode = turn.input.startMode ?? 'prompt';
     try {
-        if (startMode === 'continue') {
-            await agent.continue();
-        }
-        else {
-            await agent.prompt([
-                ...(turn.input.beforeUserMessages ?? []),
-                toPiUserMessage(turn.input.userMessage),
-            ]);
-        }
+        await startAgent(agent, turn, startMode, emit);
         await agent.waitForIdle();
         await repeatRecoveredRequest(agent, turn, convergeAtIdle);
         await convergeAtIdle?.();
@@ -159,6 +208,10 @@ export async function runAgent(agent, turn, convergeAtIdle) {
         await repeatRecoveredRequest(agent, turn, convergeAtIdle);
         if (turn.input.signal?.aborted) {
             return { kind: 'aborted' };
+        }
+        if (turn.contentReview.outcome) {
+            // 不走 LLM 错误分类：分类结果的 message 可能取自原始错误，只用网关给的中性文案结束。
+            return { kind: 'failed', message: turn.contentReview.message ?? '' };
         }
         // A turn-failure hook restored the failure its recovery replaced: the
         // Turn reports that one, not the host error of the repeated call.
@@ -182,5 +235,109 @@ export async function runAgent(agent, turn, convergeAtIdle) {
         }, '[pi-turn-runner] agent start threw');
         return failureReason(runError);
     }
+}
+async function startAgent(agent, turn, startMode, emit) {
+    switch (startMode) {
+        case 'continue':
+            return agent.continue();
+        case 'resume-tool-calls':
+            return resumePendingToolCalls(agent, turn, emit);
+        default:
+            return agent.prompt([
+                ...(turn.input.beforeUserMessages ?? []),
+                toPiUserMessage(turn.input.userMessage),
+            ]);
+    }
+}
+/**
+ * Runs, in order and with their original ids, the tool calls of the last
+ * assistant message that have no result yet, then continues the loop unless a
+ * result stops the agent or the Turn is aborted. Each result enters the
+ * transcript before its `message_end`, so the Host receives it as a
+ * `messageDelta` exactly like a tool batch result.
+ */
+async function resumePendingToolCalls(agent, turn, emit) {
+    const { assistant, pending, settled } = pendingToolCalls(agent.state.messages);
+    const anchor = turn.input.resumeAssistantMessageId;
+    if (anchor) {
+        turn.bridge.resumeAssistantMessage({ msgId: anchor, assistant, toolResults: settled });
+    }
+    const context = {
+        systemPrompt: agent.state.systemPrompt,
+        messages: [...agent.state.messages],
+        tools: toolsForCalls(agent, pending),
+    };
+    const config = toolLifecycleConfig(agent);
+    const outcomes = [];
+    const toolResults = [];
+    for (const toolCall of pending) {
+        if (turn.input.signal?.aborted)
+            return;
+        const outcome = await executeToolCall(context, assistant, toolCall, config, turn.input.signal, emit);
+        const message = toolResultMessage(outcome);
+        agent.state.messages.push(message);
+        await emit({ type: 'message_start', message });
+        await emit({ type: 'message_end', message });
+        outcomes.push(outcome);
+        toolResults.push(message);
+    }
+    await emit({ type: 'turn_end', message: assistant, toolResults });
+    if (turn.input.signal?.aborted || stopsAgent(outcomes))
+        return;
+    await agent.continue();
+}
+function pendingToolCalls(messages) {
+    let index = messages.length - 1;
+    while (index >= 0 && messages[index]?.role !== 'assistant')
+        index -= 1;
+    const assistant = messages[index];
+    if (assistant?.role !== 'assistant') {
+        throw new Error('No assistant message to resume tool calls from');
+    }
+    const settled = messages
+        .slice(index + 1)
+        .flatMap((message) => (message.role === 'toolResult' ? [message] : []));
+    const settledIds = new Set(settled.map((message) => message.toolCallId));
+    const pending = assistant.content.filter((part) => part.type === 'toolCall' && !settledIds.has(part.id));
+    if (pending.length === 0) {
+        throw new Error('The last assistant message has no tool call without a result');
+    }
+    return { assistant, pending, settled };
+}
+/** Catalog tools plus the ones the Host resolves for uncataloged calls, as in a tool batch. */
+function toolsForCalls(agent, calls) {
+    const tools = [...agent.state.tools];
+    for (const call of calls) {
+        if (tools.some((tool) => tool.name === call.name))
+            continue;
+        const tool = agent.resolveMissingTool?.(call);
+        if (tool?.name === call.name)
+            tools.push(tool);
+    }
+    return tools;
+}
+function toolLifecycleConfig(agent) {
+    return {
+        beforeToolCall: agent.beforeToolCall,
+        onToolExecutionStart: agent.onToolExecutionStart,
+        afterToolCall: agent.afterToolCall,
+        missingToolMessage: agent.missingToolMessage,
+    };
+}
+function toolResultMessage(outcome) {
+    return {
+        role: 'toolResult',
+        toolCallId: outcome.toolCall.id,
+        toolName: outcome.toolCall.name,
+        content: outcome.result.content,
+        details: outcome.result.details,
+        isError: outcome.isError,
+        timestamp: Date.now(),
+    };
+}
+/** The rule Pi applies to a tool batch: any hook stop, or every result asks to terminate. */
+function stopsAgent(outcomes) {
+    return (outcomes.some((outcome) => outcome.terminateAgent === true) ||
+        (outcomes.length > 0 && outcomes.every((outcome) => outcome.result.terminate === true)));
 }
 //# sourceMappingURL=agent.js.map

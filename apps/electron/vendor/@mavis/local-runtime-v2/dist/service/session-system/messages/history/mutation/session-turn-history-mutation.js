@@ -1,56 +1,16 @@
+import { planSettleTurnTail as planSharedSettleTurnTail, } from '@mavis/harness';
 import { canonicalActiveHistoryRevision, inspectCanonicalHistorySequence, } from '../../../sessions/representation/canonical-history-contract.js';
 import { sanitizePtcSafetyHistoryMessage } from '../../ptc/safety-reconcile.js';
 import { canonicalHistoryRecordEntry, } from './canonical-history-scanner.js';
-/** Plans the existing abort/network tail fold against the latest envelopes. */
+/** Settlement follows the canonical sequence inspection; safety folds use the PTC sanitizer. */
+const TURN_TAIL_RULES = {
+    isSettled: (records) => inspectCanonicalHistorySequence(records).status ===
+        'settled',
+    sanitizeSafetyMessage: (message) => sanitizePtcSafetyHistoryMessage(message),
+};
+/** Plans the abort/network/safety/reply tail fold against the latest envelopes. */
 export function planSettleTurnTail(active, input) {
-    assertMutationIdentity(input);
-    if (input.mode === 'safety')
-        return planSafetyTurnTail(active, input);
-    const last = active.at(-1);
-    if (!last || last.turn_id !== input.turnId || last.message.role !== 'assistant') {
-        return unchangedSettle(active);
-    }
-    if (input.mode === 'abort' && containsToolCall(last.message.content)) {
-        return unchangedSettle(active);
-    }
-    const next = [...active];
-    const approvedContent = input.approvedContent;
-    const deletedMessageIds = [];
-    if (!approvedContent.trim()) {
-        next.pop();
-        deletedMessageIds.push(last.message_id);
-    }
-    else {
-        next[next.length - 1] = {
-            ...last,
-            message: {
-                ...last.message,
-                content: [{ type: 'text', text: approvedContent }],
-            },
-        };
-    }
-    if (sameJson(active, next))
-        return unchangedSettle(active);
-    assertSettled(next, 'Turn tail settlement');
-    return { status: 'committed', active: next, deletedMessageIds };
-}
-function planSafetyTurnTail(active, input) {
-    if (active.at(-1)?.turn_id !== input.turnId)
-        return unchangedSettle(active);
-    const deletedMessageIds = [];
-    const next = active.flatMap((record) => {
-        if (record.turn_id !== input.turnId)
-            return [record];
-        const message = sanitizePtcSafetyHistoryMessage(record.message);
-        if (message)
-            return [{ ...record, message }];
-        deletedMessageIds.push(record.message_id);
-        return [];
-    });
-    if (sameJson(active, next))
-        return unchangedSettle(active);
-    assertSettled(next, 'Safety Turn tail settlement');
-    return { status: 'committed', active: next, deletedMessageIds };
+    return planSharedSettleTurnTail(active, input, TURN_TAIL_RULES);
 }
 /**
  * The artifact holding the target Turn's first record: a snapshot index, `snapshots.length`
@@ -113,7 +73,13 @@ function retractArtifacts(history) {
         },
     ];
 }
-export function validateRetractTurnInput(input) {
+/**
+ * Local copy of the harness validator, used only by {@link planRetractTurn} below. The shared
+ * one is `@mavis/harness`'s `validateRetractTurnInput`, which `session-history-mutation-adapter`
+ * calls; this file keeps THEIRS' own retract planner, so it needs its own `RetractTurnInput`
+ * shape. Not exported: nothing outside this file reads it.
+ */
+function validateRetractTurnInput(input) {
     assertMutationIdentity(input);
     assertRetractReason(input.reason);
 }
@@ -137,16 +103,6 @@ function assertRetractReason(reason) {
         (!Number.isSafeInteger(reason.attempt) || reason.attempt < 1)) {
         throw new TypeError('Output recall attempt must be a positive safe integer');
     }
-}
-function unchangedSettle(active) {
-    return { status: 'unchanged', active, deletedMessageIds: [] };
-}
-function containsToolCall(content) {
-    return (Array.isArray(content) &&
-        content.some((block) => typeof block === 'object' &&
-            block !== null &&
-            !Array.isArray(block) &&
-            Reflect.get(block, 'type') === 'toolCall'));
 }
 function containsCompactionMarker(artifacts, turnId) {
     const markerTurnId = `${turnId}:compaction`;
@@ -184,8 +140,5 @@ function assertSettled(records, operation) {
     if (inspectCanonicalHistorySequence(records).status !== 'settled') {
         throw new Error(`${operation} must produce settled canonical history`);
     }
-}
-function sameJson(left, right) {
-    return JSON.stringify(left) === JSON.stringify(right);
 }
 //# sourceMappingURL=session-turn-history-mutation.js.map

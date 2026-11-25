@@ -1,15 +1,34 @@
 import { Buffer } from 'node:buffer';
+import { BUILTIN_TOOL_NAMESPACES, skillForNamespace, summaryForNamespace, } from '../shared/builtin-tool-namespaces.js';
 import { mcpServerOfToolName, serverOfToolEntry } from './search-index.js';
 /** Default size of the deferred-tool catalog, in estimated tokens. */
 export const DEFAULT_CATALOG_BUDGET_TOKENS = 2_000;
 const DESCRIPTION_LIMIT = 120;
-/** Group key of tools without a server; not a string, so no server name can collide with it. */
+/** Group key of tools with neither a server nor a namespace; not an object, so no name can collide with it. */
 const BUILTIN_GROUP = null;
+/** Builtin groups first, then provider servers: the host knows its own tools are needed. */
+function groupRank(group) {
+    if (group === BUILTIN_GROUP)
+        return 0;
+    return group.kind === 'namespace' ? 1 : 2;
+}
+function groupSortKey(group) {
+    return group === BUILTIN_GROUP ? '' : group.name;
+}
 /**
  * Renders the deferred-tool catalog inserted into every request (its text fixed
  * until the next compaction). Every group always gets a header line with its tool count; a
  * group's tool lines appear in full or not at all (see `budgetedGroups`). Names
  * and descriptions come from tool providers and are quoted as data.
+ *
+ * A namespace bound to a Skill is the exception: it has no group of its own and
+ * no tool line. Every such namespace this catalog holds tools for shares one
+ * section (see `namespaceSection`) that states the gate once and then names
+ * each group, what it does and the Skill that unlocks it. The Skill result
+ * appends the whole group's definitions and the model has to load it before any
+ * call anyway, so listing the tools here would only repeat what loading the
+ * Skill gives — at the cost of the third-party MCP lines this catalog exists to
+ * show.
  */
 export function renderDeferredToolCatalog(entries, options) {
     const head = [
@@ -120,22 +139,31 @@ function unavailableLines({ unavailable, unavailableServers }, fixed, options) {
  * built-in group goes first, then groups from cheapest to dearest, which lists the
  * most servers; a group that does not fit the budget (less `fixed`) is skipped and
  * the next one still gets its turn. A budget of 0 leaves headers only.
+ *
+ * The Skill-bound namespaces are not one group each but one section that is
+ * always rendered: it takes no turn below and its cost enters `used` up front.
  */
 function budgetedGroups(entries, fixed, options) {
     const groups = groupEntries(entries);
     const budget = options.budgetTokens ?? DEFAULT_CATALOG_BUDGET_TOKENS;
-    let used = estimateTokens(fixed.join('\n'));
-    for (const [group, items] of groups)
+    const section = namespaceSection(groups);
+    let used = estimateTokens(fixed.join('\n')) +
+        (section.length > 0 ? estimateTokens(section.join('\n')) : 0);
+    for (const [group, items] of groups) {
+        if (isSkillBound(group))
+            continue;
         used += estimateTokens(groupHeader(group, items, false));
+    }
     const byCost = [...groups]
+        .filter(([group]) => !isSkillBound(group))
         .map(([group, items]) => ({
         group,
         items,
         lines: items.reduce((sum, item) => sum + estimateTokens(item.line), 0),
     }))
-        .sort((a, b) => Number(b.group === BUILTIN_GROUP) - Number(a.group === BUILTIN_GROUP) ||
+        .sort((a, b) => groupRank(a.group) - groupRank(b.group) ||
         a.lines - b.lines ||
-        (a.group ?? '').localeCompare(b.group ?? ''));
+        groupSortKey(a.group).localeCompare(groupSortKey(b.group)));
     const listed = new Set();
     for (const { group, items, lines } of byCost) {
         const cost = lines +
@@ -147,7 +175,18 @@ function budgetedGroups(entries, fixed, options) {
         used += cost;
     }
     const body = [];
+    let sectionRendered = false;
     for (const [group, items] of groups) {
+        // The section takes the place of the first Skill-bound namespace, so it
+        // keeps the position the namespace groups had: after the servers, before
+        // the leftover built-in group.
+        if (isSkillBound(group)) {
+            if (!sectionRendered) {
+                body.push(...section);
+                sectionRendered = true;
+            }
+            continue;
+        }
         body.push(groupHeader(group, items, listed.has(group)));
         if (!listed.has(group))
             continue;
@@ -205,11 +244,26 @@ function loadSentence(options) {
             return `${load}, then call it through \`mcp_invoke\` with that exact tool_name.`;
     }
 }
+/** The one key object per (kind, name), so `Map` groups entries by identity. */
+function intern(groups, kind, name) {
+    for (const key of groups.keys()) {
+        if (key !== BUILTIN_GROUP && key.kind === kind && key.name === name)
+            return key;
+    }
+    return { kind, name };
+}
 function groupEntries(entries) {
     const groups = new Map();
     for (const entry of entries) {
         const name = entry.tool.def.name;
-        const group = serverOfToolEntry(entry) ?? BUILTIN_GROUP;
+        const server = serverOfToolEntry(entry);
+        const namespace = entry.tool.def.namespace;
+        // Map keys compare by identity, so every entry of a group must share one object.
+        const group = server !== undefined
+            ? intern(groups, 'server', server)
+            : namespace !== undefined
+                ? intern(groups, 'namespace', namespace)
+                : BUILTIN_GROUP;
         // The first non-empty line: a description may start with blank lines.
         const description = (entry.tool.def.description ?? '').trimStart().split('\n', 1)[0].trim();
         const short = description.length > DESCRIPTION_LIMIT
@@ -220,11 +274,61 @@ function groupEntries(entries) {
         items.push({ name, line });
         groups.set(group, items);
     }
-    // Servers by name, then the built-in group.
-    return new Map([...groups].sort(([a], [b]) => a === BUILTIN_GROUP ? 1 : b === BUILTIN_GROUP ? -1 : a.localeCompare(b)));
+    // Servers by name, then namespaces by name, then the built-in group.
+    return new Map([...groups].sort(([a], [b]) => groupRank(b) - groupRank(a) || groupSortKey(a).localeCompare(groupSortKey(b))));
+}
+/** Whether a group is a namespace gated on a Skill, and so belongs to the shared section. */
+function isSkillBound(group) {
+    return (group !== BUILTIN_GROUP &&
+        group.kind === 'namespace' &&
+        skillForNamespace(group.name) !== undefined);
+}
+/**
+ * The one section every Skill-bound namespace of this catalog shares: a header
+ * stating the gate once, then one line per group in registry order, each with
+ * its own tool count, its Skill and its summary.
+ *
+ * Only namespaces this catalog actually holds tools for get a line, and the
+ * header counts those tools alone, so a Turn that hides a group (a coordinator
+ * never sees `session.dispatch`) drops both the line and its tools from the
+ * total. Empty when no group here is Skill-bound, which is what leaves a cloud
+ * catalog byte for byte as it was.
+ *
+ * The Skill name and the summary are registry text, not provider text, so they
+ * are not quoted; the summary is one sentence, so no separator is needed.
+ */
+function namespaceSection(groups) {
+    const counts = new Map();
+    for (const [group, items] of groups) {
+        if (isSkillBound(group))
+            counts.set(group.name, items.length);
+    }
+    if (counts.size === 0)
+        return [];
+    const lines = [];
+    let total = 0;
+    for (const namespace of Object.keys(BUILTIN_TOOL_NAMESPACES)) {
+        const count = counts.get(namespace);
+        const skill = skillForNamespace(namespace);
+        const summary = summaryForNamespace(namespace);
+        if (count === undefined || skill === undefined || summary === undefined)
+            continue;
+        total += count;
+        lines.push(`- ${quote(namespace)} (${count} tools, Skill \`${skill}\`): ${summary}`);
+    }
+    return [
+        `## Built-in tool namespaces (${total} tools): load a namespace's Skill with the \`skill\` tool before calling its tools.`,
+        ...lines,
+    ];
 }
 function groupHeader(group, items, listed) {
-    const label = group === BUILTIN_GROUP ? 'Built-in on-demand tools' : `Server ${quote(group)}`;
+    if (group !== BUILTIN_GROUP && group.kind === 'namespace') {
+        const label = `Namespace ${quote(group.name)}`;
+        if (listed)
+            return `## ${label} (${items.length} tools)`;
+        return `## ${label} (${items.length} tools, not listed; list them with tool_search "namespace": ${quote(group.name)})`;
+    }
+    const label = group === BUILTIN_GROUP ? 'Built-in on-demand tools' : `Server ${quote(group.name)}`;
     if (listed)
         return `## ${label} (${items.length} tools)`;
     // The listing query matches the name prefix, which a provider's server name may not equal.

@@ -10,6 +10,9 @@ export function createRuntimeSourceReferenceExtension(attachmentRegistration) {
             });
             if (source)
                 return { path: source.filePath, name: source.fileName };
+            const registered = attachmentRegistration.resolveRegisteredSource?.({ filePath: path });
+            if (registered)
+                return { path: registered.filePath, name: registered.fileName };
             return resolveWorkspaceFileSource(path, turn.workspaceDir, origin === 'diff-result');
         },
     });

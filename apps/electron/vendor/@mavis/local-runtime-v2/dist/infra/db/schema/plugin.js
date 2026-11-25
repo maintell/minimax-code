@@ -10,6 +10,18 @@ export const pluginDisabledLocalRoots = sqliteTable('local_runtime_plugin_local_
     canonicalRoot: text('canonical_root').primaryKey(),
     updatedAtMs: integer('updated_at_ms').notNull(),
 });
+/**
+ * The session preview record: the candidate a session's preview of a plugin last bound, per
+ * `(session, plugin)`. Whether the Agent may preview is an `extension` / `preview` permission rule.
+ * Migration 0068 creates the table; a record is consumed when its `boundDigest` is the installed
+ * version.
+ */
+export const extensionPreviewBindings = sqliteTable('extension_preview_consents', {
+    sessionId: text('session_id').notNull(),
+    pluginId: text('plugin_id').notNull(),
+    boundDigest: text('bound_digest').notNull(),
+    updatedAtMs: integer('updated_at_ms').notNull(),
+}, (table) => [primaryKey({ columns: [table.sessionId, table.pluginId] })]);
 /** User-disabled Mini App permissions; an absent row means the declared permission is enabled. */
 export const pluginMiniAppPermissions = sqliteTable('local_runtime_plugin_miniapp_permission', {
     pluginId: text('plugin_id').notNull(),

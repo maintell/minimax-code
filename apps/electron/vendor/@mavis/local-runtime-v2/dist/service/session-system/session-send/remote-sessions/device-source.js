@@ -40,6 +40,7 @@ export const REMOTE_SEND_ERROR_CODES = new Set([
     'SESSION_ARCHIVED',
     'SESSION_BUSY',
     'SESSION_SEND_REJECTED',
+    'SESSION_WORKTREE_CLEANED',
     'REMOTE_MESSAGE_INVALID',
 ]);
 /** What the model does with an unconfirmed send: check the target, never resend blind. */

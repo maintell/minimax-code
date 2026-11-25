@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { getRuntimeBuildEnv, getRuntimeRegion } from '@mavis/config';
-import { membership, personalWorkspace, projectQuotaWindows, record, text } from './projection.js';
+import { membership, mergePlanFields, personalWorkspace, projectQuotaWindows, record, text, } from './projection.js';
 import { SubscriptionQuotaTransport } from './transport.js';
 /**
  * Signed-in account Token Plan quota, resolved from membership plus the
@@ -40,6 +40,28 @@ export class SubscriptionQuotaClient {
         }
         catch {
             return { status: 'unknown', reason: 'quota-request-unavailable' };
+        }
+    }
+    async readPlan() {
+        const state = this.currentState();
+        if (!state)
+            return { status: 'unknown', reason: 'account-unavailable' };
+        try {
+            const plan = await state.membership.read(() => this.readMembership(state));
+            if (this.currentState() !== state)
+                return { status: 'unknown', reason: 'account-changed' };
+            if (plan.hasTokenPlan === undefined && plan.subscriptionType === undefined)
+                return { status: 'unknown', reason: 'subscription-unavailable' };
+            return {
+                status: 'known',
+                ...(plan.hasTokenPlan === undefined ? {} : { hasTokenPlan: plan.hasTokenPlan }),
+                ...(plan.subscriptionType ? { subscriptionType: plan.subscriptionType } : {}),
+                ...(plan.tier ? { tier: plan.tier } : {}),
+                ...(plan.comboId ? { comboId: plan.comboId } : {}),
+            };
+        }
+        catch {
+            return { status: 'unknown', reason: 'membership-request-unavailable' };
         }
     }
     currentState() {
@@ -92,7 +114,8 @@ export class SubscriptionQuotaClient {
             hasTokenPlan = true;
         const groupId = personal.membership.groupId ?? scoped.groupId;
         state.quota.clear();
-        return { hasTokenPlan, groupId };
+        // 订阅类型、档位与 combo ID 以会员接口为准，缺失时用个人 workspace 条目补齐。
+        return { hasTokenPlan, groupId, ...mergePlanFields(scoped, personal.membership) };
     }
     async withUserIdentity(context) {
         if (context.auth.realUserID)

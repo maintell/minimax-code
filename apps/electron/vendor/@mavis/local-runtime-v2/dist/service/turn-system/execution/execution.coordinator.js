@@ -17,11 +17,11 @@ export function createExecutionCoordinator(options) {
                 }),
             };
         },
-        failTurn: async ({ turn, error }) => ({
-            completion: settlePreHostFailure(options, turn, error),
+        failTurn: async ({ turn, error, provenance }) => ({
+            completion: settlePreHostFailure(options, turn, error, provenance),
         }),
-        failAdmission: async ({ admission, error }) => ({
-            completion: settleFailedAdmission(options, admission, error),
+        failAdmission: async ({ admission, error, provenance }) => ({
+            completion: settleFailedAdmission(options, admission, error, provenance),
         }),
         compact: async (input) => {
             let outcome;
@@ -46,6 +46,7 @@ async function executeAgentTurn(options, { turn, request, executionStart, before
                 turnId: turn.turnId,
                 turnSequence: turn.acceptedSequence,
                 eventId: `${turn.turnId}:pre-host-started`,
+                provenance: { source: request.provenance.source },
             });
             turn.signal.throwIfAborted();
             await beforeHost(turn.signal);
@@ -68,7 +69,7 @@ async function executeAgentTurn(options, { turn, request, executionStart, before
         if (turn.signal.aborted) {
             return settleAgentTurn(options, turn, request, runHost(options, turn, request));
         }
-        return settlePreHostFailure(options, turn, error);
+        return settlePreHostFailure(options, turn, error, originOf(request));
     }
     return settleAgentTurn(options, turn, request, runHost(options, turn, request, beforeCapabilityCapture));
 }
@@ -102,7 +103,10 @@ async function runHost(options, turn, request, beforeCapabilityCapture) {
     if (turn.signal.aborted) {
         // The display input and Query may already be committed before Host entry.
         // Project their terminal fact while keeping cancelled work out of AgentHost.
-        const error = await projectPreHostTerminal(options.failures, turn, turn.signal.reason, 'aborted');
+        const error = await projectPreHostTerminal(options.failures, turn, turn.signal.reason, {
+            status: 'aborted',
+            provenance: originOf(request),
+        });
         return error
             ? { status: 'failed', error }
             : { status: 'aborted', reason: String(turn.signal.reason) };
@@ -128,7 +132,7 @@ async function settleAgentTurn(options, turn, request, pending) {
         // Close admission cancellation before the failure projection.
         options.onBeginSettlement?.(turn.sessionId, turn.turnId);
         settlementStarted = true;
-        await projectPostHostFailure(options, turn, error);
+        await projectPostHostFailure(options, turn, error, originOf(request));
     }
     if (options.controller.isForceReleased?.(turn.sessionId, turn.turnId)) {
         return { status: 'aborted', reason: 'force-released' };
@@ -164,7 +168,7 @@ async function wakesQueueWhileWaitingForUser(options, sessionId) {
  * wrote its terminal, the Session state fence rejects this write as a
  * conflict: an expected no-op that never changes the Turn outcome.
  */
-async function projectPostHostFailure(options, turn, error) {
+async function projectPostHostFailure(options, turn, error, provenance) {
     try {
         await options.failures.project({
             sessionId: turn.sessionId,
@@ -172,6 +176,7 @@ async function projectPostHostFailure(options, turn, error) {
             turnSequence: turn.acceptedSequence,
             eventId: `${turn.turnId}:post-host-failed`,
             error,
+            provenance,
         });
     }
     catch (projectionError) {
@@ -188,8 +193,10 @@ async function projectPostHostFailure(options, turn, error) {
         }
     }
 }
-async function settlePreHostFailure(options, turn, error) {
-    const projectionError = await projectPreHostTerminal(options.failures, turn, error);
+async function settlePreHostFailure(options, turn, error, provenance) {
+    const projectionError = await projectPreHostTerminal(options.failures, turn, error, {
+        provenance,
+    });
     const settlementError = await settleAndRelease(options, {
         turn,
         outcome: 'failed',
@@ -201,9 +208,11 @@ async function settlePreHostFailure(options, turn, error) {
         error: settlementError ?? projectionError ?? error,
     };
 }
-async function settleFailedAdmission(options, admission, error) {
+async function settleFailedAdmission(options, admission, error, provenance) {
     options.onBeginSettlement?.(admission.sessionId, admission.turnId);
-    const projectionError = await projectPreHostTerminal(options.failures, admission, error);
+    const projectionError = await projectPreHostTerminal(options.failures, admission, error, {
+        provenance,
+    });
     const settlementError = await settleAndRelease(options, {
         turn: admission,
         outcome: 'failed',
@@ -223,7 +232,7 @@ async function settleCompaction(options, turn, outcome) {
     });
     return settlementError ? { status: 'failed', error: settlementError } : outcome;
 }
-async function projectPreHostTerminal(failures, turn, error, status) {
+async function projectPreHostTerminal(failures, turn, error, { status, provenance } = {}) {
     const input = {
         sessionId: turn.sessionId,
         turnId: turn.turnId,
@@ -231,6 +240,7 @@ async function projectPreHostTerminal(failures, turn, error, status) {
         eventId: `${turn.turnId}:pre-host-${status ?? 'failed'}`,
         error,
         ...(status ? { status } : {}),
+        ...(provenance ? { provenance } : {}),
     };
     try {
         await failures.project(input);
@@ -454,5 +464,9 @@ function compactionTerminal(outcome) {
     if (outcome.status === 'failed')
         return 'failed';
     return 'completed';
+}
+/** Display projections only need where the Turn came from, never its routing data. */
+function originOf(request) {
+    return { source: request.provenance.source };
 }
 //# sourceMappingURL=execution.coordinator.js.map

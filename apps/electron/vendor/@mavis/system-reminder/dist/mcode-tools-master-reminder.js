@@ -1,3 +1,4 @@
+import { unwrapSystemReminder, wrapSystemReminderBlocks } from './envelope.js';
 const MCODE_TOOLS_MASTER_REMINDER = [
     '<mcode-tools-master-reminder>',
     'The mcode-tools-master skill and mcode-tools CLI serve two purposes: multimodal generation and understanding, and App/Connector tool discovery and use. Load the skill before running any mcode-tools Bash command.',
@@ -10,21 +11,14 @@ const MCODE_TOOLS_MASTER_REMINDER = [
     'Use this path only when Bash and the Skill are available to this Agent. Otherwise explain that App access is unavailable; do not bypass restrictions or assume a direct-tool fallback.',
     '</mcode-tools-master-reminder>',
 ].join('\n');
-export function withMcodeToolsMasterReminder(input) {
-    const appReminder = input.enabled
-        ? MCODE_TOOLS_MASTER_REMINDER
-        : '<mcode-tools-master-reminder>App = Connector: these names refer to the same connected integration. App/Connector tools require mcode-tools through Bash. The mcode-tools-master Skill is unavailable in this Agent, so App access is unavailable. Do not assume a direct-tool fallback.</mcode-tools-master-reminder>';
-    const existing = unwrapSystemReminder(input.reminderText);
-    const body = existing ? `${existing}\n\n${appReminder}` : appReminder;
-    return `<system-reminder>\n${body}\n</system-reminder>`;
+const MCODE_TOOLS_MASTER_UNAVAILABLE = '<mcode-tools-master-reminder>App = Connector: these names refer to the same connected integration. App/Connector tools require mcode-tools through Bash. The mcode-tools-master Skill is unavailable in this Agent, so App access is unavailable. Do not assume a direct-tool fallback.</mcode-tools-master-reminder>';
+/** The full guidance when the mcode-tools-master Skill is available, otherwise the unavailable note. */
+export function buildMcodeToolsMasterReminderBlock(enabled) {
+    return enabled ? MCODE_TOOLS_MASTER_REMINDER : MCODE_TOOLS_MASTER_UNAVAILABLE;
 }
-function unwrapSystemReminder(text) {
-    const trimmed = text?.trim();
-    if (!trimmed)
-        return '';
-    return trimmed
-        .replace(/^<system-reminder>\s*/u, '')
-        .replace(/\s*<\/system-reminder>$/u, '')
-        .trim();
+export function withMcodeToolsMasterReminder(input) {
+    const appReminder = buildMcodeToolsMasterReminderBlock(input.enabled);
+    const existing = unwrapSystemReminder(input.reminderText);
+    return wrapSystemReminderBlocks(existing ? [existing, appReminder] : [appReminder]);
 }
 //# sourceMappingURL=mcode-tools-master-reminder.js.map

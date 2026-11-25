@@ -26,7 +26,7 @@
  * a cell-structured document by line makes no sense; jq recipes cover the
  * huge-notebook case.
  */
-import { readFile } from './physical-fs.js';
+import { physicalToolFs } from './physical-fs.js';
 import { extname } from 'node:path';
 import { readErrorResult } from './read-result.js';
 /** reference CLI notebook.ts: LARGE_OUTPUT_THRESHOLD */
@@ -37,10 +37,10 @@ export function isNotebookReadPath(filePath) {
     return extname(filePath).toLowerCase() === '.ipynb';
 }
 export async function readNotebookAsToolResult(opts) {
-    const { toolName, absolutePath } = opts;
+    const { toolName, absolutePath, fs = physicalToolFs } = opts;
     let raw;
     try {
-        raw = await readFile(absolutePath, 'utf-8');
+        raw = (await fs.readFile(absolutePath)).toString('utf-8');
     }
     catch (err) {
         const code = err.code;

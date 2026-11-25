@@ -1,0 +1,64 @@
+{
+  "name": "@mavis/harness",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Matrix Harness: host-neutral accepted-work engine (AgentHost kernel + context compaction) shared by local and cloud runtimes.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./compaction": {
+      "import": "./dist/compaction/index.js"
+    },
+    "./testing": {
+      "import": "./dist/testing/index.js"
+    }
+  },
+  "jscpd": {
+    "threshold": 5,
+    "reporters": [
+      "console"
+    ],
+    "minLines": 5,
+    "minTokens": 50,
+    "mode": "mild",
+    "format": [
+      "typescript"
+    ],
+    "ignore": [
+      "src/**/*.test.ts"
+    ]
+  },
+  "knip": {
+    "entry": [
+      "src/index.ts!",
+      "src/compaction/index.ts!",
+      "src/testing/index.ts!",
+      "src/agent-host/runner/ptc/quickjs-worker.ts!"
+    ],
+    "project": [
+      "src/**/*.ts!",
+      "!src/**/*.test.ts!"
+    ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "file:../../@earendil-works/pi-agent-core",
+    "@earendil-works/pi-ai": "file:../../@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent": "file:../../@earendil-works/pi-coding-agent",
+    "@mavis/agent-core": "file:../agent-core",
+    "@mavis/agent-extension": "file:../agent-extension",
+    "@mavis/agent-runtime": "file:../agent-runtime",
+    "@mavis/agent-tools": "file:../agent-tools",
+    "@mavis/config": "file:../config",
+    "@mavis/context-manager": "file:../context-manager",
+    "@mavis/conversation-contract": "file:../conversation-contract",
+    "@mavis/plugin-hooks": "file:../plugin-hooks",
+    "@mavis/protocol": "file:../protocol",
+    "@mavis/shared": "file:../shared",
+    "@mavis/system-reminder": "file:../system-reminder",
+    "@sinclair/typebox": "^0.34.0",
+    "quickjs-emscripten": "0.31.0"
+  }
+}

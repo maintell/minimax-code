@@ -178,9 +178,16 @@ function resolveTransport(providerId, provider) {
         return undefined;
     return { baseUrl: normalizeProviderBaseUrl(apiFormat, baseUrl), apiFormat };
 }
+function isUnsupportedGeminiRealtimeModel(modelId, apiFormat) {
+    return apiFormat === 'google-generative-ai' && /-(?:live|tts)(?:-|$)/iu.test(modelId.trim());
+}
 function parseModel(modelId, value, apiFormat) {
-    if (!modelId.trim() || !isRecord(value) || value.tool_call !== true)
+    if (!modelId.trim() ||
+        !isRecord(value) ||
+        value.tool_call !== true ||
+        isUnsupportedGeminiRealtimeModel(modelId, apiFormat)) {
         return undefined;
+    }
     return {
         modelId,
         displayName: stringValue(value.name) ?? modelId,

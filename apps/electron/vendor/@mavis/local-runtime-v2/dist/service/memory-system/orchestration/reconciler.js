@@ -123,9 +123,14 @@ export class MemoryReconciler {
     }
     /** One round: the fixed sequence from §5.10. */
     async runOneRound(boundary, legacyMigration) {
+        // 没有接入时不多等一拍：轮内唤醒合并依赖本轮同步读取配置的时序。
+        if (this.deps.rollout)
+            await this.deps.rollout.beforeRound();
         const config = this.deps.config();
         if (!config.writeEnabled) {
             this.event('reconciler.skipped', { reason: 'generation-disabled' });
+            // 关闭写入后不会再整理，草稿也不会续跑；草稿里有会话记忆正文的副本，不留在磁盘上。
+            await this.cleanCheckpoints(() => this.deps.consolidation.discardCheckpoints());
             return;
         }
         // Step 1: 读取本轮状态侧工作集。
@@ -133,6 +138,9 @@ export class MemoryReconciler {
         // Step 2: 清理临时文件、孤儿目录，并把镜像补物化到与 DB 一致(§6.4)。
         await this.cleanupOrphanScopeDirs();
         await this.maintainFiles(work, config);
+        // 额度检查之前删掉已经不能续跑的整理草稿：遗忘或 Reset 之后，草稿里的旧内容不该因为额度不足
+        // 跳过整理而一直留在磁盘上。
+        await this.cleanCheckpoints(() => this.deps.consolidation.dropStaleCheckpoints());
         // Step 3/4: 按阶段实际通道检查额度；后续每项新任务再次准入，在途任务继续完成。
         // 任务唤醒同时推进旧记忆迁移；引导刚选择迁移时的专用唤醒只迁移，不扫描历史会话。
         const capturedScopeKeys = new Set();
@@ -611,6 +619,15 @@ export class MemoryReconciler {
             catch (error) {
                 this.deferConsolidation(scopeKey, error);
             }
+        }
+    }
+    /** 整理草稿的清理只删文件、不调用模型；失败只上报，不打断本轮。 */
+    async cleanCheckpoints(clean) {
+        try {
+            await clean();
+        }
+        catch (error) {
+            this.reportFailure(error);
         }
     }
     async cleanupResetFiles(work) {

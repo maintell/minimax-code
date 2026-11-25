@@ -25,4 +25,16 @@ export function createMavisOperationClassifier(allowedValues) {
         },
     };
 }
+/**
+ * A tool split out of the composite mavis runs exactly one command, so its
+ * operation label is that command whatever arguments the call carries. The
+ * label vocabulary stays the mavis command set, so a dashboard reading
+ * `session list` keeps reading it after the command became its own tool.
+ */
+export function fixedOperationClassifier(operation) {
+    return {
+        allowedValues: [operation],
+        classify: () => operation,
+    };
+}
 //# sourceMappingURL=mavis-operation-classifier.js.map

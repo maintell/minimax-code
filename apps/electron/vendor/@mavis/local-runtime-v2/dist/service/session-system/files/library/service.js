@@ -10,9 +10,8 @@ import { readBunnyAssignedSessionIds } from '../../assignment-tasks/repo/assigne
 import { artifactId, artifactView } from './paths.js';
 import { createImportedArtifacts } from './imports.js';
 import { ArtifactCatalogError } from './errors.js';
-import { DEFAULT_SPACE_NAME, spaceDisplayName } from './space-name.js';
 import { readSpaceContext, syncSpaceContextGoal, writeSpaceContext, writeTidiedSpaceContext, } from './space-context.js';
-import { SPACE_ARTIFACTS_DIR, SPACE_IMPORTS_DIR, SPACE_META_FILE, SPACE_STAGING_PREFIX, resolveSpaceDirectory, spaceDirectoryName, spaceStagingDirectory, spacesRoot, trashRoot, } from './space-directory.js';
+import { LEGACY_DEFAULT_SPACE_ID, SPACE_ARTIFACTS_DIR, SPACE_IMPORTS_DIR, SPACE_STAGING_PREFIX, resolveSpaceDirectory, spaceDirectoryName, spaceStagingDirectory, spacesRoot, trashRoot, } from './space-directory.js';
 import { readSpaceMeta, spaceMetaMatches, spaceMetaOf, unclaimedSpaceDirectories, writeSpaceMeta, writeSpaceMetaIn, } from './space-meta.js';
 import { KeyedOperationQueue } from '../../../../infra/util/keyed-operation-queue.js';
 import { logger } from '../../../../infra/logging/logger.js';
@@ -22,6 +21,44 @@ const META_WRITE_FAILED = 'Space meta.json mirror write failed; startup reconcil
 const CONTEXT_SYNC_FAILED = 'Space context.md goal sync failed';
 function errorMessage(error) {
     return error instanceof Error ? error.message : String(error);
+}
+/** How many `<name> (n)` copies an import tries before it gives up. */
+const MAX_IMPORT_NAME_COPIES = 999;
+/**
+ * The file system refused a name for being too long. A name already at the limit imports once, but
+ * a second import of it has to append ` (n)` and no longer fits. Say which of the two happened
+ * instead of letting the raw errno through, where it reads as a 500 and a retry cannot help.
+ */
+function nameTooLong(copy) {
+    return new ArtifactCatalogError(copy === 0
+        ? 'File name is too long for the file system'
+        : `File name is too long to add the " (${copy})" that a same-name import needs`);
+}
+/**
+ * Writes an imported file without replacing one already there. A taken name gets the next free
+ * `<stem> (n)<ext>` the way Finder names downloads: `报告.md`, `报告 (1).md`, `报告 (2).md`.
+ * Each try is an exclusive create, so a file that appears meanwhile is skipped, not overwritten.
+ * Later candidates only grow, so a name the file system refuses ends the search at once.
+ */
+async function writeUnderFreeName(directory, name, data) {
+    const extension = path.extname(name);
+    const stem = name.slice(0, name.length - extension.length);
+    for (let copy = 0; copy <= MAX_IMPORT_NAME_COPIES; copy += 1) {
+        const candidate = copy ? `${stem} (${copy})${extension}` : name;
+        const filePath = path.join(directory, candidate);
+        try {
+            await writeFile(filePath, data, { flag: 'wx' });
+            return { name: candidate, filePath };
+        }
+        catch (error) {
+            const code = error.code;
+            if (code === 'ENAMETOOLONG')
+                throw nameTooLong(copy);
+            if (code !== 'EEXIST')
+                throw error;
+        }
+    }
+    throw new ArtifactCatalogError('Too many files with this name', 409);
 }
 /**
  * Spaces, their session links and the imported files live in the Bunny store
@@ -77,46 +114,20 @@ export class ArtifactLibraryService {
     }
     /** Everything catalog queries in the session database need from the Bunny store. */
     catalogFacts() {
+        const legacyDefault = this.bunny
+            .select({ id: bunnySpaces.id })
+            .from(bunnySpaces)
+            .where(eq(bunnySpaces.id, LEGACY_DEFAULT_SPACE_ID))
+            .get();
         return {
             links: this.spaceLinks(),
             imports: createImportedArtifacts(this.bunny),
+            ...(legacyDefault ? { rootSpaceId: legacyDefault.id } : {}),
             ...this.catalogVisibility(),
         };
     }
-    /**
-     * Creates the default space on first use and mirrors it to meta.json when the mirror is
-     * missing, and gives it a context.md when it has none yet. Request paths use
-     * `ensureDefaultRow`, which never writes a file.
-     */
-    ensureDefault() {
-        return this.spaceWrites.run('default', async () => {
-            this.ensureDefaultRow();
-            const directory = this.directory('default');
-            if (!existsSync(path.join(directory, SPACE_META_FILE)))
-                await this.mirror('default');
-            if (readSpaceContext(directory).source === 'empty')
-                await this.syncContextGoal('default', this.requireSpace('default').objective, {
-                    create: true,
-                });
-        });
-    }
-    ensureDefaultRow() {
-        this.bunny
-            .insert(bunnySpaces)
-            .values({
-            id: 'default',
-            name: DEFAULT_SPACE_NAME,
-            color: 'blue',
-            objective: '',
-            createdAtMs: 0,
-            updatedAtMs: Date.now(),
-        })
-            .onConflictDoNothing()
-            .run();
-    }
     /** Read-only: lists the rows as they are and never creates or repairs a file. */
     summary() {
-        this.ensureDefaultRow();
         const counts = new Map(spaceArtifactCounts(this.db, this.catalogFacts()).map((row) => [row.spaceId, row.count]));
         const spaces = this.bunny
             .select()
@@ -125,7 +136,6 @@ export class ArtifactLibraryService {
             .all()
             .map((space) => ({
             ...space,
-            name: spaceDisplayName(space),
             count: counts.get(space.id) ?? 0,
         }));
         return { spaces };
@@ -135,9 +145,7 @@ export class ArtifactLibraryService {
         return this.spaceWrites.run(id, async () => this.saveSpaceNow(id, input));
     }
     async saveSpaceNow(id, input) {
-        this.ensureDefaultRow();
         const current = input.id ? this.requireSpace(input.id) : undefined;
-        validateDefaultSpace(input);
         const values = spaceChanges(input, current);
         const existing = this.bunny
             .select()
@@ -283,8 +291,6 @@ export class ArtifactLibraryService {
         return this.spaceWrites.run(id, async () => this.deleteSpaceNow(id));
     }
     async deleteSpaceNow(id) {
-        if (id === 'default')
-            throw new ArtifactCatalogError('Bunny 的空间不能删除');
         this.requireSpace(id);
         const directory = this.directory(id);
         // Marked before the row goes, so a crash in between leaves a directory that says why.
@@ -319,41 +325,46 @@ export class ArtifactLibraryService {
             return undefined;
         }
     }
+    /** An imported file always belongs to one space. */
     async importFile(input) {
-        const spaceId = input.spaceId ?? 'default';
+        const spaceId = input.spaceId?.trim();
+        if (!spaceId)
+            throw new ArtifactCatalogError('Space required');
         return this.spaceWrites.run(spaceId, () => this.importFileNow(spaceId, input));
     }
     async importFileNow(spaceId, input) {
         const { name, data, category } = importContents(input);
-        this.ensureDefaultRow();
         this.requireSpace(spaceId);
         const assetKey = randomUUID();
         const workspaceDir = path.join(this.directory(spaceId), SPACE_ARTIFACTS_DIR, SPACE_IMPORTS_DIR);
-        const filePath = path.join(workspaceDir, name);
         const id = artifactId('', assetKey);
         await mkdir(workspaceDir, { recursive: true });
-        await writeFile(filePath, data, { flag: 'wx' });
+        const written = await writeUnderFreeName(workspaceDir, name, data);
         const now = Date.now();
-        this.bunny
-            .insert(bunnyArtifactLibrary)
-            .values({
-            id,
-            assetKey,
-            name,
-            path: filePath,
-            category,
-            workspaceDir,
-            spaceId,
-            importedAtMs: now,
-            updatedAtMs: now,
-        })
-            .run();
+        try {
+            this.bunny
+                .insert(bunnyArtifactLibrary)
+                .values({
+                id,
+                assetKey,
+                name: written.name,
+                path: written.filePath,
+                category,
+                workspaceDir,
+                spaceId,
+                importedAtMs: now,
+                updatedAtMs: now,
+            })
+                .run();
+        }
+        catch (error) {
+            // No row claims the file; leaving it would make a retry land beside it as `<name> (1)`.
+            await rm(written.filePath, { force: true });
+            throw error;
+        }
         return { artifact: await artifactView(this.resolve(id)) };
     }
     requireSpace(id) {
-        // The default space has no migration row; it exists from its first use.
-        if (id === 'default')
-            this.ensureDefaultRow();
         const space = this.bunny.select().from(bunnySpaces).where(eq(bunnySpaces.id, id)).get();
         if (!space)
             throw new ArtifactCatalogError('Space not found', 404);
@@ -505,9 +516,5 @@ export class ArtifactLibraryService {
             throw new ArtifactCatalogError('Artifact not found', 404);
         return row;
     }
-}
-function validateDefaultSpace(input) {
-    if (input.id === 'default' && (input.name !== DEFAULT_SPACE_NAME || input.objective))
-        throw new ArtifactCatalogError('Bunny 的空间不能改名或设置目标');
 }
 //# sourceMappingURL=service.js.map

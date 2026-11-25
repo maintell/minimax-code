@@ -3,6 +3,7 @@ import { readPluginSkill } from '../../skill/reader.js';
 import { canonicalizePluginRoot, isRecord, listDirectChildDirectories, pluginPathExists, readPluginJsonObject, resolvePluginDirectory, resolvePluginFile, } from './filesystem.js';
 import { PluginReaderError, readerFail } from './reader-errors.js';
 import { readCompatiblePluginAgents } from './agent/compatible.js';
+import { compatibleModulesDiagnostics } from './hook/extension.js';
 import { readPluginHooks } from './hook/reader.js';
 const CLAUDE_MANIFEST_PATH = '.\u0063\u006c\u0061\u0075\u0064\u0065-plugin/plugin.json';
 const CODEX_MANIFEST_PATH = '.codex-plugin/plugin.json';
@@ -27,6 +28,7 @@ export async function readCompatiblePluginPackage(packageRoot, options = {}) {
         defaultPath: 'hooks/hooks.json',
         manifestPath: manifestRelativePath,
     });
+    const modulesDiagnostics = compatibleModulesDiagnostics(kind, hookResult.modules);
     const agentResult = kind !== 'CODEX'
         ? await readCompatiblePluginAgents(root, {
             pluginName: name,
@@ -34,10 +36,7 @@ export async function readCompatiblePluginPackage(packageRoot, options = {}) {
             skills,
         })
         : { agents: [], diagnostics: [] };
-    if (mcp.servers.length + skills.length + hookResult.hooks.length + agentResult.agents.length ===
-        0) {
-        readerFail('MANIFEST_SCHEMA_INVALID', 'Compatible Plugin has no supported executable capability');
-    }
+    assertSupportedCapability(kind, mcp.servers.length + skills.length + hookResult.hooks.length + agentResult.agents.length, modulesDiagnostics.length > 0);
     return {
         source: kind === 'CODEX' ? 'LOCAL_CODEX' : 'LOCAL_\u0043\u004c\u0041\u0055\u0044\u0045',
         manifestKind: kind,
@@ -52,8 +51,22 @@ export async function readCompatiblePluginPackage(packageRoot, options = {}) {
         skills,
         hooks: hookResult.hooks,
         ...(agentResult.agents.length > 0 ? { agents: agentResult.agents } : {}),
-        diagnostics: [...mcp.diagnostics, ...hookResult.diagnostics, ...agentResult.diagnostics],
+        diagnostics: [
+            ...mcp.diagnostics,
+            ...hookResult.diagnostics,
+            ...modulesDiagnostics,
+            ...agentResult.diagnostics,
+        ],
     };
+}
+function assertSupportedCapability(kind, capabilityCount, declaresModules) {
+    if (capabilityCount > 0)
+        return;
+    // A mods-only package is rejected for the reason the author can act on.
+    if (kind === 'CLAUDE_CODE' && declaresModules) {
+        readerFail('MODS_NOT_SUPPORTED_YET', 'Compatible Plugin has no supported executable capability; mods are not supported yet');
+    }
+    readerFail('MANIFEST_SCHEMA_INVALID', 'Compatible Plugin has no supported executable capability');
 }
 function compatibleMetadata(manifest, author, iconPath) {
     const displayName = stringValue(manifest.displayName);

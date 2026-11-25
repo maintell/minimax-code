@@ -12,12 +12,12 @@ import { logger } from '../host-utils.js';
 import { DESTRUCTIVE_STANDALONE_COMMANDS, LOCAL_SCRIPT_INTERPRETERS_RE, PIPE_TO_SHELL_PATTERN, SUBCOMMAND_DANGEROUS_PATTERNS, allPipeToShellAreInlineLiteralC, hardBlockedCategoryIsFinalDeny, matchHardBlockedBash, matchSecretReadForm, } from '../classifier/dangerous-patterns.js';
 import { SAFE_BASH_FIRST_WORDS, isDestructiveKillCommand } from './bash-safe-first-words.js';
 import { shellTokenize, shellTokenizeWithMetadata } from './shell-tokenize.js';
-import { isTempDirectory, pathInAllowedWorkingPath, pathInWorkingPath } from './fs-permission.js';
+import { isTempDirectory, pathInAnyWorkingRoot } from './fs-permission.js';
 import { hasWritten } from '../written-files-registry.js';
 import { parseShellRule, compileShellRule, matchShellRule, matchWildcardPattern, } from './bash-rule-match.js';
 import { bashCommandIsSafe, checkDangerousPatterns, commandHasExecutedHeredocBody, getShellPermissionCheckSurface, } from './bash-safety-scan.js';
 import { commandHasIoRedirect, evaluateWriteTarget } from './bash-write-target.js';
-import { pureReadFirstWord, formatHardBlockedBashReason } from './bash-fast-allow.js';
+import { pureReadFirstWord, formatHardBlockedBashReason, normalizedNameCommand, } from './bash-fast-allow.js';
 import { detectSlowCommand } from './slow-command-scan.js';
 import { parseWindowsNativeDelete } from './windows-native-delete.js';
 import { resolvePermissionPath } from '../path-resolver.js';
@@ -94,6 +94,8 @@ const HELP_FLAG_TOKENS = new Set([
     '--help',
     '-h',
     '--version',
+    // Single-dash long form used by java / ffmpeg / go-style CLIs.
+    '-version',
     '-V',
     '-v',
     '-?',
@@ -568,12 +570,7 @@ function isAllowableLocalScript(scriptToken, bashCtx) {
         return false;
     if (isTempDirectory(resolved))
         return true;
-    if (bashCtx.workingDirectory && pathInWorkingPath(resolved, bashCtx.workingDirectory)) {
-        return true;
-    }
-    if (bashCtx.allowedWorkingPaths &&
-        bashCtx.allowedWorkingPaths.length > 0 &&
-        pathInAllowedWorkingPath(resolved, bashCtx.allowedWorkingPaths)) {
+    if (pathInAnyWorkingRoot(resolved, bashCtx.workingDirectory, bashCtx.allowedWorkingPaths)) {
         return true;
     }
     if (hasWritten(bashCtx.sessionId, resolved))
@@ -830,8 +827,9 @@ export function evaluateBashStatic(command, rules, bashCtx, mode) {
             // match is `... | <interp> -c '<literal>'` (or `"..."` containing no
             // `$`/backtick), stdin is data and the program is a fixed argv
             // string. This is the safe shape for `glab api ... | python3 -c ...`
-            // and `... | jq` style pipelines. Raw `... | bash` / `... | python`
-            // still ASK (stdin IS the program).
+            // and `... | jq` style pipelines; `| python3 -m json.tool` is treated
+            // the same. Raw `... | bash` /
+            // `... | python` still ASK (stdin IS the program).
             if (pipeMatch && allPipeToShellAreInlineLiteralC(permissionSurface)) {
                 logger.info({
                     permLayer: 'soft-prescan-relaxed',
@@ -1324,8 +1322,10 @@ function evaluateSingleSubcommand(command, bashRules, mode, bashCtx) {
         });
     }
     // Step 9: fast-allow first-word
-    const firstWord = pureReadFirstWord(command);
-    const safe = firstWord && SAFE_BASH_FIRST_WORDS.has(firstWord);
+    const firstWord = pureReadFirstWord(command, bashCtx);
+    const safe = firstWord &&
+        SAFE_BASH_FIRST_WORDS.has(firstWord) &&
+        !normalizedCommandNameHidesDanger(command, bashCtx);
     const sigkill = isDestructiveKillCommand(command, firstWord);
     if (safe && !commandHasIoRedirect(command, bashCtx) && !sigkill) {
         return logLayer('fast-allow-first-word', {
@@ -1346,6 +1346,22 @@ function evaluateSingleSubcommand(command, bashRules, mode, bashCtx) {
             category: 'noMatchingPermissionRule',
         },
     });
+}
+/**
+ * Earlier layers match danger patterns against the literal text, which
+ * spells the command as `git.exe` or `/usr/bin/git`. When Step 9 recognises
+ * that word as `git`, re-run those name-anchored checks on the normalised
+ * text so `git.exe push` / `/usr/bin/git push --force` cannot ride the
+ * `git` first-word allowance.
+ */
+function normalizedCommandNameHidesDanger(command, bashCtx) {
+    const normalized = normalizedNameCommand(command, bashCtx);
+    if (normalized === undefined)
+        return false;
+    return (SUBCOMMAND_DANGEROUS_PATTERNS.some(({ pattern }) => pattern.test(normalized)) ||
+        Boolean(matchHardBlockedBash(normalized, { nativeDelete: bashCtx?.nativeDelete })) ||
+        Boolean(bashCommandIsSafe(normalized)) ||
+        Boolean(checkDangerousPatterns(normalized, bashCtx)));
 }
 /**
  * Check bash command permission against a set of rules (default mode).

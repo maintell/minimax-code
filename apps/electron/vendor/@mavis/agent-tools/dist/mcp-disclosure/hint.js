@@ -2,7 +2,7 @@ export function renderMcpToolSearchHintBlock(options = {}) {
     const builtinNames = options.builtinToolNames ?? [];
     return [
         '<system-reminder>',
-        'Use `tool_search` to discover permitted on-demand tools for scheduled tasks, session management, and MCP integrations.',
+        'Use `tool_search` to discover permitted on-demand tools for scheduled tasks, session management, Space files, and MCP integrations.',
         ...(builtinNames.length > 0
             ? [
                 `Built-in on-demand tools this turn: ${builtinNames.map((name) => `\`${name}\``).join(', ')}. Search one by name to read its definition before calling it.`,

@@ -5,8 +5,18 @@ const FOUR_DAYS_MS = 4 * DAY_MS;
 const RECENT_CALENDAR_DAYS = 7;
 const EN_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const EN_MONTHS = [
-    'January', 'February', 'March', 'April', 'May', 'June',
-    'July', 'August', 'September', 'October', 'November', 'December',
+    'January',
+    'February',
+    'March',
+    'April',
+    'May',
+    'June',
+    'July',
+    'August',
+    'September',
+    'October',
+    'November',
+    'December',
 ];
 const ZH_WEEKDAYS = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
 const DEFAULT_TIME_ZONE = (() => {
@@ -124,6 +134,34 @@ function formatCommunityTime(timestampMs, nowMs, timestamp, now, locale) {
     }
     return formatDate(timestamp, locale, !sameYear);
 }
+function formatTaskTime(timestampMs, nowMs, timestamp, now, locale) {
+    if (timestampMs > nowMs)
+        return formatDate(timestamp, locale, timestamp.year !== now.year);
+    const elapsedMs = nowMs - timestampMs;
+    if (elapsedMs < MINUTE_MS)
+        return locale === 'zh' ? '刚刚' : 'Now';
+    if (elapsedMs < HOUR_MS) {
+        const minutes = Math.floor(elapsedMs / MINUTE_MS);
+        return locale === 'zh' ? `${minutes}分钟前` : `${minutes}m ago`;
+    }
+    if (elapsedMs < DAY_MS) {
+        const hours = Math.floor(elapsedMs / HOUR_MS);
+        return locale === 'zh' ? `${hours}小时前` : `${hours}h ago`;
+    }
+    const days = Math.floor(elapsedMs / DAY_MS);
+    if (days < 7)
+        return locale === 'zh' ? `${days}天前` : `${days}d ago`;
+    if (days < 30) {
+        const weeks = Math.floor(days / 7);
+        return locale === 'zh' ? `${weeks}周前` : `${weeks}w ago`;
+    }
+    if (days < 365) {
+        const months = Math.floor(days / 30);
+        return locale === 'zh' ? `${months}个月前` : `${months}mo ago`;
+    }
+    const years = Math.floor(days / 365);
+    return locale === 'zh' ? `${years}年前` : `${years}y ago`;
+}
 /**
  * Project-wide UI timestamp calculator.
  *
@@ -163,6 +201,8 @@ export function formatProductTime(timestampMs, options) {
         }
         case 'community-relative':
             return formatCommunityTime(timestampMs, nowMs, timestamp, now, locale);
+        case 'task-relative':
+            return formatTaskTime(timestampMs, nowMs, timestamp, now, locale);
         case 'common-precise':
             return isSameDay(timestamp, now)
                 ? formatTime(timestamp)

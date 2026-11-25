@@ -1,4 +1,4 @@
-import { MarketplaceCategory, PluginInstallationPolicy, } from '@mavis/thrift-gen/generated/desktop-service/types';
+import { MarketplaceCategory, PluginInstallationPolicy, PluginPostInstallActionType, PluginPostInstallBrowser, PluginPostInstallSettingsPage, } from '@mavis/thrift-gen/generated/desktop-service/types';
 const BUILTIN_AGENT_PLUGIN_ICON_URL = 'minimax-builtin://plugin-icons/github';
 const CATEGORY_IDS = {
     Other: MarketplaceCategory.OTHER,
@@ -36,6 +36,28 @@ export function pluginPackageDetail(plugin, installExists, enabled) {
                     description: agent.description,
                     content: agent.content,
                 })),
+            }
+            : {}),
+        ...(plugin.postInstall ? { postInstall: postInstallWire(plugin.postInstall) } : {}),
+    };
+}
+export function postInstallWire(action) {
+    if (action.type === 'openSettings') {
+        return {
+            type: PluginPostInstallActionType.OPEN_SETTINGS,
+            label: action.label,
+            settingsPage: PluginPostInstallSettingsPage.BROWSER,
+        };
+    }
+    return {
+        type: PluginPostInstallActionType.OPEN_URL,
+        label: action.label,
+        url: action.url,
+        ...(action.browser
+            ? {
+                browser: action.browser === 'edge'
+                    ? PluginPostInstallBrowser.EDGE
+                    : PluginPostInstallBrowser.CHROME,
             }
             : {}),
     };

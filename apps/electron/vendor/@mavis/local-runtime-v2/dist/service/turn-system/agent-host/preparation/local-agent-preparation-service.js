@@ -1,13 +1,20 @@
+import { messagesHaveSkillAvailabilityNotice } from '@mavis/agent-tools';
 import { readAdvisorSelection, } from '../../../model-system/index.js';
-import { LocalAgentConfigBuilder, } from './config/local-agent-config-builder.js';
-import { ADVISOR_TOOL_NAME, isLocalTurnBuiltinToolAllowed, } from '../assembly/local-turn-tool-catalog.js';
-import { readAgentProfile } from '../assembly/local-turn-tool-catalog-source.js';
+import { ADVISOR_TOOL_NAME, isLocalTurnBuiltinToolAllowed, readAgentProfile, } from '@mavis/harness';
+import { LocalAgentConfigBuilder, } from './local-agent-config-builder.js';
+import { sessionModelPinRequest, } from './session-model-selection.js';
 /**
  * Conversation preparation owner shared by normal turns, manual compaction,
  * archive title generation and Context Debug.
+ *
+ * It is also the desktop `ModelAccess`: a Turn's model is resolved once, the
+ * preparation returns it without its credential, and `credential()` hands the
+ * credential of that same resolution to the harness. Entries are keyed by the
+ * returned model object and die with it.
  */
 export class LocalAgentPreparationService {
     options;
+    credentials = new WeakMap();
     constructor(options) {
         this.options = options;
     }
@@ -48,6 +55,12 @@ export class LocalAgentPreparationService {
             ...(model ? { model } : {}),
             ...(input.request.clientIntent ? { clientIntent: input.request.clientIntent } : {}),
             ...(input.promptRead ? { promptRead: input.promptRead } : {}),
+            // A continuation resumes the last Turn without a new user message, so it has
+            // nowhere to carry a skill-availability update: it only reads the window.
+            commitSkillCatalog: input.request.executionMode !== 'continuation',
+            skillCatalogHistoryHasNotice: () => messagesHaveSkillAvailabilityNotice(input.history.messages),
+            // Only a real Turn may pin the Session's model; compaction and side builds never do.
+            sessionModelPin: sessionModelPinRequest(input.history.messages),
         });
     }
     prepareCompaction(input) {
@@ -68,16 +81,24 @@ export class LocalAgentPreparationService {
     resolveModel(input) {
         return this.options.modelResolver.resolveModel(input);
     }
+    async credential(model) {
+        const credential = this.credentials.get(model);
+        if (!credential) {
+            throw new Error('LocalAgentPreparationService: the model was not prepared by this service');
+        }
+        return credential;
+    }
     async prepareResolved(input) {
         const built = await this.options.configBuilder.buildPrepared(input);
         const builtAgentConfig = built.agentConfig;
         const agentConfig = Object.freeze({ ...builtAgentConfig });
         const advisor = this.bindAdvisor(input, agentConfig);
-        const llm = await this.resolveModel({
+        const { llm, credential } = splitModelCredential(await this.resolveModel({
             sessionId: input.session.sessionId,
             turnId: input.turnId,
             agentConfig: builtAgentConfig,
-        });
+        }));
+        this.credentials.set(llm, credential);
         return {
             agentConfig,
             ...(built.agentShell ? { agentShell: built.agentShell } : {}),
@@ -91,6 +112,9 @@ export class LocalAgentPreparationService {
                 ? { additionalWorkspaceRoots: built.additionalWorkspaceRoots }
                 : {}),
             ...(advisor ? { advisor } : {}),
+            ...(built.skillAvailabilityNotice
+                ? { skillAvailabilityNotice: built.skillAvailabilityNotice }
+                : {}),
         };
     }
     /**
@@ -123,6 +147,17 @@ export class LocalAgentPreparationService {
             ? '[advisor] the stored advisor model cannot be used; this Turn runs without the advisor'
             : '[advisor] the stored advisor settings no longer apply; this Turn uses the model defaults');
     }
+}
+/** Keeps every credential field that the resolver set, including one set to `undefined`. */
+function splitModelCredential(resolved) {
+    const { apiKey, headers, fetch, fileApiGatewayAuth, ...llm } = resolved;
+    const credential = {
+        ...('apiKey' in resolved ? { apiKey } : {}),
+        ...('headers' in resolved ? { headers } : {}),
+        ...('fetch' in resolved ? { fetch } : {}),
+        ...('fileApiGatewayAuth' in resolved ? { fileApiGatewayAuth } : {}),
+    };
+    return { llm, credential };
 }
 function toModelOverride(model) {
     if (!model)

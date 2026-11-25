@@ -54,7 +54,7 @@ export class HostedReviewCapability {
             userInput: '',
         });
         return {
-            run: async (_ctx, toolInput, signal) => {
+            run: async (_ctx, toolInput, signal, onStarted) => {
                 try {
                     const preparedRead = await prepareReview({
                         workspace: session.workspaceDir,
@@ -77,13 +77,23 @@ export class HostedReviewCapability {
                         preparedRead,
                         parentTurnId: identity.turnId,
                         signal,
+                        onStarted,
                     });
                     if (result.status === 'succeeded') {
                         turn.state.setSubagentResult(result.finalText);
-                        return { status: 'succeeded', mode: 'subagent' };
+                        return {
+                            status: 'succeeded',
+                            mode: 'subagent',
+                            subagentExecutions: result.subagentExecutions,
+                        };
                     }
                     if (result.status === 'aborted') {
-                        return { status: 'failed', mode: 'subagent', errorMessage: 'Review was aborted.' };
+                        return {
+                            status: 'failed',
+                            mode: 'subagent',
+                            errorMessage: 'Review was aborted.',
+                            subagentExecutions: result.subagentExecutions,
+                        };
                     }
                     const inlinePrepared = { ...prepared, mode: 'inline' };
                     const inlineReminder = this.activateReview(turn, inlinePrepared, turn.state.delivery);
@@ -91,6 +101,7 @@ export class HostedReviewCapability {
                         status: 'prepared',
                         mode: 'inline',
                         instruction: [inlineReminder, '', inlinePrepared.request].join('\n'),
+                        subagentExecutions: result.subagentExecutions,
                     };
                 }
                 catch (error) {
@@ -249,13 +260,13 @@ export class HostedReviewCapability {
     runSubagent(turn, request) {
         if (turn.subagentRun)
             return turn.subagentRun;
-        const run = this.executeSubagentWithFallback(request.parent, request.preparedRead, request.parentTurnId, request.signal);
+        const run = this.executeSubagentWithFallback(request.parent, request.preparedRead, request.parentTurnId, { signal: request.signal, onStarted: request.onStarted });
         turn.subagentRun = run;
         return run;
     }
-    async executeSubagentWithFallback(parent, preparedRead, parentTurnId, signal) {
+    async executeSubagentWithFallback(parent, preparedRead, parentTurnId, options) {
         try {
-            return await this.executeSubagent(parent, preparedRead, parentTurnId, signal);
+            return await this.executeSubagent(parent, preparedRead, parentTurnId, options);
         }
         catch (error) {
             return {
@@ -264,7 +275,8 @@ export class HostedReviewCapability {
             };
         }
     }
-    async executeSubagent(parent, preparedRead, parentTurnId, signal) {
+    async executeSubagent(parent, preparedRead, parentTurnId, options) {
+        const { signal, onStarted } = options;
         const conversation = this.options.conversation;
         if (!conversation)
             return { status: 'failed', errorMessage: 'Conversation is unavailable.' };
@@ -316,6 +328,7 @@ export class HostedReviewCapability {
             childTurnId: requestedTurnId,
         });
         let submitted = false;
+        let executions;
         try {
             rememberReviewPromptRead(promptReadHandoff);
             const accepted = await conversation.ingress.submit({
@@ -341,14 +354,32 @@ export class HostedReviewCapability {
                 rebindReviewPromptRead(promptReadHandoff, accepted.turnId);
                 registeredTurnId = accepted.turnId;
             }
-            const result = await waitForReviewCompletion(conversation, child.sessionId, accepted.completion, signal);
-            return reviewSubagentResult(result);
+            const execution = {
+                agent_name: child.agentName,
+                sub_session_id: child.sessionId,
+                sub_turn_id: accepted.turnId,
+                description: preparedRead.prepared.request,
+                status: 'started',
+            };
+            executions = [execution];
+            // Only the accepted child completion is authoritative for execution status.
+            const completion = observeReviewCompletion(accepted.completion, execution);
+            onStarted?.({ ...execution });
+            const result = await waitForReviewCompletion(conversation, child.sessionId, completion, signal);
+            return {
+                ...reviewSubagentResult(result),
+                subagentExecutions: executions.map((entry) => ({ ...entry })),
+            };
         }
         catch (error) {
             if (!submitted)
                 attribution?.forgetRound(requestedTurnId);
             discardReviewPromptRead(promptReadHandoff, registeredTurnId);
-            throw error;
+            return {
+                status: 'failed',
+                errorMessage: reviewExecutionErrorMessage(error),
+                subagentExecutions: executions?.map((entry) => ({ ...entry })),
+            };
         }
     }
 }
@@ -371,5 +402,13 @@ function reviewTrigger(intent) {
 }
 function turnKey(identity) {
     return `${identity.sessionId}\u0000${identity.turnId}`;
+}
+async function observeReviewCompletion(completion, execution) {
+    const result = await completion;
+    execution.status = result.status === 'completed' ? 'succeeded' : result.status;
+    return result;
+}
+function reviewExecutionErrorMessage(error) {
+    return error instanceof Error ? error.message : String(error);
 }
 //# sourceMappingURL=hosted-capability.js.map

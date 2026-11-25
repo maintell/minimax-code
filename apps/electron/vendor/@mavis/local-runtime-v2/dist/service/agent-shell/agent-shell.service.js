@@ -218,6 +218,10 @@ export class AgentShellService {
      * Actual execution still validates the fixed binary; failure never selects another shell
      * family. When the bound executable no longer exists (for example a PowerShell MSI install
      * replaced by MSIX), the Session is rebound to a discovered executable of the same family.
+     * A timed-out probe only means the machine did not finish the fixed probe in time (for Git Bash
+     * it may not have got past `git.exe --version`, and an externally killed probe also reports a
+     * timeout). The binding was already validated when it was captured, so a slow machine runs the
+     * command with that shell instead of failing every Bash call; the command keeps its own timeout.
      */
     async resolveForExecution(sessionId) {
         if (this.options.platform !== 'win32')
@@ -229,6 +233,10 @@ export class AgentShellService {
         if (matchesBinding(shell, candidate))
             return { ...shell, version: candidate.version };
         const reason = executionFailureReason(candidate);
+        if (reason === 'probe-timed-out') {
+            logger.warn({ sessionId, family: shell.family, reason }, '[agent-shell] execution shell probe timed out; running with the bound shell');
+            return shell;
+        }
         if (reason === 'not-installed') {
             const rebound = await this.rebindMissingShell(sessionId, shell);
             if (rebound)
@@ -237,7 +245,7 @@ export class AgentShellService {
         logger.warn({ sessionId, family: shell.family, reason }, '[agent-shell] execution shell validation failed');
         const recovery = reason === 'not-installed'
             ? `install ${shell.family} again and retry; no new conversation is needed`
-            : 'restore the session shell to run commands';
+            : `make sure ${shell.family} starts normally on this computer and retry; no new conversation is needed`;
         throw new Error(`AGENT_SHELL_UNAVAILABLE: ${shell.family} (${reason}); ${recovery}; conversation and other tools remain available`);
     }
     async probe(shell) {

@@ -33,25 +33,17 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
     return useValue ? value : void 0;
 };
 import { Type } from '@sinclair/typebox';
-import { createReadStream } from 'node:fs';
-import { lstat, readdir, realpath } from 'node:fs/promises';
 import { isAbsolute, join, relative, sep } from 'node:path';
-import JSZip from 'jszip';
 import { bindTool, } from '@mavis/agent-core/tools';
 import { logger } from './runtime-types.js';
-import { resolveWithinWorkspace } from './path-guard.js';
+import { createLocalWebsiteDeployFiles, } from './website-deploy-files.js';
 import { ENTITLEMENT_LIMIT_EXCEEDED_ERROR_CODE, WEBSITE_ENTITLEMENT_LIMIT_EXCEEDED_CODE, buildEntitlementLimitReachedEvent, parseEntitlementDenial, websiteDeployEntitlementLimitText, } from '../shared/entitlement.js';
 const ARCHIVE_MIME = 'application/zip';
 const MAX_ARCHIVE_BYTES = 200 * 1024 * 1024;
 const ARCHIVE_REQUEST_TIMEOUT_MS = 1_500_000;
 const GET_UPLOAD_URL_PATH = '/matrix/api/v1/mcp/get_upload_url';
 const PUBLISH_WEBSITE_ARCHIVE_PATH = '/matrix/api/v1/mcp/publish_website_archive';
-const IGNORE_NAMES = [
-    /^\.git$/u,
-    /^node_modules$/u,
-    /^\.DS_Store$/u,
-    /^\.env(\..+)?$/u,
-];
+export { isWebsiteDeployIgnoredName, } from './website-deploy-files.js';
 export const WebsiteDeployToolDef = {
     name: 'website_deploy',
     description: '⚠️ **Public deployment — user confirmation required.** This tool publishes the ' +
@@ -109,10 +101,12 @@ let CloudWebsiteDeployTool = (() => {
             __runInitializers(_classThis, _classExtraInitializers);
         }
         archonServer;
-        workspaceRoot;
-        constructor(archonServer, workspaceRoot) {
+        deployFiles;
+        constructor(archonServer, workspaceRoot, 
+        /** 缺省直接读写本机 workspace；cloud-harness-server 传入走 compute 的实现。 */
+        deployFiles = createLocalWebsiteDeployFiles(workspaceRoot)) {
             this.archonServer = archonServer;
-            this.workspaceRoot = workspaceRoot;
+            this.deployFiles = deployFiles;
         }
         async execute(ctx, input, signal) {
             if (signal?.aborted) {
@@ -129,21 +123,22 @@ let CloudWebsiteDeployTool = (() => {
                     reason: 'invalid_source_path',
                 });
             }
-            const dir = await resolveDeployDirectory(input.path, this.workspaceRoot, 'path');
+            const files = this.deployFiles;
+            const dir = await resolveDeployDirectory(files, input.path, 'path');
             if (!dir.ok)
                 return aiReadableFailure(dir.message, dir.details);
-            const index = await validateIndex(dir.path, input.path);
+            const index = await validateIndex(files, dir.path, input.path);
             if (!index.ok)
                 return aiReadableFailure(index.message, index.details);
-            const sourceDir = await resolveDeployDirectory(sourcePath, this.workspaceRoot, 'source');
+            const sourceDir = await resolveDeployDirectory(files, sourcePath, 'source');
             if (!sourceDir.ok)
                 return aiReadableFailure(sourceDir.message, sourceDir.details);
             let canonicalSite;
             let canonicalSource;
             try {
                 [canonicalSite, canonicalSource] = await Promise.all([
-                    realpath(dir.path),
-                    realpath(sourceDir.path),
+                    files.realpath(dir.path),
+                    files.realpath(sourceDir.path),
                 ]);
             }
             catch {
@@ -157,11 +152,11 @@ let CloudWebsiteDeployTool = (() => {
             let siteFiles;
             let sourceFiles;
             try {
-                siteFiles = await walkDeployableFiles(dir.path, signal);
+                siteFiles = await files.list(dir.path, signal);
                 sourceFiles =
                     canonicalSite === canonicalSource
                         ? siteFiles
-                        : await walkDeployableFiles(sourceDir.path, signal, dir.path);
+                        : await files.list(sourceDir.path, signal, dir.path);
             }
             catch {
                 if (signal?.aborted) {
@@ -188,6 +183,7 @@ let CloudWebsiteDeployTool = (() => {
             }
             const siteUpload = await uploadArchive({
                 archonServer: this.archonServer,
+                deployFiles: files,
                 files: siteFiles,
                 filename: 'website.zip',
                 signal,
@@ -197,6 +193,7 @@ let CloudWebsiteDeployTool = (() => {
                 return archiveUploadFailure(siteUpload);
             const sourceUpload = await uploadArchive({
                 archonServer: this.archonServer,
+                deployFiles: files,
                 files: sourceFiles,
                 filename: 'website-source.zip',
                 signal,
@@ -264,11 +261,11 @@ let CloudWebsiteDeployTool = (() => {
     return CloudWebsiteDeployTool = _classThis;
 })();
 export { CloudWebsiteDeployTool };
-async function resolveDeployDirectory(inputPath, workspaceRoot, kind) {
+async function resolveDeployDirectory(files, inputPath, kind) {
     const label = kind === 'source' ? 'source_path' : 'path';
     let path;
     try {
-        path = await resolveWithinWorkspace(inputPath, workspaceRoot);
+        path = await files.resolve(inputPath);
     }
     catch {
         return {
@@ -277,107 +274,70 @@ async function resolveDeployDirectory(inputPath, workspaceRoot, kind) {
             details: { reason: kind === 'source' ? 'source_path_escape' : 'path_escape' },
         };
     }
+    let type;
     try {
-        const info = await lstat(path);
-        if (info.isDirectory())
-            return { ok: true, path };
-        return {
-            ok: false,
-            message: kind === 'source'
-                ? `Cannot deploy: '${inputPath}' is not a real source directory.`
-                : `Cannot deploy: '${inputPath}' is not a directory. Pass the built site directory.`,
-            details: { reason: kind === 'source' ? 'source_not_a_directory' : 'not_a_directory' },
-        };
+        type = await files.typeOf(path);
     }
-    catch (error) {
-        if (error.code === 'ENOENT') {
-            return {
-                ok: false,
-                message: kind === 'source'
-                    ? `Cannot deploy: '${inputPath}' does not exist.`
-                    : `Cannot deploy: '${inputPath}' does not exist. Run the build first, then pass its output directory.`,
-                details: { reason: kind === 'source' ? 'source_not_found' : 'not_found' },
-            };
-        }
+    catch {
         return {
             ok: false,
             message: `Cannot deploy: unable to read '${label}'. Check the path and permissions, then retry.`,
             details: { reason: kind === 'source' ? 'source_stat_failed' : 'stat_failed' },
         };
     }
-}
-async function validateIndex(dir, inputPath) {
-    try {
-        const info = await lstat(join(dir, 'index.html'));
-        if (info.isFile())
-            return { ok: true };
+    if (type === 'dir')
+        return { ok: true, path };
+    if (type === undefined) {
         return {
             ok: false,
-            message: `Cannot deploy: '${inputPath}/index.html' exists but is not a regular file.`,
-            details: { reason: 'index_not_a_file' },
+            message: kind === 'source'
+                ? `Cannot deploy: '${inputPath}' does not exist.`
+                : `Cannot deploy: '${inputPath}' does not exist. Run the build first, then pass its output directory.`,
+            details: { reason: kind === 'source' ? 'source_not_found' : 'not_found' },
         };
     }
-    catch (error) {
-        if (error.code === 'ENOENT') {
-            return {
-                ok: false,
-                message: `Cannot deploy: '${inputPath}' has no index.html at the root. website_deploy needs ` +
-                    'a built static site (a bundler dist/ output), not source code or an unbuilt project.',
-                details: { reason: 'missing_index_html' },
-            };
-        }
+    return {
+        ok: false,
+        message: kind === 'source'
+            ? `Cannot deploy: '${inputPath}' is not a real source directory.`
+            : `Cannot deploy: '${inputPath}' is not a directory. Pass the built site directory.`,
+        details: { reason: kind === 'source' ? 'source_not_a_directory' : 'not_a_directory' },
+    };
+}
+async function validateIndex(files, dir, inputPath) {
+    let type;
+    try {
+        type = await files.typeOf(join(dir, 'index.html'));
+    }
+    catch {
         return {
             ok: false,
             message: `Cannot deploy: unable to read '${inputPath}/index.html'.`,
             details: { reason: 'index_stat_failed' },
         };
     }
-}
-async function walkDeployableFiles(rootDir, signal, excludedDir) {
-    const rootReal = await realpath(rootDir);
-    const excludedReal = excludedDir ? await realpath(excludedDir) : undefined;
-    const files = [];
-    const stack = [rootReal];
-    while (stack.length > 0) {
-        if (signal?.aborted)
-            throw new Error('aborted');
-        const dir = stack.pop();
-        if (!dir)
-            break;
-        const entries = await readdir(dir, { withFileTypes: true });
-        for (const entry of entries) {
-            if (IGNORE_NAMES.some((pattern) => pattern.test(entry.name)))
-                continue;
-            const absPath = join(dir, entry.name);
-            if (entry.isSymbolicLink())
-                continue;
-            if (entry.isDirectory()) {
-                const realDir = await realpath(absPath);
-                if (excludedReal && realDir === excludedReal)
-                    continue;
-                stack.push(realDir);
-                continue;
-            }
-            if (!entry.isFile())
-                continue;
-            const info = await lstat(absPath);
-            if (!info.isFile())
-                continue;
-            files.push({
-                absPath,
-                relPath: relative(rootReal, absPath).split(sep).join('/'),
-                bytes: info.size,
-            });
-        }
+    if (type === 'file')
+        return { ok: true };
+    if (type === undefined) {
+        return {
+            ok: false,
+            message: `Cannot deploy: '${inputPath}' has no index.html at the root. website_deploy needs ` +
+                'a built static site (a bundler dist/ output), not source code or an unbuilt project.',
+            details: { reason: 'missing_index_html' },
+        };
     }
-    return files;
+    return {
+        ok: false,
+        message: `Cannot deploy: '${inputPath}/index.html' exists but is not a regular file.`,
+        details: { reason: 'index_not_a_file' },
+    };
 }
 async function uploadArchive(input) {
     if (input.signal?.aborted)
         return { ok: false, reason: 'aborted', stage: input.stage };
     let archive;
     try {
-        archive = await packZip(input.files, input.signal);
+        archive = await input.deployFiles.pack(input.files, input.signal);
     }
     catch {
         return {
@@ -386,12 +346,20 @@ async function uploadArchive(input) {
             stage: input.stage,
         };
     }
+    try {
+        return await sendArchive(input, archive);
+    }
+    finally {
+        await archive.dispose();
+    }
+}
+async function sendArchive(input, archive) {
     let prepared;
     try {
         prepared = await input.archonServer.postJson(GET_UPLOAD_URL_PATH, {
             filename: input.filename,
             mime_type: ARCHIVE_MIME,
-            size_bytes: archive.byteLength,
+            size_bytes: archive.bytes,
             category: 'website',
         }, input.signal, { timeoutMs: ARCHIVE_REQUEST_TIMEOUT_MS });
     }
@@ -409,22 +377,16 @@ async function uploadArchive(input) {
     if (code !== 0 || !putUrl || !ossKey || input.differentFromOssKey === ossKey) {
         return { ok: false, reason: 'upload_url_rejected', stage: input.stage };
     }
-    const timeoutSignal = AbortSignal.timeout(ARCHIVE_REQUEST_TIMEOUT_MS);
-    const putSignal = input.signal ? AbortSignal.any([input.signal, timeoutSignal]) : timeoutSignal;
     try {
-        const response = await fetch(putUrl, {
-            method: 'PUT',
-            headers: { 'Content-Type': ARCHIVE_MIME },
-            // Copy into a plain Uint8Array so the DOM `fetch` BodyInit contract is
-            // satisfied across Node 22's generic Buffer typings.
-            body: new Uint8Array(archive),
-            signal: putSignal,
+        const uploaded = await archive.put(putUrl, {
+            contentType: ARCHIVE_MIME,
+            timeoutMs: ARCHIVE_REQUEST_TIMEOUT_MS,
+            ...(input.signal ? { signal: input.signal } : {}),
         });
         if (input.signal?.aborted)
             return { ok: false, reason: 'aborted', stage: input.stage };
-        if (timeoutSignal.aborted || !response.ok) {
+        if (!uploaded)
             return { ok: false, reason: 'oss_upload_failed', stage: input.stage };
-        }
     }
     catch {
         return {
@@ -434,22 +396,6 @@ async function uploadArchive(input) {
         };
     }
     return { ok: true, ossKey };
-}
-async function packZip(files, signal) {
-    const zip = new JSZip();
-    for (const file of files) {
-        if (signal?.aborted)
-            throw new Error('aborted');
-        zip.file(file.relPath, createReadStream(file.absPath));
-    }
-    const archive = await zip.generateAsync({
-        type: 'nodebuffer',
-        compression: 'DEFLATE',
-        compressionOptions: { level: 6 },
-    });
-    if (signal?.aborted)
-        throw new Error('aborted');
-    return archive;
 }
 function archiveSizeFailure(kind, bytes, count) {
     if (count === 0) {

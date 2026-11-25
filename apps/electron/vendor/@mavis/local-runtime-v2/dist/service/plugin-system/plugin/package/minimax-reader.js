@@ -7,10 +7,12 @@ import { readMiniMaxPluginAgents } from './agent/minimax.js';
 import { readOptionalMiniAppContribution } from './miniapp/reader.js';
 import { PluginPackageContractError } from './package-contract.js';
 import { ignoredManifestFieldDiagnostics, PluginReaderError, readerFail } from './reader-errors.js';
+import { readMiniMaxExtension } from './hook/extension.js';
 import { readPluginHooks } from './hook/reader.js';
 import { MARKETPLACE_CATEGORY_NAMES, } from './types.js';
 const MANIFEST_PATH = '.minimax-plugin/plugin.json';
 const PLUGIN_NAME = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/u;
+const MAX_PLUGIN_NAME_LENGTH = 80;
 const SEMVER = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-((?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/u;
 const ICON_PATH = /^(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.(?:png|jpe?g|webp)$/u;
 const APP_PATH = /^(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.app\.json$/u;
@@ -49,7 +51,12 @@ const MANIFEST_FIELDS = new Set([
     'hooks',
     'hostBindings',
     'agents',
+    'postInstall',
 ]);
+/** The manifest `name` rule; a name that passes it is also a safe path segment. */
+export function isMiniMaxPluginName(name) {
+    return name.length <= MAX_PLUGIN_NAME_LENGTH && PLUGIN_NAME.test(name);
+}
 export async function readMiniMaxPluginPackage(packageRoot, options) {
     const root = await canonicalizePluginRoot(packageRoot, { rejectSymlink: true });
     const { path: manifestPath, value } = await readPluginJsonObject(root, MANIFEST_PATH, {
@@ -71,16 +78,13 @@ export async function readMiniMaxPluginPackage(packageRoot, options) {
     })));
     assertUniqueNames(skills, 'Skill', (skill) => skill.name);
     const hostBindings = await readPluginHostBindings(root, manifest.hostBindings);
-    const skillNames = new Set(skills.map((skill) => skill.name));
-    const invalidBinding = hostBindings.find((binding) => binding.requiredSkills.some((skill) => !skillNames.has(skill)));
-    if (invalidBinding) {
-        readerFail('HOST_BINDING_SKILL_MISSING', `Host Binding ${invalidBinding.bindingId} references an undeclared Skill`);
-    }
+    assertHostBindingSkills(hostBindings, new Set(skills.map((skill) => skill.name)));
     const hookResult = await readPluginHooks(root, {
         pluginName: manifest.name,
         declared: manifest.hooks,
         sourceFormat: 'MINIMAX',
     });
+    const extensionResult = await readMiniMaxExtension(root, hookResult.modules);
     const agentResult = await readMiniMaxPluginAgents(root, {
         pluginName: manifest.name,
         declared: manifest.agents,
@@ -88,16 +92,15 @@ export async function readMiniMaxPluginPackage(packageRoot, options) {
     });
     const miniapp = await readOptionalMiniAppContribution(root.path, mcpServers.map((server) => server.name));
     assertRequiredMiniApp(miniapp, options.requireMiniApp);
-    if (apps.length +
+    const postInstall = readPostInstall(value.postInstall, options.source);
+    const capabilityCount = apps.length +
         mcpServers.length +
         skills.length +
         hostBindings.length +
         hookResult.hooks.length +
-        agentResult.agents.length ===
-        0 &&
-        !miniapp) {
-        failWithoutCapability(appResult.diagnostics);
-    }
+        agentResult.agents.length;
+    const declaredHooks = options.extensionCandidate && manifest.hooks.length > 0 ? manifest.hooks : undefined;
+    assertExecutableCapability(capabilityCount, [miniapp, extensionResult.extension, declaredHooks], appResult.diagnostics);
     return {
         source: options.source,
         manifestKind: 'MINIMAX',
@@ -118,15 +121,24 @@ export async function readMiniMaxPluginPackage(packageRoot, options) {
         skills,
         hostBindings,
         hooks: hookResult.hooks,
+        ...(extensionResult.extension ? { extension: extensionResult.extension } : {}),
         ...(agentResult.agents.length > 0 ? { agents: agentResult.agents } : {}),
         ...(miniapp ? { miniapp } : {}),
+        ...optionalPostInstall(postInstall.action),
         diagnostics: [
             ...appResult.diagnostics,
+            ...postInstall.diagnostics,
             ...hookResult.diagnostics,
+            ...extensionResult.diagnostics,
             ...agentResult.diagnostics,
             ...ignoredManifestFieldDiagnostics(value, MANIFEST_FIELDS),
         ],
     };
+}
+function assertExecutableCapability(capabilityCount, contributions, appDiagnostics) {
+    if (capabilityCount === 0 && contributions.every((contribution) => !contribution)) {
+        failWithoutCapability(appDiagnostics);
+    }
 }
 /** An App-only package whose every reference was skipped reports why, not just emptiness. */
 function failWithoutCapability(appDiagnostics) {
@@ -186,6 +198,13 @@ async function readPluginHostBindings(root, relativePaths) {
     assertUniqueHostBindingValues(bindings.map((binding) => binding.bindingId), 'bindingId');
     assertUniqueHostBindingValues(bindings.map((binding) => binding.logicalToolName), 'logicalToolName');
     return bindings;
+}
+/** A Host Binding may only require Skills the same package declares. */
+function assertHostBindingSkills(hostBindings, skillNames) {
+    const invalidBinding = hostBindings.find((binding) => binding.requiredSkills.some((skill) => !skillNames.has(skill)));
+    if (invalidBinding) {
+        readerFail('HOST_BINDING_SKILL_MISSING', `Host Binding ${invalidBinding.bindingId} references an undeclared Skill`);
+    }
 }
 function readHostBinding(value, sourcePath) {
     if (Object.keys(value).some((key) => !HOST_BINDING_FIELDS.has(key)) ||
@@ -287,7 +306,7 @@ function assertManifestEnvelope(value) {
 }
 function readManifestIdentity(value) {
     const name = requiredString(value.name, 'name');
-    if (name.length > 80 || !PLUGIN_NAME.test(name)) {
+    if (!isMiniMaxPluginName(name)) {
         readerFail('MANIFEST_SCHEMA_INVALID', 'MiniMax Plugin name is invalid');
     }
     const version = requiredString(value.version, 'version');
@@ -385,5 +404,85 @@ function resolveHostCapabilities(source, bindings) {
         bindings.some((binding) => binding.hostCapability.id === 'computer.use' && binding.hostCapability.version === 1)
         ? ['computer-use']
         : [];
+}
+const POST_INSTALL_FIELDS = {
+    openUrl: new Set(['type', 'label', 'url', 'browser']),
+    openSettings: new Set(['type', 'label', 'page']),
+};
+const POST_INSTALL_LABEL_MAX = 40;
+const POST_INSTALL_URL_MAX = 2048;
+/** A named browser only opens that vendor's extension store. */
+const POST_INSTALL_BROWSER_HOSTS = {
+    chrome: 'chromewebstore.google.com',
+    edge: 'microsoftedge.microsoft.com',
+};
+/** An absent action contributes no key, so every projection stays exact-optional. */
+function optionalPostInstall(action) {
+    return action ? { postInstall: action } : {};
+}
+/**
+ * `postInstall` sends the user to an external page from a button that looks like part of the
+ * install, so only an official package may declare it: a local or imported package never reaches
+ * that projection, and its declaration is dropped with a diagnostic. Within that boundary it is an
+ * optional convenience, so a malformed declaration never blocks installation: it is dropped and
+ * reported too. Only https URLs are accepted, and a named browser is limited to its own extension
+ * store host. `openSettings` names one Host settings page and carries no URL.
+ */
+function readPostInstall(value, source) {
+    if (value === undefined)
+        return { diagnostics: [] };
+    if (source !== 'OFFICIAL') {
+        return { diagnostics: [{ code: 'POST_INSTALL_SOURCE_IGNORED', name: 'postInstall' }] };
+    }
+    const action = parsePostInstall(value);
+    return action
+        ? { action, diagnostics: [] }
+        : { diagnostics: [{ code: 'POST_INSTALL_INVALID_IGNORED', name: 'postInstall' }] };
+}
+function parsePostInstall(value) {
+    if (!isRecord(value))
+        return undefined;
+    const { type } = value;
+    if (type !== 'openUrl' && type !== 'openSettings')
+        return undefined;
+    if (Object.keys(value).some((key) => !POST_INSTALL_FIELDS[type].has(key)))
+        return undefined;
+    const label = postInstallLabel(value.label);
+    if (!label)
+        return undefined;
+    if (type === 'openSettings') {
+        return value.page === 'browser' ? { type, label, page: 'browser' } : undefined;
+    }
+    return parseOpenUrlPostInstall(value, label);
+}
+function parseOpenUrlPostInstall(value, label) {
+    const url = postInstallUrl(value.url);
+    if (!url)
+        return undefined;
+    if (value.browser === undefined)
+        return { type: 'openUrl', label, url: url.href };
+    const browser = postInstallBrowser(value.browser);
+    if (!browser || url.hostname !== POST_INSTALL_BROWSER_HOSTS[browser])
+        return undefined;
+    return { type: 'openUrl', label, url: url.href, browser };
+}
+function postInstallLabel(value) {
+    const label = typeof value === 'string' ? value.trim() : '';
+    return label && label.length <= POST_INSTALL_LABEL_MAX ? label : undefined;
+}
+function postInstallUrl(value) {
+    if (typeof value !== 'string' || value.length > POST_INSTALL_URL_MAX)
+        return undefined;
+    let url;
+    try {
+        url = new URL(value);
+    }
+    catch {
+        return undefined;
+    }
+    return url.protocol === 'https:' && !url.username && !url.password ? url : undefined;
+}
+function postInstallBrowser(value) {
+    return value === 'chrome' || value === 'edge' ? value : undefined;
 }
 //# sourceMappingURL=minimax-reader.js.map

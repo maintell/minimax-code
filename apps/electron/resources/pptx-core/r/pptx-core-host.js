@@ -2001,6 +2001,7 @@ var init_pptx_preview_limits_generated = __esm({
       maxInputBytes: 134217728,
       maxEntries: 4e3,
       maxEntryUncompressedBytes: 33554432,
+      maxStoredMediaEntryBytes: 67108864,
       maxTotalUncompressedBytes: 268435456,
       maxMediaBytes: 201326592,
       maxConcurrentEntryReads: 8,
@@ -9319,7 +9320,7 @@ function textSpacing(elementRows, paragraphProperties2, localName) {
   }
   if (percent) {
     const value1000 = percentageAttribute(percent, "val");
-    if (value1000 === null || value1000 < 0 || value1000 > 201e3) {
+    if (value1000 === null || value1000 < 0 || value1000 > 132e5) {
       throw new RangeError(`DrawingML ${localName} percent spacing is invalid`);
     }
     return Object.freeze({ kind: "percent", value1000 });
@@ -11194,10 +11195,11 @@ function relativePartTargetV1(source, target) {
   return "../".repeat(from.length) + to.join("/");
 }
 var PptPackagePatchBuilderV1 = class {
-  constructor(base, io, sourceHas) {
+  constructor(base, io, sourceHas, presentationPartUri = "ppt/presentation.xml") {
     this.base = base;
     this.io = io;
     this.sourceHas = sourceHas;
+    this.presentationPartUri = presentationPartUri;
     for (const part of base.replacements) this.parts.set(part.partUri, part);
   }
   parts = /* @__PURE__ */ new Map();
@@ -15250,7 +15252,7 @@ async function planPptPagesV1(baseline, current, builder, baselineIO, clipboardS
   const originalOrder = baseline.slides.map((slide) => slide.nodeId);
   const nextOrder = current.slides.map((slide) => slide.nodeId);
   const orderChanged = JSON.stringify(originalOrder) !== JSON.stringify(nextOrder);
-  const presentationPart = "ppt/presentation.xml";
+  const presentationPart = builder.presentationPartUri;
   let original = decode(await builder.read(presentationPart));
   let root = parsePptXmlV1(original);
   let list = pptXmlChildV1(root, PRESENTATIONML_NS, "sldIdLst");
@@ -15338,7 +15340,8 @@ async function planPptPagesV1(baseline, current, builder, baselineIO, clipboardS
         const sourceBuilder = new PptPackagePatchBuilderV1(
           { ...builder.plan(), replacements: [] },
           { readPart: builder.read, digest: builder.digest },
-          builder.has
+          builder.has,
+          builder.presentationPartUri
         );
         const mapping = /* @__PURE__ */ new Map([[source.sourcePartUri, slide.sourcePartUri]]);
         await cloneDependencies(
@@ -15391,6 +15394,7 @@ async function planPptPagesV1(baseline, current, builder, baselineIO, clipboardS
 }
 
 // src/editing/clipboard-source.ts
+init_pptx_rendering();
 function clipboardDocumentDescriptorV1(document) {
   const { getSlide, resolve, themes, masters, layouts, resources, ...data } = document;
   const snapshot = JSON.parse(
@@ -15410,11 +15414,20 @@ function clipboardDocumentDescriptorV1(document) {
 function sourceForRelationshipPart(uri) {
   return uri === "_rels/.rels" ? "" : uri.replace(/(^|\/)_rels\//u, "$1").slice(0, -5);
 }
+var PPT_CLIPBOARD_MAX_TRANSFER_BYTES = 128 * 1024 * 1024;
+function assertPptClipboardPartsWithinLimitsV1(parts) {
+  let total = 0;
+  for (const { bytes } of parts) {
+    total += bytes.byteLength;
+    if (total > PPT_CLIPBOARD_MAX_TRANSFER_BYTES || bytes.byteLength > PPTX_PREVIEW_LIMITS_V1.maxEntryUncompressedBytes)
+      throw new Error("resource_limit_exceeded");
+  }
+}
 function materializePptClipboardSourceV1(input, key3) {
   if (input?.schema !== "mavis.ppt_clipboard.v1" || !["objects", "slides"].includes(input.kind) || !Array.isArray(input.selectedIds) || !input.selectedIds.length || input.selectedIds.length > 256 || !Array.isArray(input.parts) || input.parts.length > 4e3 || !/^\w{16}$/u.test(key3))
     throw new Error("invalid_transaction");
-  if (JSON.stringify(input.document).length > 8e6 || input.parts.reduce((sum, part) => sum + part.bytes.byteLength, 0) > 128 * 1024 * 1024)
-    throw new Error("resource_limit_exceeded");
+  if (JSON.stringify(input.document).length > 8e6) throw new Error("resource_limit_exceeded");
+  assertPptClipboardPartsWithinLimitsV1(input.parts);
   const prefix = `ppt/clipboard-${key3}/`;
   const uris = /* @__PURE__ */ new Map();
   const handles = /* @__PURE__ */ new Map();
@@ -15513,7 +15526,7 @@ function materializePptClipboardSourceV1(input, key3) {
     selectedIds,
     document,
     parts: new ImmutableReadonlyMap(parts),
-    presentationPartUri: uris.get("ppt/presentation.xml")
+    presentationPartUri: uris.get(input.presentationPartUri ?? "ppt/presentation.xml")
   };
 }
 function mergeClipboardCatalogsV1(document, source) {
@@ -15623,8 +15636,8 @@ function selfContainedPptFragmentV1(raw, namespaces) {
 }
 async function registerMaster(source, uri, builder) {
   const id2 = `rIdMavisMaster${source.key}${stableHashTextV1(uri)}`;
-  await builder.relationship("ppt/presentation.xml", id2, uri, `${OFFICE_RELATIONSHIPS_NS}/slideMaster`);
-  const raw = decode2(await builder.read("ppt/presentation.xml"));
+  await builder.relationship(builder.presentationPartUri, id2, uri, `${OFFICE_RELATIONSHIPS_NS}/slideMaster`);
+  const raw = decode2(await builder.read(builder.presentationPartUri));
   const root = parsePptXmlV1(raw);
   const list = pptXmlChildV1(root, PRESENTATIONML_NS, "sldMasterIdLst");
   if (list?.children.some((child2) => child2.attributes[`{${OFFICE_RELATIONSHIPS_NS}}id`] === id2)) return;
@@ -15643,7 +15656,7 @@ async function registerMaster(source, uri, builder) {
       xml: `<p:sldMasterIdLst xmlns:p="${PRESENTATIONML_NS}">${child}</p:sldMasterIdLst>`
     }
   ]);
-  await builder.set("ppt/presentation.xml", encode2(xml));
+  await builder.set(builder.presentationPartUri, encode2(xml));
 }
 async function copyPptClipboardClosureV1(source, uri, destination, builder, mapping = /* @__PURE__ */ new Map(), visiting = /* @__PURE__ */ new Set()) {
   const prior = mapping.get(uri);
@@ -15699,7 +15712,7 @@ async function registerPptClipboardGlobalsV1(source, builder) {
     for (const font of fontList.children) {
       const name = pptXmlChildV1(font, PRESENTATIONML_NS, "font")?.attributes.typeface;
       if (!name) throw new Error("unsupported_edit");
-      const raw = decode2(await builder.read("ppt/presentation.xml"));
+      const raw = decode2(await builder.read(builder.presentationPartUri));
       const root = parsePptXmlV1(raw);
       const list = pptXmlChildV1(root, PRESENTATIONML_NS, "embeddedFontLst");
       const existing = list?.children.find(
@@ -15718,14 +15731,17 @@ async function registerPptClipboardGlobalsV1(source, builder) {
         if (existing) {
           const currentId = existing.children.find((child) => child.localName === node2.localName)?.attributes[`{${OFFICE_RELATIONSHIPS_NS}}id`];
           const currentRelationships = parsePptXmlV1(
-            decode2(await builder.read("ppt/_rels/presentation.xml.rels"))
+            decode2(await builder.read(relationshipsPartUriV1(builder.presentationPartUri)))
           );
           const currentRelation = currentRelationships.children.find(
             (child) => child.attributes.Id === currentId
           );
           if (!currentRelation || await builder.digest(
             await builder.read(
-              resolvePartTargetV1("ppt/presentation.xml", currentRelation.attributes.Target)
+              resolvePartTargetV1(
+                builder.presentationPartUri,
+                currentRelation.attributes.Target
+              )
             )
           ) !== await builder.digest(source.parts.get(dependency).bytes))
             throw new Error("unsupported_edit");
@@ -15734,7 +15750,7 @@ async function registerPptClipboardGlobalsV1(source, builder) {
         await copyPptClipboardClosureV1(source, dependency, dependency, builder);
         const newId = `rIdClipFont${stableHashTextV1(dependency)}`;
         await builder.relationship(
-          "ppt/presentation.xml",
+          builder.presentationPartUri,
           newId,
           dependency,
           relation.attributes.Type
@@ -15768,7 +15784,7 @@ async function registerPptClipboardGlobalsV1(source, builder) {
         ].includes(node2.localName)
       );
       const xml = list ? appendPptXmlChildV1(raw, list, fragment) : next ? raw.slice(0, next.start) + incoming + raw.slice(next.start) : appendPptXmlChildV1(raw, root, incoming);
-      await builder.set("ppt/presentation.xml", encode2(xml));
+      await builder.set(builder.presentationPartUri, encode2(xml));
     }
   }
   const styleRelation = relationRoot.children.find(
@@ -15782,7 +15798,7 @@ async function registerPptClipboardGlobalsV1(source, builder) {
   const styles = source.parts.get(sourceUri);
   if (!styles) throw new Error("unsupported_edit");
   const currentRelations = parsePptXmlV1(
-    decode2(await builder.read("ppt/_rels/presentation.xml.rels"))
+    decode2(await builder.read(relationshipsPartUriV1(builder.presentationPartUri)))
   );
   const currentStyle = currentRelations.children.find(
     (node2) => node2.attributes.Type === `${OFFICE_RELATIONSHIPS_NS}/tableStyles` && node2.attributes.TargetMode !== "External"
@@ -15790,14 +15806,17 @@ async function registerPptClipboardGlobalsV1(source, builder) {
   if (!currentStyle) {
     await copyPptClipboardClosureV1(source, sourceUri, sourceUri, builder);
     await builder.relationship(
-      "ppt/presentation.xml",
+      builder.presentationPartUri,
       `rIdClipTable${stableHashTextV1(sourceUri)}`,
       sourceUri,
       styleRelation.attributes.Type
     );
     return;
   }
-  const destination = resolvePartTargetV1("ppt/presentation.xml", currentStyle.attributes.Target);
+  const destination = resolvePartTargetV1(
+    builder.presentationPartUri,
+    currentStyle.attributes.Target
+  );
   const styleRaw = decode2(styles.bytes);
   const styleRoot = parsePptXmlV1(styleRaw);
   const canonical2 = (node2) => [
@@ -16013,7 +16032,6 @@ async function writePptClipboardObjectV1(source, current, target, builder, io) {
 
 // src/roundtrip/clipboard-closure.ts
 init_xml_fragment();
-var PRESENTATION = "ppt/presentation.xml";
 var PRESENTATION_GLOBALS = /* @__PURE__ */ new Set([`${OFFICE_RELATIONSHIPS_NS}/font`, `${OFFICE_RELATIONSHIPS_NS}/tableStyles`]);
 var decode3 = (bytes) => new TextDecoder("utf-8", { fatal: true }).decode(bytes);
 function internalRelationships(root) {
@@ -16050,6 +16068,7 @@ function referencedRelationshipIds(raw, shapeIds) {
   return found.size === wanted.size ? values : null;
 }
 async function collectPptClipboardPartsV1(input) {
+  const presentationPart = input.presentationPartUri ?? "ppt/presentation.xml";
   const parts = /* @__PURE__ */ new Map();
   const relationships = /* @__PURE__ */ new Map();
   const followed = /* @__PURE__ */ new Map();
@@ -16078,12 +16097,12 @@ async function collectPptClipboardPartsV1(input) {
       if (target) queue.push({ uri: target, follow: "all" });
     }
   };
-  if (input.has(PRESENTATION)) {
-    const relations = await relationsOf(PRESENTATION);
+  if (input.has(presentationPart)) {
+    const relations = await relationsOf(presentationPart);
     const globals = new Set(
       (relations ? internalRelationships(relations.root) : []).filter((relation) => PRESENTATION_GLOBALS.has(relation.attributes.Type ?? "")).map((relation) => relation.attributes.Id ?? "")
     );
-    queue.push({ uri: PRESENTATION, follow: globals });
+    queue.push({ uri: presentationPart, follow: globals });
   }
   for (const root of input.roots) {
     if (!root.authoredShapeIds || !input.has(root.partUri)) {
@@ -33791,6 +33810,25 @@ function resourceContentType(part) {
   if (partUri3.endsWith(".oga")) return "audio/ogg";
   return part.contentType;
 }
+function timingAudioResources(graph, part) {
+  const pending = [...part.timingProjection?.roots ?? []];
+  const ids = /* @__PURE__ */ new Set();
+  while (pending.length) {
+    const node2 = pending.pop();
+    if (node2.target?.kind === "media" && node2.target.relationshipId)
+      ids.add(node2.target.relationshipId);
+    for (const child of node2.children) pending.push(child);
+  }
+  if (!ids.size) return [];
+  return (graph.relationships.get(part.partUri) ?? []).flatMap((rel) => {
+    if (!ids.has(rel.relationshipId) || rel.targetMode !== "Internal" || !rel.internalTargetExists || !rel.resolvedTargetPartUri || !/\/(?:audio|media)$/u.test(rel.relationshipType))
+      return [];
+    const target = graph.parts.get(rel.resolvedTargetPartUri);
+    if (target?.partKind !== "media" || !resourceContentType(target).startsWith("audio/"))
+      return [];
+    return [{ relationshipId: rel.relationshipId, resourceId: resourceId(graph, target.partUri) }];
+  });
+}
 function masterTextStyles(graph, part) {
   const elementRows = rows(part);
   const styles = elementRows.find((row) => row.anchor.localName === "txStyles");
@@ -33958,6 +33996,7 @@ function buildPptDocumentV1(inputGraph, options = {}) {
       notesSourcePartUri: relationTargetByType(graph, part.partUri, "notesSlide"),
       timingSourcePartUri: part.typedProjection.featureKinds.includes("timing") ? part.partUri : null,
       timingSource: part.timingProjection ?? null,
+      timingAudio: timingAudioResources(graph, part),
       animationColorScheme: Object.fromEntries(
         [
           "dk1",
@@ -36863,6 +36902,16 @@ function compileRenderTreeV1(layout, options = {}) {
     order
   );
   if (!rootNodeId) throw new TypeError("RenderTree root is unavailable");
+  for (const { resourceId: resourceId2 } of options.timingAudio ?? []) {
+    const audio = compileRenderResourceV1(
+      resourceId2,
+      options.resources,
+      layout.slideId,
+      "static-approximation"
+    );
+    if (audio?.kind === "media" && audio.mediaType.startsWith("audio/"))
+      addOwnedResource(resources, audio);
+  }
   if (options.resolveHyperlink) {
     const byId = new Map(nodes.map((node2) => [node2.nodeId, node2]));
     for (let index = 0; index < nodes.length; index++) {
@@ -38133,27 +38182,23 @@ function compileBehaviorNodeV1(node2, target, geometryBasis, inheritedPreset = {
   }
   if (node2.kind === "command") {
     const authoredCommand = (attribute2(node2, "cmd", "command") ?? "").toLowerCase();
-    const command = authoredCommand === "togglepause" ? "toggle-play-pause" : authoredCommand;
-    if (!["play", "pause", "seek", "stop", "toggle-play-pause"].includes(command)) return null;
-    const mediaId = target.subNodeKey ?? target.nodeId;
+    const playFrom = /^playfrom\(\s*(\d+(?:\.\d+)?)\s*\)$/u.exec(authoredCommand);
+    const startAtMs = playFrom ? Math.round(Number(playFrom[1]) * 1e3) : void 0;
+    if (startAtMs !== void 0 && (!Number.isSafeInteger(startAtMs) || !target.playbackMediaId))
+      return null;
+    const command = playFrom ? "play" : authoredCommand === "togglepause" ? "toggle-play-pause" : authoredCommand;
+    if (command !== "play" && command !== "pause" && command !== "seek" && command !== "stop" && command !== "toggle-play-pause")
+      return null;
+    const value2 = {
+      command,
+      mediaId: (playFrom ? target.playbackMediaId : void 0) ?? target.subNodeKey ?? target.nodeId,
+      ...startAtMs !== void 0 ? { startAtMs } : {}
+    };
     return Object.freeze({
       kernelId: "behavior.media-command",
       initial: [],
       tracks: Object.freeze([
-        directTrack(
-          node2,
-          target,
-          "media-command",
-          {
-            command,
-            mediaId
-          },
-          {
-            command,
-            mediaId
-          },
-          "behavior.media-command"
-        )
+        directTrack(node2, target, "media-command", value2, value2, "behavior.media-command")
       ])
     });
   }
@@ -38442,11 +38487,15 @@ function buildAnimationTargetMapV1(slide) {
   const canonical2 = [...grouped].sort(([a], [b]) => a - b).map(
     ([id2, shapes]) => `${id2}:${shapes.map((shape2) => shape2.nodeId).sort().join(",")}`
   ).join("|");
+  const timingAudio = new Map(
+    slide.timingAudio?.map((item) => [item.relationshipId, item.resourceId])
+  );
   return Object.freeze({
     slideId: slide.nodeId,
+    timingAudio,
     byAuthoredShapeId: grouped,
     diagnostics: Object.freeze(diagnostics2),
-    canonicalHash: `animation-target-map:v1:${stableHashTextV1(`${slide.nodeId}|${canonical2}`)}`
+    canonicalHash: `animation-target-map:v1:${stableHashTextV1(`${slide.nodeId}|${canonical2}${timingAudio.size ? JSON.stringify([...timingAudio]) : ""}`)}`
   });
 }
 function kindCompatible(source, shape2) {
@@ -38532,6 +38581,21 @@ function resolveAnimationTargetV1(source, map) {
       })
     };
   }
+  if (source.kind === "media" && source.shapeId === null && source.relationshipId) {
+    const resource = map.timingAudio.get(source.relationshipId);
+    if (resource)
+      return {
+        ok: true,
+        target: {
+          nodeId: map.slideId,
+          sourceNodeId: map.slideId,
+          kind: "media",
+          subNodeKind: "media",
+          subNodeKey: resource,
+          playbackMediaId: resource
+        }
+      };
+  }
   const candidates = source.shapeId === null ? [] : map.byAuthoredShapeId.get(source.shapeId) ?? [];
   if (candidates.length === 0)
     return {
@@ -38616,7 +38680,8 @@ function resolveAnimationTargetV1(source, map) {
       kind: source.kind,
       subNodeKind,
       subNodeKey,
-      sourceNodeId: shape2.nodeId
+      sourceNodeId: shape2.nodeId,
+      ...shape2.kind === "picture" && shape2.resourceId && shape2.mediaResourceId && shape2.mediaKind ? { playbackMediaId: shape2.nodeId } : {}
     })
   };
 }
@@ -39972,6 +40037,7 @@ function evaluateAnimationV1(program, eventLog, logicalNowMs, options) {
           command: {
             mediaId: value2.mediaId,
             command: value2.command,
+            ...value2.startAtMs !== void 0 ? { startAtMs: value2.startAtMs } : {},
             logicalTimeMs: activation2.startMs,
             generation: options.generation,
             idempotencyKey: `media-command:v1:${stableHashTextV1(`${program.canonicalHash}|${track3.trackId}|${activation2.startMs}|${activation2.eventSequence}|${options.generation}`)}`,
@@ -41270,7 +41336,7 @@ var PptDocumentEditSessionV1 = class {
       (sum, candidateSource) => sum + [...candidateSource.parts.values()].reduce((size, part) => size + part.bytes.length, 0),
       0
     );
-    if (this.clipboardSources.size >= 128 || used + [...source.parts.values()].reduce((size, part) => size + part.bytes.length, 0) > 128 * 1024 * 1024)
+    if (this.clipboardSources.size >= 128 || used + [...source.parts.values()].reduce((size, part) => size + part.bytes.length, 0) > PPT_CLIPBOARD_MAX_TRANSFER_BYTES)
       throw new Error("resource_limit_exceeded");
     this.clipboardSources.set(source.key, source);
   }
@@ -42814,15 +42880,18 @@ async function planPptNotesV1(baseline, current, builder) {
         `${OFFICE_RELATIONSHIPS_NS}/notesSlide`
       );
       await builder.relationship(uri, "rIdSlide", slide.sourcePartUri, `${OFFICE_RELATIONSHIPS_NS}/slide`);
-      const presRels = parsePptXmlV1(decode5(await builder.read("ppt/_rels/presentation.xml.rels")));
+      const presentationPart = builder.presentationPartUri;
+      const presRels = parsePptXmlV1(
+        decode5(await builder.read(relationshipsPartUriV1(presentationPart)))
+      );
       const master = presRels.children.find(
-        (node2) => node2.attributes.Type === `${OFFICE_RELATIONSHIPS_NS}/notesMaster` && node2.attributes.TargetMode !== "External"
+        (node2) => node2.namespaceUri === PACKAGE_RELATIONSHIPS_NS && node2.localName === "Relationship" && node2.attributes.Type === `${OFFICE_RELATIONSHIPS_NS}/notesMaster` && node2.attributes.TargetMode !== "External"
       );
       if (master)
         await builder.relationship(
           uri,
           "rIdNotesMaster",
-          resolvePartTargetV1("ppt/presentation.xml", master.attributes.Target),
+          resolvePartTargetV1(presentationPart, master.attributes.Target),
           `${OFFICE_RELATIONSHIPS_NS}/notesMaster`
         );
     }
@@ -44489,6 +44558,7 @@ async function createPptxCoreDocumentSessionFromSourceGraph(graph, dependencies)
         ...replacements.keys()
       ]);
       const closure = await collectPptClipboardPartsV1({
+        presentationPartUri: graph.officeDocumentPart,
         roots: snapshot.document.slides.flatMap((slide) => {
           if (kind === "slides")
             return targetIds.includes(slide.nodeId) ? [{ partUri: slide.sourcePartUri }] : [];
@@ -44508,11 +44578,9 @@ async function createPptxCoreDocumentSessionFromSourceGraph(graph, dependencies)
           replacements.get("[Content_Types].xml") ?? await readPart("[Content_Types].xml")
         )
       );
+      assertPptClipboardPartsWithinLimitsV1([...closure.values()].map((bytes) => ({ bytes })));
       const parts = [];
-      let total = 0;
       for (const [partUri3, bytes] of closure) {
-        total += bytes.length;
-        if (total > 128 * 1024 * 1024) throw new Error("resource_limit_exceeded");
         const original = graph.parts.get(partUri3) ?? clipboardPart(partUri3)?.sourcePart;
         const contentType = original?.contentType ?? types.children.find((node2) => node2.attributes.PartName === `/${partUri3}`)?.attributes.ContentType ?? types.children.find((node2) => node2.attributes.Extension === partUri3.split(".").at(-1))?.attributes.ContentType ?? (partUri3 === "[Content_Types].xml" ? "application/xml" : null);
         if (!contentType) throw new Error("unsupported_edit");
@@ -44528,6 +44596,7 @@ async function createPptxCoreDocumentSessionFromSourceGraph(graph, dependencies)
       ).join("\n").slice(0, 8192);
       return {
         schema: "mavis.ppt_clipboard.v1",
+        presentationPartUri: graph.officeDocumentPart,
         kind,
         plainText,
         selectedIds: [...targetIds],
@@ -44545,7 +44614,8 @@ async function createPptxCoreDocumentSessionFromSourceGraph(graph, dependencies)
       const preflight = new PptPackagePatchBuilderV1(
         currentPlan,
         { readPart, digest: digestSha2562 },
-        (uri) => savedParts.has(uri) || graph.parts.has(uri)
+        (uri) => savedParts.has(uri) || graph.parts.has(uri),
+        graph.officeDocumentPart
       );
       await registerPptClipboardGlobalsV1(source, preflight);
       session.installClipboardSource(source);
@@ -44607,7 +44677,8 @@ async function createPptxCoreDocumentSessionFromSourceGraph(graph, dependencies)
           expectedChangedParts: []
         },
         currentIO,
-        (uri) => savedParts.has(uri) || graph.parts.has(uri)
+        (uri) => savedParts.has(uri) || graph.parts.has(uri),
+        graph.officeDocumentPart
       );
       const basePlan = await planPptxSaveV1({
         revision: snapshot.revision,
@@ -44891,6 +44962,7 @@ async function createPptxCoreDocumentSessionFromSourceGraph(graph, dependencies)
       }
       const layout = await requireReadyLayout(slideIndex);
       const tree = compileRenderTreeV1(layout, {
+        timingAudio: document.slides[slideIndex].timingAudio,
         resolveHyperlink,
         resources: document.resources,
         glyphOutline: documentFonts.runtime.glyphOutline,

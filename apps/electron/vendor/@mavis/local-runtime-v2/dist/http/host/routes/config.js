@@ -1,6 +1,6 @@
 import { getConfig, resolveBetaFeature, resolveEffectivePtc } from '@mavis/config';
 import { json, readFirstString, readJsonBody, sanitizeConfig, sanitizeProviderConfig, splitModelId, } from '../../../infra/transport/host-http.js';
-import { buildPermissionModeOptionsResponse, isLocalPermissionModeString, normalizePermissionModeConfigBody, } from '../../../service/permission/index.js';
+import { buildPermissionModeOptionsResponse, emitPermissionModeChangeMetric, isLocalPermissionModeString, normalizePermissionModeConfigBody, readLocalPermissionMode, } from '../../../service/permission/index.js';
 import { listLocalRuntimeModels } from '../host-support.js';
 import { isPeekEnabled } from '../../../service/turn-system/index.js';
 /**
@@ -123,6 +123,7 @@ async function handleLocalConfigPut(deps, request) {
         if (requestedPermissionMode &&
             requestedPermissionMode !== previousPermissionMode &&
             config.permissionMode === requestedPermissionMode) {
+            emitPermissionModeChangeMetric(deps.metricsClient, readLocalPermissionMode(previousPermissionMode), readLocalPermissionMode(requestedPermissionMode));
             deps.publishGlobalEvent?.({
                 type: 'config.permission_mode.changed',
                 payload: { permissionMode: requestedPermissionMode },

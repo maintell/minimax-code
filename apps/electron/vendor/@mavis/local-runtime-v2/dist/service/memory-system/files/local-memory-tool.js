@@ -1,5 +1,5 @@
 import { LocalMemoryFacade } from './local-memory-facade.js';
-import { formatLocalDate } from './local-memory-store-utils.js';
+import { countMatchedTerms, formatLocalDate, parseSearchTerms, rankByScore, } from './local-memory-store-utils.js';
 import { LocalMemoryError } from './types.js';
 import { emitResourceAmbiguityTelemetry } from '../../agent/index.js';
 const VALID = new Set([
@@ -241,7 +241,8 @@ async function searchMainMemory(facade, sourceNames, query) {
     const entries = await readSources(sourceNames, (sourceAgent) => facade.searchMemory(sourceAgent, query));
     if (sourceNames.length <= 1)
         return entries[0]?.value ?? [];
-    return entries.flatMap(({ sourceAgent, value }) => value.map((result) => ({ ...result, sourceAgent })));
+    const terms = parseSearchTerms(query);
+    return rankByScore(entries.flatMap(({ sourceAgent, value }) => value.map((result) => ({ ...result, sourceAgent }))), ({ line }) => countMatchedTerms(line, terms));
 }
 async function readTopicMemory(facade, sourceNames, topicName, { emitBusEvent, metrics }) {
     const candidates = (await readSources(sourceNames, async (sourceAgent) => {
@@ -278,8 +279,12 @@ async function readTopicMemory(facade, sourceNames, topicName, { emitBusEvent, m
 async function searchTopicMemory(facade, sourceNames, query) {
     const entries = await readSources(sourceNames, (sourceAgent) => facade.searchTopics(sourceAgent, query));
     if (sourceNames.length <= 1)
-        return entries[0]?.value ?? [];
-    return entries.flatMap(({ sourceAgent, value }) => value.map((result) => ({ ...result, sourceAgent })));
+        return (entries[0]?.value ?? []).map(({ topic }) => topic);
+    const merged = entries.flatMap(({ sourceAgent, value }) => value.map((match) => ({ ...match, sourceAgent })));
+    return rankByScore(merged, ({ matchedTerms }) => matchedTerms).map(({ topic, sourceAgent }) => ({
+        ...topic,
+        sourceAgent,
+    }));
 }
 async function readSources(sourceNames, read) {
     return Promise.all(sourceNames.map(async (sourceAgent) => ({

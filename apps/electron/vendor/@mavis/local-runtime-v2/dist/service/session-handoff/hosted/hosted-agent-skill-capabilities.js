@@ -5,7 +5,7 @@ export function createHostedSkillCapabilities(host, restrictions) {
     };
     return {
         listRuntimeSkills: (scope) => host.skillRuntime.listHostedRuntimeSkills(scope, context),
-        renderCatalog: (scope) => host.skillRuntime.renderHostedCatalog(scope, context),
+        listCatalogEntries: (scope) => host.skillRuntime.listHostedCatalogEntries(scope, context),
     };
 }
 //# sourceMappingURL=hosted-agent-skill-capabilities.js.map

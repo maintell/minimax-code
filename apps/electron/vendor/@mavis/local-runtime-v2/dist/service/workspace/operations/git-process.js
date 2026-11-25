@@ -14,7 +14,7 @@ export async function git(args, workspace, options = {}) {
         const pending = execFile('git', ['-c', 'core.quotePath=false', '--no-optional-locks', ...args], {
             cwd: resolve(workspace),
             encoding: 'utf-8',
-            env: gitEnv(),
+            env: gitEnv(options.env),
             maxBuffer: GIT_MAX_BUFFER,
             ...(options.signal ? { signal: options.signal } : {}),
         });
@@ -109,13 +109,13 @@ export function requireGitSuccess(result, operation) {
     }
     return result;
 }
-function gitEnv() {
+function gitEnv(extra) {
     const env = { ...process.env };
     for (const key of Object.keys(env)) {
         if (key.startsWith('GIT_'))
             delete env[key];
     }
-    return env;
+    return extra ? { ...env, ...extra } : env;
 }
 function abortError() {
     const error = new Error('Git operation aborted');

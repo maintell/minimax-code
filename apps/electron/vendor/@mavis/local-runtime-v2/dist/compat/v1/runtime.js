@@ -2,6 +2,7 @@ import { createDeferredPluginHookPermissionCapability, } from '@mavis/permission
 import { createDeferredContentSafetyCapability } from '@mavis/shared/local-runtime-safety';
 import { createDeferredSkillRuntimeCapability } from '@mavis/shared/local-runtime-skills';
 import { emitSubagentTelemetry, roleClass, SUBAGENT_TELEMETRY_EVENT, } from '../../service/agent/index.js';
+import { createDeferredMergeRequestPort, } from '../../service/merge-request/index.js';
 import { createV1CronAgentCleanupBridge, createV1MavisCronAdapterBridge } from './cron.js';
 /** These bridges carry references only. Host composition creates and owns every service. */
 export function createV1RuntimeBridges(conversation) {
@@ -12,6 +13,7 @@ export function createV1RuntimeBridges(conversation) {
         mcp: createDeferredMcpRuntimeCapability(),
         skill: createDeferredSkillRuntimeCapability(),
         pluginHookPermissions: createDeferredPluginHookPermissionCapability(),
+        mergeRequests: createDeferredMergeRequestPort(),
         safety: createDeferredContentSafetyCapability(),
         conversation,
     };

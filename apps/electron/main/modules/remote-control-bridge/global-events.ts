@@ -5,8 +5,13 @@ const EVENT_STREAM_SCOPE_QUERY = '_mavis_stream_scope';
  * Local-only events never sent upstream. Worktree creation progress carries
  * local paths and Git output at ~150ms per frame; no controller renders it, and
  * a `workspace.*` frame would make every controller re-pull the resource snapshot.
+ *
+ * `ui.request` is addressed at this machine's own `main` window: it carries the
+ * requestId a reply is keyed by plus local file paths, chat ids and Agent
+ * names. Only that window acts on it, so sending it upstream would leak the
+ * payload and hand a controller the id it needs to answer for the window.
  */
-const LOCAL_ONLY_EVENT_TYPES = new Set(['workspace.worktree.progress']);
+const LOCAL_ONLY_EVENT_TYPES = new Set(['workspace.worktree.progress', 'ui.request']);
 /**
  * Electron host adapter for the public Global Events SSE contract.
  *

@@ -11,12 +11,30 @@
     },
     "./miniapp-diagnostics": {
       "import": "./dist/miniapp-diagnostics.js"
+    },
+    "./output-limit-recovery": {
+      "import": "./dist/output-limit-recovery.js"
+    },
+    "./request-media": {
+      "import": "./dist/request-media.js"
+    },
+    "./tool-output-budget": {
+      "import": "./dist/tool-output-budget.js"
     }
   },
   "typesVersions": {
     "*": {
       "miniapp-diagnostics": [
         "dist/miniapp-diagnostics.d.ts"
+      ],
+      "output-limit-recovery": [
+        "dist/output-limit-recovery.d.ts"
+      ],
+      "request-media": [
+        "dist/request-media.d.ts"
+      ],
+      "tool-output-budget": [
+        "dist/tool-output-budget.d.ts"
       ]
     }
   },

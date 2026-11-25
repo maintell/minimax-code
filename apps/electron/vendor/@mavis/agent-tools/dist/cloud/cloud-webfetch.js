@@ -50,9 +50,21 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
 };
 import { Buffer } from 'node:buffer';
 import { Type } from '@sinclair/typebox';
-import { bindTool, } from '@mavis/agent-core/tools';
+import { bindTool, withProgrammaticResult, } from '@mavis/agent-core/tools';
 import { FetchMode, } from './runtime-types.js';
 const WEB_FETCH_MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
+// archon-server WebFetch runs the fetch workflow under a 60s total budget and
+// then the prompt extractor on its own 30s deadline (not shared with the fetch
+// budget), answering with a business error when either expires. The client
+// waits for that whole budget plus a margin for the hop, so a slow extractor
+// comes back as archon-server's own answer instead of the default 15s attempt
+// timing out and re-running the full fetch + extract.
+// Source of the 60s and 30s: Apollo app `matrix.archon.server`, namespace
+// `webfetch_config.json`, fields `total_timeout_ms` and `extractor.timeout_ms`
+// (code defaults `defaultWebFetchTotalTimeoutMs` / `defaultWebFetchExtractorTimeoutMs`
+// in archon_server `conf/apollo.go`). Raising either there must raise this too.
+// Keep it under undici's 300s header timeout so no long-request dispatcher is needed.
+const WEB_FETCH_RPC_TIMEOUT_MS = (60 + 30 + 10) * 1000;
 export const WebFetchToolDef = {
     name: 'web_fetch',
     description: 'Fetch URL content. Use `deep` mode only when a prior default fetch failed because of captcha, anti-bot blocking, or empty extracted content.',
@@ -92,11 +104,11 @@ let CloudWebFetchTool = (() => {
                 url: input.url,
                 ...(input.prompt !== undefined ? { prompt: input.prompt } : {}),
                 ...(fetchMode !== undefined ? { fetch_mode: fetchMode } : {}),
-            }, signal);
+            }, signal, { timeoutMs: WEB_FETCH_RPC_TIMEOUT_MS });
             const statusCode = resp.base_resp?.status_code ?? 0;
             if (statusCode !== 0) {
                 const message = resp.base_resp?.status_msg ?? 'archon-server WebFetch returned non-zero status';
-                return {
+                return withProgrammaticResult({
                     tool_name: WebFetchToolDef.name,
                     text: message,
                     content: [{ type: 'text', text: message }],
@@ -105,7 +117,10 @@ let CloudWebFetchTool = (() => {
                         url: input.url,
                         status_code: statusCode,
                     },
-                };
+                }, 
+                // WebFetchData on failure: { url, httpStatus?, retryAfter? }. The cloud
+                // RPC carries neither the HTTP status nor Retry-After, so only url is set.
+                { data: { url: input.url } });
             }
             const content = resp.content ?? '';
             const receivedBytes = Buffer.byteLength(content, 'utf8');
@@ -115,7 +130,7 @@ let CloudWebFetchTool = (() => {
                 // available without crossing the RPC, BPE, or model-context boundaries.
                 const message = `web_fetch response exceeded the safe limit (${receivedBytes} UTF-8 bytes; ` +
                     `maximum ${WEB_FETCH_MAX_RESPONSE_BYTES}). Retry with a narrower \`prompt\` or use a more specific data source.`;
-                return {
+                return withProgrammaticResult({
                     tool_name: WebFetchToolDef.name,
                     text: message,
                     content: [{ type: 'text', text: message }],
@@ -126,9 +141,9 @@ let CloudWebFetchTool = (() => {
                         received_bytes: receivedBytes,
                         max_response_bytes: WEB_FETCH_MAX_RESPONSE_BYTES,
                     },
-                };
+                }, { data: { url: input.url } });
             }
-            return {
+            return withProgrammaticResult({
                 tool_name: WebFetchToolDef.name,
                 text: content,
                 content: [{ type: 'text', text: content }],
@@ -136,7 +151,17 @@ let CloudWebFetchTool = (() => {
                     ok: true,
                     url: input.url,
                 },
-            };
+            }, 
+            // WebFetchData: { url, finalUrl?, httpStatus?, contentType?, bytes?, content }.
+            // The cloud WebFetch RPC returns the extracted text only, so finalUrl,
+            // httpStatus and contentType have no source here; text and details are unchanged.
+            // Completeness: this path never cuts. Unlike Desktop there is no 16k-token
+            // clip, and the size guard above refuses the response instead of cutting it,
+            // so those two failure paths stay undeclared (Desktop declares none either).
+            {
+                data: { url: input.url, bytes: receivedBytes, content },
+                completeness: { truncated: false },
+            });
         }
     };
     return CloudWebFetchTool = _classThis;

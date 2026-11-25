@@ -1,7 +1,7 @@
 export { initializeLocalBackgroundBashExecutor } from './initialize.js';
 export { createHostedBackgroundReminderCapabilities } from './delivery/hosted-reminder-capabilities.js';
 export { admitBackgroundTask } from './tasks/lifecycle.js';
-export { persistLocalSubagentTaskTerminal } from './delivery/terminal.js';
+export { persistLocalSubagentTaskTerminal, subagentFinalText } from './delivery/terminal.js';
 export { taskTurnId } from './tasks/turn-id.js';
 export { taskIdFromTurnId } from './tasks/turn-id.js';
 export { startBackgroundLocalTask } from './tasks/runner.js';

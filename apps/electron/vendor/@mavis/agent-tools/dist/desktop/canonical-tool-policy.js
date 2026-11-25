@@ -1,3 +1,4 @@
+import { SPACE_REMOTE_WRITE_TOOL_NAMES } from '../space/tool-names.js';
 import { isCanonicalSubagentRole } from './subagent-roles.js';
 /**
  * Starting a task and continuing one are the same delegation entry point, so
@@ -16,6 +17,8 @@ const READ_ONLY_CANONICAL_BLOCKED_TOOL_NAMES = new Set([
     'ask_user',
     'request_feature_enable',
     'request_plugin',
+    // Explore and Verifier may read Space but never change it.
+    ...SPACE_REMOTE_WRITE_TOOL_NAMES,
 ]);
 /** Computer-use tools share the computer_* namespace across native and MCP paths. */
 export function isComputerUseRuntimeToolName(name) {

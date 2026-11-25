@@ -4,9 +4,31 @@ import { homedir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { IDE_APPS_CACHE_TTL_MS, IDE_APP_RESOLVE_CONCURRENCY, IDE_CATALOG, IDE_PATH_PROBE_CONCURRENCY, IDE_UNAVAILABLE_REASON, isPresentationApp, isPresentationFile, } from './catalog.js';
+import { logger } from '../../../infra/logging/logger.js';
 import { toNativeWindowsDrivePath } from '../files/path-utils.js';
 import { pathExists, IdeLauncherError, resolvePath, assertWithinWorkspace, assertRegularFileExists, expandTilde, } from './launch-target.js';
 const execFile = promisify(execFileCallback);
+/**
+ * Editors whose CLI reveals a line with `-g <file>:<line>`, mapped to the CLI
+ * shipped inside their macOS bundle (relative to the .app root).
+ */
+const GOTO_LINE_MAC_BUNDLED_CLI = {
+    vscode: ['Contents', 'Resources', 'app', 'bin', 'code'],
+    cursor: ['Contents', 'Resources', 'app', 'bin', 'cursor'],
+};
+/**
+ * The bundled CLI normally exits as soon as it hands the file to the editor.
+ * Cap the wait so a CLI that never exits cannot hold the open-in-ide request.
+ */
+const GOTO_LINE_CLI_TIMEOUT_MS = 5_000;
+function gotoLineArgs(entry, filePath, line) {
+    return GOTO_LINE_MAC_BUNDLED_CLI[entry.family] && line !== undefined
+        ? ['-g', `${filePath}:${line}`]
+        : null;
+}
+function withRequestedLine(target, line) {
+    return target.filePath && line !== undefined ? { ...target, line } : target;
+}
 function stripIdeLaunchFields(app) {
     const result = {
         id: app.id,
@@ -132,12 +154,12 @@ export class IdeLauncher {
     async listIdeApps() {
         return this.resolveCachedIdeApps();
     }
-    async openWorkspaceInIde(workspaceDir, ideId, filePath, fileOnly = false) {
+    async openWorkspaceInIde(workspaceDir, ideId, filePath, options = {}) {
         const entry = IDE_CATALOG.find((item) => item.id === ideId);
         if (!entry) {
             throw new IdeLauncherError(`Unsupported IDE: ${ideId}`, 'IDE_APP_UNSUPPORTED', 400);
         }
-        const target = await this.resolveIdeOpenTarget(workspaceDir, filePath, fileOnly);
+        const target = withRequestedLine(await this.resolveIdeOpenTarget(workspaceDir, filePath, options.fileOnly), options.line);
         if (isPresentationApp(entry) && (!target.filePath || !isPresentationFile(target.filePath))) {
             throw new IdeLauncherError('A presentation file is required for this application', 'PRESENTATION_FILE_REQUIRED', 400);
         }
@@ -529,7 +551,7 @@ export class IdeLauncher {
     async launchIdeOpenTarget(target, entry, app) {
         if (target.filePath) {
             try {
-                await this.launchFileInResolvedIde(target.filePath, entry, app);
+                await this.launchFileInResolvedIde(target.filePath, entry, app, target.line);
                 return;
             }
             catch (error) {
@@ -543,10 +565,13 @@ export class IdeLauncher {
         }
         throw new IdeLauncherError('workspace or path is required', 'VALIDATION_ERROR', 400);
     }
-    async launchFileInResolvedIde(filePath, entry, app) {
+    async launchFileInResolvedIde(filePath, entry, app, line) {
         if (!app.available || !app.launchTarget || !app.launchKind) {
             throw new IdeLauncherError(`${entry.name} is not available`, 'IDE_APP_UNAVAILABLE', 422);
         }
+        // VS Code and Cursor reveal a line only through their CLI
+        // `--goto file:line`; other editors keep the plain file argument.
+        const gotoArgs = gotoLineArgs(entry, filePath, line);
         if (entry.family === 'ghostty') {
             await this.launchWorkspaceInResolvedIde(path.dirname(filePath), entry, app);
             return;
@@ -556,7 +581,7 @@ export class IdeLauncher {
             return;
         }
         if (app.launchKind === 'mac-app') {
-            await runCommand('open', ['-a', app.launchTarget, filePath]);
+            await this.openFileInMacApp(entry, app.launchTarget, filePath, gotoArgs);
             return;
         }
         if (app.launchKind === 'windows-file-manager') {
@@ -573,7 +598,46 @@ export class IdeLauncher {
             await launchPresentationProcess(app.launchTarget, [filePath]);
         }
         else {
-            await runCommand(app.launchTarget, [filePath]);
+            await runCommand(app.launchTarget, gotoArgs ?? [filePath]);
+        }
+    }
+    async openFileInMacApp(entry, appPath, filePath, gotoArgs) {
+        if (gotoArgs && (await this.revealLineWithBundledCli(entry, appPath, gotoArgs)))
+            return;
+        await runCommand('open', ['-a', appPath, filePath]);
+    }
+    /**
+     * `open -a App --args` is dropped when the app is already running, so reveal
+     * the line through the CLI bundled inside the .app, which forwards to the
+     * running instance. Returns false (and logs why) when the caller should fall
+     * back to opening the file without a line.
+     */
+    async revealLineWithBundledCli(entry, appPath, gotoArgs) {
+        const relativeCli = GOTO_LINE_MAC_BUNDLED_CLI[entry.family];
+        if (!relativeCli)
+            return false;
+        const bundledCli = path.join(appPath, ...relativeCli);
+        if (!(await pathExists(bundledCli))) {
+            logger.warn({ ideId: entry.id, bundledCli }, 'IDE goto-line CLI missing; opening file without a line');
+            return false;
+        }
+        try {
+            await execFile(bundledCli, gotoArgs, { timeout: GOTO_LINE_CLI_TIMEOUT_MS });
+            return true;
+        }
+        catch (error) {
+            // Keep the user's file path out of the log: execFile messages embed argv.
+            const failure = error;
+            logger.warn({
+                ideId: entry.id,
+                bundledCli,
+                reason: failure.killed ? 'timeout' : 'error',
+                code: typeof failure.code === 'string' || typeof failure.code === 'number'
+                    ? failure.code
+                    : undefined,
+                signal: typeof failure.signal === 'string' ? failure.signal : undefined,
+            }, 'IDE goto-line CLI failed; opening file without a line');
+            return false;
         }
     }
     async launchWorkspaceInResolvedIde(workspaceRoot, entry, app) {

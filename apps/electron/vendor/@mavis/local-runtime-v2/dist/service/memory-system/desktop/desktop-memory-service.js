@@ -1,4 +1,5 @@
 import { LocalMemoryFacade } from '../files/local-memory-facade.js';
+import { countMatchedTerms, parseSearchTerms, rankByScore, } from '../files/local-memory-store-utils.js';
 import { mergeMemorySources, readMemorySources, selectMemorySource, selectMainMemoryResource, } from './desktop-memory-family.js';
 import { DesktopMemoryServiceMutations, agentResolverUnavailable, } from './desktop-memory-service-mutations.js';
 /** Default requested key for omitted memory agent names. The shared
@@ -43,7 +44,8 @@ export class DesktopMemoryService extends DesktopMemoryServiceMutations {
         return this.wrap(async () => {
             const scope = await this.resolveReadScope(req);
             const results = await readMemorySources(scope.sourceNames, (agentName) => this.memory.searchMemory(agentName, req.query));
-            const flattened = results.flatMap(({ sourceAgent, value }) => value.map((result) => ({ result, sourceAgent })));
+            const terms = parseSearchTerms(req.query);
+            const flattened = rankByScore(results.flatMap(({ sourceAgent, value }) => value.map((result) => ({ result, sourceAgent }))), ({ result }) => countMatchedTerms(result.line, terms));
             return {
                 results: flattened.map(({ result }) => result),
                 ...(scope.sourceNames.length > 1
@@ -86,11 +88,14 @@ export class DesktopMemoryService extends DesktopMemoryServiceMutations {
         return this.wrap(async () => {
             const scope = await this.resolveReadScope(req);
             const sourceResults = await readMemorySources(scope.sourceNames, (agentName) => this.memory.searchTopics(agentName, req.keyword, Number.MAX_SAFE_INTEGER));
-            const topics = mergeMemorySources(sourceResults.flatMap(({ sourceAgent, value }) => value.map((entry) => ({ sourceAgent, value: entry }))), scope.canonicalName, (entry) => entry.name, { resource: 'topic search', telemetryHost: this.telemetryHost }).sort((a, b) => a.value.name.localeCompare(b.value.name));
+            const merged = mergeMemorySources(sourceResults.flatMap(({ sourceAgent, value }) => value.map((match) => ({ sourceAgent, value: match }))), scope.canonicalName, (match) => match.topic.name, { resource: 'topic search', telemetryHost: this.telemetryHost }).sort((a, b) => a.value.topic.name.localeCompare(b.value.topic.name));
+            // Most matched keywords first, name order within a tie (and for a blank keyword), so the
+            // limit cuts the least relevant topics.
+            const topics = rankByScore(merged, ({ value }) => value.matchedTerms);
             const limit = req.limit === undefined ? 10 : Math.max(0, req.limit);
             const sliced = topics.slice(0, limit);
             return {
-                topics: sliced.map(({ value }) => value),
+                topics: sliced.map(({ value }) => value.topic),
                 ...(scope.sourceNames.length > 1
                     ? { baseResp: { source_agents: sliced.map(({ sourceAgent }) => sourceAgent) } }
                     : {}),

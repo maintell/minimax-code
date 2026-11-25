@@ -1,8 +1,6 @@
 import { DEFAULT_COMPACTION_SETTINGS } from '@earendil-works/pi-coding-agent/compaction';
 import { resolveSegmentCompactionBudget, } from '@mavis/context-manager';
-import { resolveCheckpointSharedPrefix } from '../../execution/checkpoint-shared-prefix.js';
-import { checkpointMaxOutputTokens } from '../../execution/checkpoint-prompt.js';
-import { createLocalContextFootprintMeasurer } from '../../execution/local-context-footprint.js';
+import { resolveCheckpointSharedPrefix, checkpointMaxOutputTokens, createLocalContextFootprintMeasurer, } from '@mavis/harness/compaction';
 import { createTokenCounter, } from '../rebuild-pipeline.js';
 import { currentTurnStart } from '../segment-checks.js';
 import { resolveSegmentContextSwitch, traceSegmentContextConfig, } from '../trace.js';
@@ -132,6 +130,12 @@ export class SegmentCoordinatorCore {
     maxOutputTokens(route) {
         return checkpointMaxOutputTokens(DEFAULT_COMPACTION_SETTINGS.reserveTokens, route.maxTokens ?? route.model.maxTokens, route.model.contextWindow);
     }
+    /**
+     * Route budget from the window and the configured output limit. `compactionTriggerAt`
+     * is not an input and is never read here: the segment profile does not honour that user
+     * setting, only the main automatic trigger does. See {@link footprint} for the matching
+     * token-source contract.
+     */
     budget(route, snapshot) {
         const maxOutputTokens = route.maxTokens ?? route.model.maxTokens;
         const foreground = this.options.foregroundBudget({
@@ -145,6 +149,24 @@ export class SegmentCoordinatorCore {
             foreground,
         });
     }
+    /**
+     * The segment profile's footprint: the LOCAL ESTIMATE ONLY. It deliberately passes no
+     * `usageAnchor`, so a Provider usage measurement never reaches this path.
+     *
+     * Three consequences, all intentional:
+     *
+     * - The soft and hard lines are compared against a local estimate, not against the next
+     *   request's measured prompt. The segment ladder is a separate product decision from the
+     *   main automatic trigger and must not inherit its calibration.
+     * - A user `contextManagement.compactionTriggerAt` does not move it. Only the main
+     *   automatic compactor reads that setting (createCompactionTriggerAtGetter in
+     *   execution/production-context-compactors.ts); the segment profile ignores it.
+     * - Wiring an anchor in here would silently change WHEN background compaction starts.
+     *   That is a product behaviour change, not a refactor, so it needs its own decision.
+     *
+     * It does share the visual token pricer with the trigger, through the same measurer: a
+     * screenshot costs its real dimensions on both paths. Only the token SOURCE differs.
+     */
     footprint(model, messages, snapshot) {
         return createLocalContextFootprintMeasurer({
             model,

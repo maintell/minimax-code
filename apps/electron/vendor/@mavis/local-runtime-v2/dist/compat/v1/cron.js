@@ -28,6 +28,7 @@ export function createV1MavisCronAdapterBridge() {
     let handleRequest;
     let reminders;
     let mainConversation;
+    let recordOrigin;
     const adapter = createLocalMavisCronAdapter(createDesktopServiceClient({
         baseUrl: 'http://local-runtime-v2.internal',
         fetch: (input, init) => {
@@ -50,10 +51,12 @@ export function createV1MavisCronAdapterBridge() {
                 return reminders.cancel(request.sessionId);
             },
             targetsMainConversation: (agentName) => mainConversation?.(agentName) === true,
+            recordScheduleOrigin: (request) => recordOrigin?.(request) === true,
         },
         bindSelfReminders(service) {
             reminders = service.selfReminders;
             mainConversation = service.targetsMainConversation?.bind(service);
+            recordOrigin = service.recordScheduleOrigin?.bind(service);
         },
         bindHandleRequest(next) {
             if (handleRequest)

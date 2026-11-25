@@ -1,6 +1,7 @@
-import { readFile, stat } from 'node:fs/promises';
+import { open, readFile, stat } from 'node:fs/promises';
 import { extname } from 'node:path';
 import { PNG } from 'pngjs';
+import { classifyExistingPathError } from '../path-error.js';
 import { buildCompressedModelImageFromFile, decodeDataUrl, } from '../../../../infra/util/model-image-preprocess.js';
 const DEFAULT_THUMBNAIL_MAX_EDGE = 512;
 const THUMBNAIL_MAX_OUTPUT_BYTES = 1024 * 1024;
@@ -150,7 +151,17 @@ export async function buildWorkspaceFileThumbnail(absolutePath, maxEdge, preserv
             code: 'THUMBNAIL_UNSUPPORTED',
         };
     }
-    const sourceInfo = await stat(absolutePath);
+    let sourceInfo;
+    try {
+        sourceInfo = await stat(absolutePath);
+        // Decoders can swallow filesystem errors. Check readability before decoding
+        // or serving a cached thumbnail, so restored permissions remain retryable.
+        const source = await open(absolutePath, 'r');
+        await source.close();
+    }
+    catch (error) {
+        return { ok: false, ...classifyExistingPathError(error, 'file') };
+    }
     if (!sourceInfo.isFile()) {
         return {
             ok: false,

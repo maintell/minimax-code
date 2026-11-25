@@ -1,7 +1,7 @@
 import { DEFAULT_COLLECTION_POLICY, parseCollectionPolicy } from "@mavis/shared/collection-policy";
 import { createCollectionPolicyMatcher } from "@mavis/shared/collection-policy/matcher";
 import { resolveSessionClioCaptureEnabled } from "@mavis/shared/session-clio";
-import { parseRunawayGuardOverride, parsePromptSuggestionRemotePolicy, parseBunnyRemotePolicy } from "@mavis/config";
+import { parseRunawayGuardOverride, parsePromptSuggestionRemotePolicy, parseBunnyRemotePolicy, getBunnyMissingPolicy } from "@mavis/config";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
@@ -12,7 +12,7 @@ import { pipeline } from "node:stream/promises";
 import { app, BrowserWindow } from "electron";
 import { resetConfig, getConfig, writeLocalRuntimeAuthContext, readLocalRuntimeAuthContext } from "@mavis/config";
 import * as ws_1 from "ws";
-import logger from "../../utils/logger";
+import * as logger_1 from "../../utils/logger";
 import { prepareDesktopMcodeToolsHostBinDir } from "../mcode-tools/host-bin-dir";
 import { DOMAIN_URL, IPC_CHANNELS } from "../../config/constants";
 import { resolveDesktopPromptConfigKey } from "../../config/prompt-config-key";
@@ -33,6 +33,7 @@ export { ensureComputerUseUtilityStarted } from "./utility";
 export { releaseComputerUseLease } from "./utility";
 
 let localRuntimeModulePromise = null;
+const runtimeHttpLogger = (0, logger_1.getCategoryLogger)('main', 'runtime-http');
 let httpServer = null;
 let httpPort = null;
 let localRuntimeStartupToken = null;
@@ -55,10 +56,13 @@ let contextWindowUsageEnabled = true;
 let runawayGuardConfig = {};
 let promptSuggestionPolicy = {};
 /**
- * Apollo Bunny rollout (default, UID allowlist, buckets); empty until a fetch
- * succeeds, which leaves the build default (on outside prod, off in prod).
+ * Apollo Bunny rollout (default, UID allowlist, buckets); undefined until the renderer pushes
+ * one. Until then Runtime gets `getBunnyMissingPolicy()`: inside and public prod packages fail
+ * closed (kill switch on), every other package keeps the empty policy and its build default.
+ * Resolved on read, not at module load, because packaged build flags reach `process.env` only
+ * once the bundled env file is applied.
  */
-let bunnyPolicy = {};
+let bunnyPolicy;
 let toolResultCompactionConfig = {};
 let bunnyContextConfig = {};
 /**
@@ -170,7 +174,7 @@ async function bootstrapManagedRuntimeEnv() {
         }
     }
     catch {
-        logger.warn('[LocalRuntime] managed routing lane bootstrap unavailable');
+        logger_1.default.warn('[LocalRuntime] managed routing lane bootstrap unavailable');
     }
 }
 function readNonEmptyEnv(key) {
@@ -180,7 +184,8 @@ function readNonEmptyEnv(key) {
 function resolveMainFetch() {
     return resolveElectronNetFetch() ?? fetch;
 }
-function currentManagedRoutingHeaders() {
+/** Lane headers for managed-backend requests made by Electron main, e.g. manual Space uploads. */
+export function currentManagedRoutingHeaders() {
     const lane = managedRoutingContext?.bedrockLane?.trim();
     if (!lane)
         return undefined;
@@ -615,11 +620,11 @@ function createLocalAsrClientSession(clientTransport) {
                     signal: requestController.signal,
                 });
                 const traceId = response.headers.get('Trace-Id') ?? 'unknown';
-                logger.info(`[ASR:amadeus] proxy SSE response traceId=${traceId} status=${response.status} content-type=${response.headers.get('content-type') ?? 'unknown'}`);
+                logger_1.default.info(`[ASR:amadeus] proxy SSE response traceId=${traceId} status=${response.status} content-type=${response.headers.get('content-type') ?? 'unknown'}`);
                 await consumeAmadeusAsrSse(response, (text, final, index) => {
                     if (finalized)
                         return;
-                    logger.info(`[ASR:amadeus] parsed event index=${index ?? 'implicit'} finish=${final} textLength=${text.length}`);
+                    logger_1.default.info(`[ASR:amadeus] parsed event index=${index ?? 'implicit'} finish=${final} textLength=${text.length}`);
                     clientTransport.sendFrame({
                         type: 'result',
                         text,
@@ -710,6 +715,27 @@ export function createLocalAsrNativeSession(input) {
 export function parseLocalAsrNativeControlFrame(frame) {
     return parseLocalAsrBrowserFramePayload(frame);
 }
+/** Keep diagnostic stack locations without persisting request data or private directories. */
+function diagnosticHttpErrorFacts(error) {
+    const code = error instanceof Error ? error.code : undefined;
+    const stack = error instanceof Error && typeof error.stack === 'string' ? error.stack : '';
+    return {
+        errorType: error instanceof Error ? 'Error' : typeof error,
+        ...(typeof code === 'string' && /^(?:ERR_[A-Z0-9_]{1,64}|E[A-Z]{2,24})$/u.test(code)
+            ? { errorCode: code }
+            : {}),
+        // Basenames and line/column numbers suffice to locate code. Do not retain
+        // the error message, function arguments, URLs, or absolute workspace paths.
+        stackLocations: stack
+            .slice(0, 12000)
+            .split('\n')
+            .slice(1, 9)
+            .flatMap((line) => {
+            const match = /(?:[/\\]|node:)([A-Za-z0-9_.-]{1,100}:\d+:\d+)\)?$/u.exec(line);
+            return match ? [match[1]] : [];
+        }),
+    };
+}
 async function startLocalRuntimeServer() {
     if (!isDiagnosticSidecarEnabled())
         return;
@@ -721,6 +747,15 @@ async function startLocalRuntimeServer() {
     }
     httpServer = createServer((req, res) => {
         void handleHttpRequest(req, res).catch((err) => {
+            try {
+                runtimeHttpLogger.error({
+                    msg: '[LocalRuntime] diagnostic HTTP request failed',
+                    ...diagnosticHttpErrorFacts(err),
+                });
+            }
+            catch {
+                // Diagnostics must not prevent the HTTP error response from completing.
+            }
             if (res.destroyed || res.writableEnded)
                 return;
             if (!res.headersSent) {
@@ -844,7 +879,7 @@ export function prepareLocalRuntime() {
             await stopLocalRuntimeServer();
             await stopUtilityRuntime();
             localRuntimeSidecarFailReason = error instanceof Error ? error.message : String(error);
-            logger.error(`[LocalRuntime] diagnostic sidecar failed to start: ${localRuntimeSidecarFailReason}`);
+            logger_1.default.error(`[LocalRuntime] diagnostic sidecar failed to start: ${localRuntimeSidecarFailReason}`);
             return false;
         }
     })();
@@ -916,7 +951,7 @@ export async function setLocalRuntimeAuthContext(data, options = {}) {
             // Invalidate the old Utility identity before policy refresh or runtime
             // warmup can take noticeable time. A refresh within the same authenticated
             // login keeps its identity so account-owned MiniApps are not retired.
-            void setUtilityRuntimeAuthContext(transitionContext).catch((error) => logger.warn(`[LocalRuntime] Failed to publish pending auth context: ${String(error)}`));
+            void setUtilityRuntimeAuthContext(transitionContext).catch((error) => logger_1.default.warn(`[LocalRuntime] Failed to publish pending auth context: ${String(error)}`));
         }
     }
     if (options.prepare !== false) {
@@ -971,7 +1006,7 @@ export function setLocalRuntimePromptSuggestionPolicy(value) {
 }
 /** Stores the validated Apollo Bunny rollout for live updates and Utility restarts. */
 export function setLocalRuntimeBunnyPolicy(value) {
-    bunnyPolicy = parseBunnyRemotePolicy(value, (message) => logger.warn(`[LocalRuntime] Bunny policy: ${message}`));
+    bunnyPolicy = parseBunnyRemotePolicy(value, (message) => logger_1.default.warn(`[LocalRuntime] Bunny policy: ${message}`));
     setUtilityRuntimeBunnyPolicy(bunnyPolicy);
 }
 /** Applies a validated, non-persistent Apollo threshold snapshot to the live Desktop runtime. */
@@ -997,7 +1032,7 @@ export function setLocalRuntimeBunnyContextConfig(value) {
 export function setLocalRuntimeCollectionPolicyConfig(value) {
     const parsed = parseCollectionPolicy(value);
     if (!parsed) {
-        logger.warn('[LocalRuntime] Rejected collection policy payload; keeping the last valid policy');
+        logger_1.default.warn('[LocalRuntime] Rejected collection policy payload; keeping the last valid policy');
         return false;
     }
     // Apollo now owns the policy for the rest of this process, so a later fork's
@@ -1022,7 +1057,7 @@ function restorePersistedCollectionPolicy(persisted) {
     collectionPolicyRestored = true;
     const restored = parseCollectionPolicy(persisted);
     if (!restored) {
-        logger.warn('[LocalRuntime] Persisted collection policy is invalid; using the built-in policy');
+        logger_1.default.warn('[LocalRuntime] Persisted collection policy is invalid; using the built-in policy');
         return;
     }
     adoptCollectionPolicy(restored);
@@ -1049,7 +1084,7 @@ function persistCollectionPolicy(policy) {
         storage.setDesktopConfig({ collectionPolicy: policy });
     })
         .catch((error) => {
-        logger.warn(`[LocalRuntime] Failed to persist collection policy: ${String(error)}`);
+        logger_1.default.warn(`[LocalRuntime] Failed to persist collection policy: ${String(error)}`);
     });
 }
 function normalizeToolResultCompactionConfig(value) {
@@ -1146,7 +1181,7 @@ function persistLocalRuntimeAuthContext(context) {
         return true;
     }
     catch (error) {
-        logger.warn(`[LocalRuntime] Failed to persist auth context: ${String(error)}`);
+        logger_1.default.warn(`[LocalRuntime] Failed to persist auth context: ${String(error)}`);
         return false;
     }
 }
@@ -1192,7 +1227,7 @@ function hydratePersistedLocalRuntimeAuthContext(dataDir) {
         authContext = normalizeAuthContext({ ...nextAuthContext, ...authContext });
     }
     catch (error) {
-        logger.warn(`[LocalRuntime] Failed to load persisted auth context: ${String(error)}`);
+        logger_1.default.warn(`[LocalRuntime] Failed to load persisted auth context: ${String(error)}`);
     }
 }
 function readOptionalString(value) {
@@ -1237,7 +1272,7 @@ function broadcastMiniAppSlept(event) {
         }
         catch (error) {
             // One closing window must not keep the notice from the others.
-            logger.warn(`[LocalRuntime] Mini App slept notice failed for window ${window.id}: ${String(error)}`);
+            logger_1.default.warn(`[LocalRuntime] Mini App slept notice failed for window ${window.id}: ${String(error)}`);
         }
     }
 }
@@ -1253,7 +1288,7 @@ registerUtilityRuntimeMainHooks({
     getContextWindowUsageEnabled: () => contextWindowUsageEnabled,
     getRunawayGuardConfig: () => runawayGuardConfig,
     getPromptSuggestionPolicy: () => promptSuggestionPolicy,
-    getBunnyPolicy: () => bunnyPolicy,
+    getBunnyPolicy: () => bunnyPolicy ?? getBunnyMissingPolicy(),
     getToolResultCompactionConfig: () => toolResultCompactionConfig,
     getBunnyContextConfig: () => bunnyContextConfig,
     getCollectionPolicy: () => collectionPolicy,
@@ -1274,7 +1309,7 @@ registerUtilityRuntimeMainHooks({
         catch {
             // Config store unreadable this early: the manager's own fallback picks
             // English rather than losing the failure report.
-            logger.warn('[LocalRuntime] desktop language lookup failed; using English failure text');
+            logger_1.default.warn('[LocalRuntime] desktop language lookup failed; using English failure text');
             return true;
         }
     },
@@ -1288,7 +1323,7 @@ registerUtilityRuntimeMainHooks({
                 window.webContents.send(IPC_CHANNELS.RUNTIME_FAILED, failReason);
             }
             catch {
-                logger.warn('[LocalRuntime] runtime-failed push to window failed');
+                logger_1.default.warn('[LocalRuntime] runtime-failed push to window failed');
             }
         }
     },
@@ -1296,17 +1331,24 @@ registerUtilityRuntimeMainHooks({
         isEnabled: () => getConfig().beta.filePanelBrowser === true,
         onAgentAction: (event) => broadcastEmbeddedBrowserAgentAction(event),
     }),
-    openMiniAppSurface: async ({ sessionId, pluginId, path, signal, isGenerationCurrent }) => {
-        await openManagedMiniAppSurface({
+    openMiniAppSurface: async ({ sessionId, pluginId, path, turnId, signal, isGenerationCurrent, }) => {
+        // An Agent open never counts as user attention or evicts another App at capacity.
+        const opened = await openManagedMiniAppSurface({
+            initiator: 'agent',
             sessionId,
             pluginId,
             ...(path !== undefined ? { path } : {}),
             signal,
             isGenerationCurrent,
         });
+        // The Agent's `miniapp.open` works in the page it opened, the same as open_tab { miniAppId }.
+        if (turnId && typeof opened?.tabId === 'number') {
+            const { getEmbeddedBrowserManager } = await import('../browser/embedded-browser-manager');
+            getEmbeddedBrowserManager().grantAgentMiniAppControl(sessionId, turnId, opened.tabId);
+        }
         // openManagedMiniAppSurface has crossed the native-tab commit point.
         // Keep the renderer event aligned with that committed visible state.
-        broadcastEmbeddedBrowserAgentAction({ sessionId, action: 'open_miniapp' });
+        broadcastEmbeddedBrowserAgentAction({ sessionId, action: 'open_miniapp', pluginId });
     },
     closeMiniAppSurface: ({ pluginId, isGenerationCurrent }) => closeManagedMiniAppSurface({ pluginId, isGenerationCurrent }),
     sleepMiniAppSurface: (input) => sleepManagedMiniAppSurface(input, { notifySlept: broadcastMiniAppSlept }),
@@ -1350,7 +1392,7 @@ registerUtilityRuntimeMainHooks({
         }
         minimaxDataDirOverridden = true;
         resetConfig();
-        logger.info(`[LocalRuntime] Launch plan: buildEnv=${process.env.NEXT_PUBLIC_BUILD_ENV ?? 'unset'}, ` +
+        logger_1.default.info(`[LocalRuntime] Launch plan: buildEnv=${process.env.NEXT_PUBLIC_BUILD_ENV ?? 'unset'}, ` +
             `dataDirMode=${launchPlan.dataDirMode}, policy=${launchPlan.startupExecutionPolicy}, ` +
             `clone=${isolation ? (isolation.created ? 'created' : 'reused') : 'disabled'}`);
         const memoryOnlyAuth = authContextPersistence === 'memory-only';

@@ -25,13 +25,17 @@ export function validateCreateInput(input) {
  * A review dispatch also carries the `<review-target>` block: what the checked task recorded
  * about itself, which the reviewer has no tool to read for itself. Without `reviewTarget` the
  * message is byte-for-byte the one an ordinary dispatch writes.
+ *
+ * `verdictGate` is `bunny.verdictGate` as the runtime gate reads it; it decides whether a review
+ * dispatch is also told to end with a verdict. Both arguments are required so no caller can
+ * leave that decision to a default.
  */
-export function taskInstruction(input, reviewTarget) {
+export function taskInstruction(input, reviewTarget, verdictGate) {
     return (renderTaskFirstMessage({
         content: input.content,
         criteria: (input.doneWhen ?? []).map((item) => item.trim()).filter(Boolean),
         userWords: input.userWords,
-    }) + reviewTargetSection(reviewTarget));
+    }) + reviewTargetSection(reviewTarget, verdictGate));
 }
 /** A project task's `.link.json`: a pointer to where it runs, never a copy of its files. */
 export function assignmentLink(input) {

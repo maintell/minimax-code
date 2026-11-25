@@ -12,6 +12,7 @@ import { performance } from 'node:perf_hooks';
 import { getEvolutionReminder, boundMap } from './evolution.js';
 import { touchTodoStateTurn } from './todo-state.js';
 import { stripProviderSuffix } from './providers.js';
+import { wrapSystemReminderBlocks } from './envelope.js';
 export class SystemReminderService {
     collector;
     registry;
@@ -177,9 +178,7 @@ export class SystemReminderService {
             if (criticalOnly) {
                 this.logger.info(this.logCtx(), `SR injection limited to critical providers sessionId=${session.sessionId} modelKey=${disabledModelKey ?? 'unknown'} providers=${namedProviders.length} blocks=${blocks.length}`);
             }
-            const fullText = blocks.length === 0
-                ? null
-                : `<system-reminder>\n${blocks.join('\n\n')}\n</system-reminder>`;
+            const fullText = blocks.length === 0 ? null : wrapSystemReminderBlocks(blocks);
             const diagnostic = diagEnabled
                 ? {
                     fullText,

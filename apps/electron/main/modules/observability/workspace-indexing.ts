@@ -1,3 +1,4 @@
+import { isOutboxOwnerUserId } from "./owner";
 const STAGES = {
     eligibility: true,
     prepare: true,
@@ -54,7 +55,7 @@ export function parseWorkspaceIndexingObservation(value) {
 export function sanitizeWorkspaceIndexingPayload(payload) {
     const observation = parseWorkspaceIndexingObservation(payload);
     const owner = payload.owner_user_id;
-    if (!observation || typeof owner !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(owner))
+    if (!observation || !isOutboxOwnerUserId(owner))
         return {};
     return { ...observation, owner_user_id: owner };
 }

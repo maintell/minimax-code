@@ -9,7 +9,7 @@
  */
 import crypto from 'node:crypto';
 import { ilinkFetch } from './ilink-fetch.js';
-import { buildIlinkBaseInfo, buildIlinkCommonHeaders } from './ilink-wire.js';
+import { buildIlinkBaseInfo, buildIlinkCommonHeaders, parseIlinkJson } from './ilink-wire.js';
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -60,7 +60,8 @@ export class ILinkClient {
                 label: 'getUpdates',
                 signal,
             });
-            return JSON.parse(text);
+            // Lossless: a uint64 `message_id` must not be rounded by JSON.parse.
+            return parseIlinkJson(text);
         }
         catch (err) {
             if (err instanceof Error && err.name === 'AbortError') {
@@ -80,7 +81,7 @@ export class ILinkClient {
             timeoutMs: this.timeoutMs,
             label: 'sendMessage',
         });
-        const resp = JSON.parse(text || '{}');
+        const resp = parseIlinkJson(text || '{}');
         if (resp.ret !== undefined && resp.ret !== 0) {
             throw new Error(`sendMessage ret=${resp.ret}`);
         }
@@ -99,7 +100,7 @@ export class ILinkClient {
             timeoutMs: this.timeoutMs,
             label: 'getUploadUrl',
         });
-        return JSON.parse(text);
+        return parseIlinkJson(text);
     }
     // -------------------------------------------------------------------------
     // sendTyping
@@ -128,7 +129,7 @@ export class ILinkClient {
             timeoutMs: DEFAULT_CONFIG_TIMEOUT_MS,
             label: 'getConfig',
         });
-        return JSON.parse(text);
+        return parseIlinkJson(text);
     }
     // -------------------------------------------------------------------------
     // Internal fetch wrapper

@@ -20,11 +20,12 @@
  *      `detectEncodingForResolvedPath` semantics).
  *
  * Local-FS assumption: like read-video.ts / read-guards.ts, this module
- * uses physical-fs so Electron cannot treat user archives as directories.
+ * uses physical-fs by default so Electron cannot treat user archives as
+ * directories; the core tools pass their host fs port instead.
  * Both hosts (desktop process, cloud sandbox executor) run on a local FS.
  * Remote-FS hosts keep pi's default operations and none of this engages.
  */
-import { readFile as fsReadFile, open as fsOpen, stat as fsStat, writeFile as fsWriteFile, realpath as fsRealpath, mkdir as fsMkdir, } from './physical-fs.js';
+import { physicalToolFs } from './physical-fs.js';
 import { formatPatch, structuredPatch } from 'diff';
 import { withPluginHookCompatibleToolResponse } from '../plugin-hooks/vendor-tool-response.js';
 import { regularFileVersion } from './file-read-ledger.js';
@@ -89,11 +90,11 @@ function encodeText(body, encoding, bom) {
     }
     return Buffer.from(joinBomText(body, bom), 'utf-8');
 }
-async function probeOldFile(absolutePath) {
+async function probeOldFile(absolutePath, fs) {
     const fresh = { existed: false, encoding: 'utf-8', srcBom: false };
     let stats;
     try {
-        stats = await fsStat(absolutePath);
+        stats = await fs.stat(absolutePath);
     }
     catch (err) {
         if (err.code === 'ENOENT')
@@ -101,11 +102,13 @@ async function probeOldFile(absolutePath) {
         throw err;
     }
     const size = stats.size;
+    // The port only promises CoreToolStats; `version` is read by the guard alone,
+    // and the desktop host that sets a guard stats through physical-fs.
     const version = regularFileVersion(stats);
     if (size > WRITE_CAPTURE_MAX_BYTES) {
         // Sample just enough bytes for BOM/encoding preservation; skip oldText.
         const sample = Buffer.alloc(Math.min(BINARY_SAMPLE_BYTES, size));
-        const handle = await fsOpen(absolutePath, 'r');
+        const handle = await fs.open(absolutePath, 'r');
         try {
             await handle.read(sample, 0, sample.length, 0);
         }
@@ -115,7 +118,7 @@ async function probeOldFile(absolutePath) {
         const { encoding, bom } = detectEncodingFromBuffer(sample);
         return { existed: true, encoding, srcBom: bom, version, captureSkipped: 'too_large' };
     }
-    const raw = await fsReadFile(absolutePath);
+    const raw = await fs.readFile(absolutePath);
     const { encoding, bom } = detectEncodingFromBuffer(raw);
     if (encoding === 'utf-8' && raw.subarray(0, BINARY_SAMPLE_BYTES).includes(0)) {
         // NULs in a non-UTF-16 file: binary — diffing it would be garbage.
@@ -129,11 +132,11 @@ async function probeOldFile(absolutePath) {
  * failed, stats again so an existing file is still checked, and lets stat
  * errors other than ENOENT refuse the write.
  */
-async function guardedFileVersion(absolutePath, probe) {
+async function guardedFileVersion(absolutePath, probe, fs) {
     if (probe)
         return probe.version;
     try {
-        return regularFileVersion(await fsStat(absolutePath));
+        return regularFileVersion((await fs.stat(absolutePath)));
     }
     catch (err) {
         if (err.code === 'ENOENT')
@@ -160,17 +163,20 @@ async function guardedFileVersion(absolutePath, probe) {
  * own result text rather than risking a cross-file mixup.
  *
  * `guard` is desktop-only; without it (cloud) the write path is unchanged.
+ * Core tools pass their host fs port, on which the desktop host also carries
+ * `guard`; without a port the physical filesystem is used.
  */
 export function createCapturingWriteOperations(options = {}) {
     const { guard } = options;
+    const fs = 'writeFile' in options ? options : physicalToolFs;
     const captures = new Map();
     const operations = {
-        realpath: fsRealpath,
-        mkdir: (dir) => fsMkdir(dir, { recursive: true }).then(() => { }),
+        realpath: (path) => fs.realpath(path),
+        mkdir: (dir) => fs.mkdir(dir, { recursive: true }).then(() => { }),
         async writeFile(absolutePath, content) {
             let probe;
             try {
-                probe = await probeOldFile(absolutePath);
+                probe = await probeOldFile(absolutePath, fs);
             }
             catch {
                 // Capture is an enhancement, never a gate: if the old file cannot
@@ -180,13 +186,13 @@ export function createCapturingWriteOperations(options = {}) {
                 probe = undefined;
             }
             if (guard) {
-                await guard.beforeWrite(absolutePath, await guardedFileVersion(absolutePath, probe));
+                await guard.beforeWrite(absolutePath, await guardedFileVersion(absolutePath, probe, fs));
             }
             const { bom: nextBom, text: body } = splitBomText(content);
             const encoding = probe?.encoding ?? 'utf-8';
             const bom = (probe?.srcBom ?? false) || nextBom;
             const buffer = encodeText(body, encoding, bom);
-            await fsWriteFile(absolutePath, buffer);
+            await fs.writeFile(absolutePath, buffer);
             if (guard)
                 await guard.afterWrite(absolutePath);
             if (!probe)

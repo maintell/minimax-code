@@ -151,6 +151,7 @@ export async function initializeTurnSystem(options) {
     const trustedSubmission = createSubmission(trustedMessageDelivery.activation);
     const historyMutation = createHistoryMutationCapability({
         sessions: options.sessions.sessions.historyMutation,
+        harnessHistory: options.harnessHistory,
         forkProjections: options.forkProjections,
         rewindProjections: options.rewindProjections,
         activeTurnId: (sessionId) => execution.activeTurnId(sessionId),
@@ -358,6 +359,9 @@ function createRuntimeSteeringRequeue(options, released) {
                 teardown: createSteeringTeardownCommit({
                     projectDisplay,
                     canonicalHistory: options.sessions.canonicalHistory,
+                    ...(options.receiverIsCoordinator
+                        ? { receiverIsCoordinator: options.receiverIsCoordinator }
+                        : {}),
                     ...(options.nowMs ? { nowMs: options.nowMs } : {}),
                     ...(options.logger ? { logger: options.logger } : {}),
                     ...(options.onSteeringTeardownCommitted
@@ -373,6 +377,7 @@ function createRuntimeTurnContinuation(options, execution) {
     return createTurnContinuationService({
         history: options.sessions.canonicalHistory,
         execution,
+        harness: options.harnessHistory,
         previousTurn: {
             readTerminal: (sessionId) => options.sessions.sessions.repository.readAgentTurnTerminal(sessionId),
         },

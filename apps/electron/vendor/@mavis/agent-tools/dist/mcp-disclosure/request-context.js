@@ -2,6 +2,7 @@ import { renderCarriedToolDefinitions, renderDeferredToolCatalog } from './catal
 import { compactionSummaryKey as summaryKey, compactionSummaryTimestamp as summaryTimestamp, findLastCompactionSummary, } from './compaction-summary.js';
 import { confirmToolSearchAnnouncement, forgetAllToolSearchSessionStates, forgetToolSearchSessionState, noteCompaction, noteToolSearchNoticeInHistory, pendingToolSearchNotice, plannedToolSearchWindow, receiveToolSearchResponse, toolSearchSessionState, toolSearchTurnWindow, } from './session-state.js';
 import { readToolSearchTurnFacts } from './turn-facts.js';
+import { isAnsweredResponse, isNewestNotice, requestUserText } from './window-notice.js';
 /** @internal Exported for focused tests. */
 export const TOOL_SEARCH_CONTEXT_REASON = 'tool-search-context';
 /**
@@ -117,7 +118,9 @@ export function createToolSearchContextHook(input) {
         // The summary's own time keeps every copy identical across requests.
         const timestamp = summary ? summaryTimestamp(summary) : 0;
         const carried = facts.carryAcrossCompaction && summary ? carriedText(summaryKey(summary)) : undefined;
-        const restored = summary && notice && !isNewestNotice(messages, notice) ? notice : undefined;
+        const restored = summary && notice && !isNewestNotice(messages, notice, NOTICE_TAG, false)
+            ? notice
+            : undefined;
         return [
             catalog && {
                 text: catalog,
@@ -321,31 +324,6 @@ function generationLatch(before, summary, hookInput) {
     return { generation, capacity, dropped };
 }
 const NOTICE_TAG = '<tool-availability-update>';
-function userText(message) {
-    if (message?.role !== 'user')
-        return undefined;
-    return typeof message.content === 'string'
-        ? message.content
-        : message.content.flatMap((part) => (part.type === 'text' ? [part.text] : [])).join('\n');
-}
-/**
- * `notice` is the newest notice among the user messages, of those after the last
- * assistant message when `sentAnew`. Summaries quoting it are no user messages.
- */
-function isNewestNotice(messages, notice, sentAnew = false) {
-    for (let at = messages.length - 1; at >= 0; at -= 1) {
-        const message = messages[at];
-        if (sentAnew && message?.role === 'assistant')
-            return false;
-        const text = userText(message) ?? '';
-        const newest = text.lastIndexOf(NOTICE_TAG);
-        if (newest === -1)
-            continue;
-        const sent = text.lastIndexOf(notice);
-        return sent !== -1 && sent + notice.indexOf(NOTICE_TAG) === newest;
-    }
-    return false;
-}
 /**
  * Marks the window the Turn planned as sent, so an answer can make it the
  * Session's. Confirms the pending notice when it is the newest notice among the
@@ -358,9 +336,10 @@ function noteSentNotices(sessionId, messages, planned) {
     if (planned)
         planned.sent = true;
     const notice = pendingToolSearchNotice(sessionId);
-    if (notice && isNewestNotice(messages, notice, true))
+    if (notice && isNewestNotice(messages, notice, NOTICE_TAG, true)) {
         confirmToolSearchAnnouncement(sessionId);
-    noteToolSearchNoticeInHistory(sessionId, () => messages.some((message) => userText(message)?.includes(NOTICE_TAG)));
+    }
+    noteToolSearchNoticeInHistory(sessionId, () => messages.some((message) => requestUserText(message)?.includes(NOTICE_TAG)));
 }
 /**
  * The after-LLM half of `createToolSearchContextHook`, registered with it by
@@ -375,10 +354,8 @@ export function createToolSearchResponseHook(input) {
     // Created with the Turn's request hook, after its catalog build planned the window.
     const planned = plannedToolSearchWindow(sessionId);
     return ({ message }) => {
-        const answered = message.stopReason !== 'error' &&
-            (message.stopReason !== 'aborted' || message.content.length > 0);
         try {
-            if (answered)
+            if (isAnsweredResponse(message))
                 receiveToolSearchResponse(sessionId, planned);
         }
         catch {

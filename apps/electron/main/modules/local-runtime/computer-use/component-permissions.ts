@@ -1,4 +1,4 @@
-import { createComputerUseClient, discoverComponent } from "@mavis/computer-use";
+import { isComputerUseOsSupported, createComputerUseClient, discoverComponent } from "@mavis/computer-use";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { shell } from "electron";
@@ -11,6 +11,13 @@ const unavailable = () => ({
     screenRecording: 'unavailable',
     captureReady: false,
 });
+/** Checked before preparing or launching the component, which older macOS refuses to open. */
+function osUnsupported(operation) {
+    if (isComputerUseOsSupported())
+        return undefined;
+    logUnavailable(operation, 'computer_os_version_unsupported');
+    return { ...unavailable(), unavailableReason: 'os_version_unsupported' };
+}
 /** Error codes and names only; arbitrary messages may contain private profile paths. */
 function failureCode(error) {
     const code = error?.code;
@@ -83,6 +90,9 @@ async function inspect(request) {
     }
 }
 export async function getComputerUsePermissionStatus() {
+    const unsupported = osUnsupported('status');
+    if (unsupported)
+        return unsupported;
     try {
         return snapshot(await inspect(false), 'status');
     }
@@ -93,6 +103,8 @@ export async function getComputerUsePermissionStatus() {
 }
 export async function requestComputerUsePermission(kind) {
     validateKind(kind);
+    if (osUnsupported('request'))
+        return { status: 'unavailable', message: 'MiniMax Computer Use requires macOS 13 or later.' };
     try {
         const result = await inspect(true);
         const status = snapshot(result, 'request')[kind === 'accessibility' ? 'accessibility' : 'screenRecording'];

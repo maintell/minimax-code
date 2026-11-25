@@ -52,10 +52,18 @@ let LocalCodeReviewTool = (() => {
         constructor(adapter) {
             this.adapter = adapter;
         }
-        async execute(ctx, input, signal) {
+        async execute(ctx, input, signal, onUpdate) {
             if (signal?.aborted)
                 throw new Error('Operation aborted');
-            const result = await this.adapter.run(ctx, input, signal);
+            const result = await this.adapter.run(ctx, input, signal, (execution) => {
+                onUpdate?.({
+                    content: [{ type: 'text', text: 'Started code review.' }],
+                    details: { subagent_executions: [execution] },
+                });
+            });
+            const executionDetails = result.subagentExecutions?.length
+                ? { subagent_executions: result.subagentExecutions }
+                : {};
             if (result.status === 'failed') {
                 const errorMessage = result.errorMessage ?? 'Code review failed';
                 const text = `<code_review_error>${escapeTagText(errorMessage)}</code_review_error>`;
@@ -63,7 +71,7 @@ let LocalCodeReviewTool = (() => {
                     tool_name: LocalCodeReviewToolDef.name,
                     text,
                     content: [{ type: 'text', text }],
-                    details: { status: 'failed', mode: result.mode },
+                    details: { status: 'failed', mode: result.mode, ...executionDetails },
                     isError: true,
                 };
             }
@@ -74,7 +82,7 @@ let LocalCodeReviewTool = (() => {
                     tool_name: LocalCodeReviewToolDef.name,
                     text,
                     content: [{ type: 'text', text }],
-                    details: { status: 'prepared', mode: result.mode },
+                    details: { status: 'prepared', mode: result.mode, ...executionDetails },
                 };
             }
             const text = `<code_review_result_ready mode="${result.mode}">` +
@@ -84,7 +92,7 @@ let LocalCodeReviewTool = (() => {
                 tool_name: LocalCodeReviewToolDef.name,
                 text,
                 content: [{ type: 'text', text }],
-                details: { status: 'succeeded', mode: result.mode },
+                details: { status: 'succeeded', mode: result.mode, ...executionDetails },
             };
         }
     };

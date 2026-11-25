@@ -1,44 +1,35 @@
-import { mutableTitleContext } from './agent-host/preparation/config/text-completion.js';
+import { dirname } from 'node:path';
+import { createSavePtcScriptTool } from '@mavis/agent-tools/desktop';
+import { mutableTitleContext } from './agent-host/preparation/text-completion.js';
 import { resolveSegmentContextBudget } from '@mavis/shared/segment-context-budget';
 import { overridesGenericReminders, readTrustedAgentProfileCoordination, } from '@mavis/shared/agent-coordination';
-import { scopeSegmentCompaction } from './agent-host/compaction/segment-turn.js';
 import { createProductionRunawayGuardExtension } from './runaway-guard/extension.js';
 import { streamSimple } from '@earendil-works/pi-ai';
-import { outputLimitRecoveryExtension, requestMediaExtension, sessionReportExtension, toolOutputBudgetExtension, webSearchContentBudgetExtension, } from '@mavis/agent-extension';
+import { sessionReportExtension, webSearchContentBudgetExtension } from '@mavis/agent-extension';
 import { withLLMRetry } from '@mavis/agent-core/pi-turn-runner';
-import { describeLocalBrowserToolInput } from '@mavis/agent-tools/desktop';
-import { combineAgentEventObservers } from './lifecycle/production-event-observers.js';
 import { adaptCanonicalHistory } from './lifecycle/canonical-history.adapter.js';
 import { createHostPtcWiring } from './lifecycle/ptc-session-store-composition.js';
-import { TOOL_RESULT_COMPACTION_DEFAULTS, parseRequestMediaConfig, parseToolResultCompactionConfig, } from '@mavis/config';
+import { parseRequestMediaConfig, parseToolResultCompactionConfig, } from '@mavis/config';
 import { createSideChatModeMessage, isSideChatModeMessage, ArchiveTitleModelAdapter, resolveSessionHistoryPaths, } from '../session-system/index.js';
 import { isPeekSession } from '../session-system/index.js';
-import { createNativeAgentHostProductionDependencies, createNativeLocalAgentPreparation, LocalAgentHost, PtcSessionStore, } from './agent-host/index.js';
-import { createContextCompactors } from './compaction/execution/production-context-compactors.js';
-import { createMainRequestProjection, } from './compaction/execution/request-projection.js';
-import { ContextUsageAnchorState } from './compaction/execution/usage-anchor.js';
-import { CheckpointImageFileWriter } from './compaction/algorithm/checkpoint-image-file-writer.js';
+import { createDesktopSafetyCheck, createLocalHarness, createLocalMachineCompute, createLocalRunScopes, createNativeLocalAgentPreparation, createNativePtcResultProjection, } from './agent-host/index.js';
+import { combineAgentEventObservers, createAssetsUploadSyncRecorder, projectTurnRequestContext, readSessionAgentExecutionSnapshot, scopeSegmentCompaction, UNBOUNDED_HARNESS_LIMITS, } from '@mavis/harness';
+import { AutomaticContextCompactor, createMainRequestProjection, } from '@mavis/harness/compaction';
+import { createHostCapabilityRegistry } from './product-tools/host-capability-adapters.js';
+import { desktopPromptBlocks } from './product-tools/desktop-catalog-rules.js';
+import { prepareDesktopBashTools } from './product-tools/desktop-bash-tools.js';
 import { createFileApiRuntime } from './persistence/file-api-upload.repository.js';
 import { createSegmentCompactionCoordinator } from './compaction/segment/composition.js';
 import { ToolOutputArtifactRepository } from './persistence/tool-output-artifact.repository.js';
-import { productionEmergencyFilesGrant, productionEmergencyPorts, segmentProfileSessions, } from './runtime/emergency/production.js';
-import { fenceForceReleasedTurns } from './agent-host/events/released-turn-fence.js';
-import { productionContextResetPort } from './runtime/emergency/context-reset.js';
-import { agentHomeGrantSource, assignmentSpaceGrantSource, compactionSnapshotGrantSource, createSessionReadableGrantResolver, runtimeWorkspaceGrantSource, sessionAttachmentGrantSource, toolOutputGrantSource, } from './agent-host/runner/policy/session-readable-grants.js';
-import { pluginReadGrantSources } from './agent-host/runner/policy/plugin-grant-sources.js';
 import { isProductionRuntimeErrorRetryable } from './runtime-error-retry-policy.js';
-import { createTodoCadenceReminderHook } from './execution/reminder/todo-cadence-reminder.js';
-import { createHostTurnReminders } from './execution/reminder/host-turn-reminders.js';
-import { createSessionIdentityReminderHook } from './execution/reminder/session-identity-reminder.js';
-import { hasPtcTurnChildTodoWrite } from './agent-host/execution/ptc/catalog.js';
-import { projectTurnRequestContext } from './agent-host/execution/ptc/compaction-reminder.js';
-import { readSessionAgentExecutionSnapshot } from './agent-host/preparation/config/session-agent-execution-snapshot.js';
-import { McpToolResultHistoryExternalizer } from './agent-host/execution/mcp-tool-result-history-externalizer.js';
-import { createBrowserHostCapabilityAdapter } from './agent-host/assembly/host-capability/browser.js';
-import { createComputerUseHostCapabilityAdapter } from './agent-host/assembly/host-capability/computer.js';
-import { HostCapabilityRegistry } from './agent-host/assembly/host-capability/registry.js';
+import { packagedPtcWorkerUrl } from './runtime/ptc-worker-url.js';
+import { productionEmergencyFilesGrant, productionEmergencyPorts, segmentProfileSessions, } from './runtime/emergency/production.js';
+import { productionContextResetPort } from './runtime/emergency/context-reset.js';
+import { agentHomeGrantSource, assignmentSpaceGrantSource, compactionSnapshotGrantSource, createSessionReadableGrantResolver, runtimeWorkspaceGrantSource, sessionAttachmentGrantSource, toolOutputGrantSource, } from './runtime/session-readable-grants.js';
+import { pluginReadGrantSources } from './runtime/plugin-grant-sources.js';
+import { createComputerUseCaptureStarter } from './computer-use-capture/session.js';
 export { createGlobalMemoryModelCompletion } from '../memory-system/index.js';
-export { combineAgentEventObservers, createSessionLLMRetryEventObserver, createContentReviewSlowEventObserver, } from './lifecycle/production-event-observers.js';
+export { createSessionLLMRetryEventObserver, createContentReviewSlowEventObserver, } from './lifecycle/production-event-observers.js';
 /** Creates the one process-local AgentConfig/model preparation shared by title and AgentHost. */
 export function createProductionAgentPreparation(options) {
     return createNativeLocalAgentPreparation(options);
@@ -126,7 +117,8 @@ function createHostPermissionPolicy(options, toolOutputArtifacts) {
                         if (!session || session.archived)
                             return undefined;
                         const library = options.sessions.artifactCatalog.library;
-                        return library.directory(library.sessionSpace(sessionId) ?? 'default');
+                        const spaceId = library.sessionSpace(sessionId);
+                        return spaceId === undefined ? undefined : library.directory(spaceId);
                     },
                     spacesRoot: () => options.sessions.artifactCatalog.library.spacesRoot(),
                 }),
@@ -142,41 +134,6 @@ function createHostPermissionPolicy(options, toolOutputArtifacts) {
             ...(options.product.permission.logger ? { logger: options.product.permission.logger } : {}),
         }),
         ...(options.miniAppApprovals ? { miniAppApprovals: options.miniAppApprovals } : {}),
-    };
-}
-function createHostToolCatalog(options, toolOutputArtifacts, ptc) {
-    return {
-        // Read per Turn: the coordination owners bind their extension after the Host exists.
-        coordinatorMemoryTools: (input) => options.coordinatorExtension?.()?.memoryTools?.(input) ?? [],
-        hostCapabilityRegistry: createHostCapabilityRegistry(options.cliProductPolicy),
-        resolveSources: async (input) => {
-            const session = await requireExecutionSession(options.sessions, input);
-            return options.product.toolSources.resolve({
-                session,
-                turnId: input.turnId,
-                resourceAgentName: input.resourceAgentName,
-                ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),
-                ...(input.skipAgentResolution ? { skipAgentResolution: true } : {}),
-                ...(input.expectedAgentInstanceId
-                    ? { expectedAgentInstanceId: input.expectedAgentInstanceId }
-                    : {}),
-                ...(input.builtinCapabilities ? { builtinCapabilities: input.builtinCapabilities } : {}),
-                toolsDisabled: process.env.MAVIS_LOCAL_RUNTIME_DISABLE_TOOLS === '1',
-                computerUseActive: input.computerUseActive,
-                ...(input.agentMemoryEnabled === undefined
-                    ? {}
-                    : { agentMemoryEnabled: input.agentMemoryEnabled }),
-                ...(input.agentMemoryReadNames === undefined
-                    ? {}
-                    : { agentMemoryReadNames: input.agentMemoryReadNames }),
-                ...optionalTurnCapabilitySources(input),
-            });
-        },
-        config: options.product.preparation.configBuilder.config().mcpToolSearch,
-        env: process.env,
-        // run_code saves a return value over 64 KiB where oversized results are externalized.
-        writePtcReturnArtifact: (input) => toolOutputArtifacts.write(input),
-        ...ptc,
     };
 }
 /** Turn-frozen capability views forwarded to tool sources only when present. */
@@ -231,16 +188,19 @@ function bindCoordinatorMemoryPrompt(options) {
         return;
     options.preparation.bindCoordinatorMemoryProvider((context) => extension()?.memoryPrompt?.(context) ?? Promise.resolve(''));
 }
-/** Connects the native v2 AgentHost only to injected product, owner and observer ports. */
+/**
+ * Connects the native v2 Harness only to injected product, owner and observer
+ * ports. The kernel is assembled inside the Harness; this root supplies policy
+ * and the Session-side ports.
+ */
 export async function createLocalAgentHost(options) {
     const isSideChat = (sessionId) => options.sessions.sideChats.relation(sessionId) !== undefined;
-    const eventObserver = combineAgentEventObservers(options.product.eventObserver, options.eventObserver);
-    const contextUsageAnchor = new ContextUsageAnchorState();
+    const requestMessages = createRequestMessageFilter(isSideChat);
     // PTC store/load values, their temp tree, and the saved-script pieces.
     const ptc = createHostPtcWiring(options);
-    // One request-only projection: installed in the main request's hook chain and repeated by
-    // the shared-prefix checkpoint request, with the Turn's Tool Search context and PTC reminder.
-    const mainRequest = createMainRequestProjection((sessionId, messages) => isSideChat(sessionId) ? messages : messages.filter((m) => !isSideChatModeMessage(m)), projectTurnRequestContext);
+    // The segment coordinator repeats the main request's request-only steps, with the Turn's
+    // Tool Search context and PTC reminder, for its shared-prefix checkpoint request.
+    const mainRequest = createMainRequestProjection(requestMessages, projectTurnRequestContext);
     const toolOutputArtifacts = new ToolOutputArtifactRepository({
         resolveSessionReportsDirectory: (id) => options.sessions.artifacts.ensureReportsDirectory(id),
         inspectSessionReportsDirectory: (id) => options.sessions.artifacts.inspectReportsDirectory(id),
@@ -248,144 +208,310 @@ export async function createLocalAgentHost(options) {
     const getToolResultCompactionConfig = createToolResultCompactionConfigGetter(options);
     const getRequestMediaConfig = createRequestMediaConfigGetter(options);
     const getImageEncoding = () => requestImageEncoding(getRequestMediaConfig().image);
-    const imageFileWriter = new CheckpointImageFileWriter({
-        writeImageArtifact: (input) => toolOutputArtifacts.writeImage(input),
-        logger: options.product.runner.logger,
-    });
+    const { contextUsage, ...runnerSinks } = options.product.runner;
     const segmentCompaction = createProductionSegmentCompaction(options, isSideChat, mainRequest);
     bindCoordinatorMemoryPrompt(options);
-    const mcpToolResultHistoryExternalizer = createMcpToolResultHistoryExternalizer(options, toolOutputArtifacts, getToolResultCompactionConfig);
-    const normalExtensions = createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig, getImageEncoding);
-    const dependencies = await createNativeAgentHostProductionDependencies({
-        sessions: {
-            get: (sessionId) => options.sessions.sessions.execution.getExecutionSnapshot(sessionId),
-        },
-        planDocuments: options.sessions.planDocuments,
-        agents: options.product.agents,
-        ...optionalPromptReadDependencies(options.product),
-        turnRuntimeFacts: options.product.turnRuntimeFacts,
-        preparation: options.preparation,
-        toolCatalog: createHostToolCatalog(options, toolOutputArtifacts, ptc.catalog),
-        inputPreparation: { ...options.product.inputPreparation, getImageEncoding },
-        permission: createHostPermissionPolicy(options, toolOutputArtifacts),
-        runner: {
-            ...options.product.runner,
-            resolveComputerUseCapture: options.resolveComputerUseCapture,
-            reviewContent: options.safety.review,
-            onSlowReview: options.onSlowReview,
-            ...(options.reviewOfflineWait ? { reviewOfflineWait: options.reviewOfflineWait } : {}),
-        },
-        ...optionalToolPolicyGuard(options.toolPolicyGuard),
-        executor: {
-            ...options.product.executor,
-            ...ptc.executor,
-            nativeDelete: () => options.product.preparation.configBuilder.config().permission?.nativeDelete === true,
-            logger: options.product.runner.logger,
-            ...createHostTurnReminders(contextUsageAnchor, options.memorySummaryContext, options.ptcScriptCatalog, options.ptcScriptCatalogInjected),
-            suppressExecutionReminders: (_session, agentConfig) => overridesGenericReminders(readTrustedAgentProfileCoordination(agentConfig.agent_profile)),
-            fileApi: createFileApiRuntime({
-                db: options.db,
-                nowMs: options.nowMs,
-                product: options.product.fileApi,
-            }),
-            attemptRecall: options.sessions.agentProjection.attemptRecall,
-            ...(options.nowMs ? { nowMs: options.nowMs } : {}),
-            cliProductPolicy: options.cliProductPolicy,
-            tuiProductPolicy: options.tuiProductPolicy,
-            contentReviewEnabled: options.contentReviewEnabled,
-            finalizeToolResultForHistory: mcpToolResultHistoryExternalizer.finalize,
-            resolvePluginHookRuntimeContext: (session) => {
-                const config = options.product.preparation.configBuilder.config();
-                return {
-                    transcriptPath: resolveSessionHistoryPaths(config.dataDir, session).messages,
-                    permissionMode: config.permissionMode,
-                };
-            },
-            preparePluginHookSessionOwnership: options.pluginHookSessionOwnership.prepare,
-            activatePluginHookSessionOwnership: options.pluginHookSessionOwnership.activate,
-            afterCompactionBeforeLlmCallHooks: [...mainRequest.hooks],
-            genericExecutionReminderHooks: [
-                createSessionIdentityReminderHook(contextUsageAnchor),
-                createTodoCadenceReminderHook(contextUsageAnchor, hasPtcTurnChildTodoWrite),
-            ],
-            onSteeringConsumed: options.onSteeringConsumed,
-            onInputReviewResolved: options.onInputReviewResolved,
-            resolveLlmRetry: options.resolveLlmRetry,
-            ...optionalTurnAccounting(options.product),
-            ...(options.outputTokenCap ? { outputTokenCap: options.outputTokenCap } : {}),
-            turnStateLayer: () => options.coordinatorExtension?.()?.turnState,
-            segmentPrefixLength: segmentCompaction.segmentPrefixLength,
-            ...(options.turnFaults ? { turnFaults: options.turnFaults } : {}),
-        },
-        ...optionalNormalExtensions(normalExtensions),
-        turnControl: options.turnControl,
-        ...optionalTurnHooks(options),
-        canonicalHistory: adaptCanonicalHistory(options.sessions.canonicalHistory, options.sessions.sessions.historyMutation),
+    const dependencies = {
+        policy: createHostProductPolicy(options, getImageEncoding),
+        extensions: (runs) => createHostNormalExtensions(options, runs, toolOutputArtifacts),
         compaction: {
-            ...createContextCompactors({
-                // The isolated summary request drops every mode message; the replacement
-                // carries a fresh one from `checkpointReminder`.
-                checkpointRequestMessages: (messages) => messages.filter((message) => !isSideChatModeMessage(message)),
-                mainRequestMessages: mainRequest.project,
-                checkpointReminder: (sessionId, timestamp) => isSideChat(sessionId) ? createSideChatModeMessage(timestamp) : undefined,
-                contextUsageAnchor,
-                checkpointState: options.product.checkpointState,
-                logger: options.product.runner.logger,
-                imageFileWriter,
-                promptSnapshots: options.product.promptSnapshots,
-                readConfig: () => options.product.preparation.configBuilder.config(),
-                resolveEarlierFiles: createEarlierFilesResolver(options, toolOutputArtifacts),
-            }),
-            control: options.turnControl,
-            lifecycle: options.sessions.agentProjection.compactionLifecycle,
-            barrier: options.sessions.sessions.historyMutation.compactionBarrier,
-            observer: options.sessions.agentProjection.compactionObserver,
+            compactionTriggerAt: () => options.product.preparation.configBuilder.config().contextManagement?.compactionTriggerAt,
+            toolResults: getToolResultCompactionConfig,
+            checkpointRequestMessages: (messages) => messages.filter((message) => !isSideChatModeMessage(message)),
             checkpointSharedPrefixEnabled: createCheckpointSharedPrefixSwitch(options),
-            ...(options.product.runner.metricsClient
-                ? { metricsClient: options.product.runner.metricsClient }
-                : {}),
-            usageAnchor: contextUsageAnchor,
-            segments: segmentCompaction.segments,
         },
-        usage: {
-            projector: options.sessions.usage.projector,
-            onFailure: ({ sessionId, error }) => {
-                options.product.executor.reportFailure?.(sessionId, `agent_usage_projection_failed:${describeError(error)}`);
+        pools: {
+            disposeSession: async (sessionId) => {
+                await options.product.permission.mutations?.clearSession(sessionId);
             },
         },
-        events: {
-            projectors: {
-                session: options.sessions.agentProjection.session,
-                messages: withContextUsageProjection(options.sessions.agentProjection.messages, options.contextUsageProjection),
-                stream: options.sessions.agentProjection.stream,
-                turnFacts: options.turnFacts,
-            },
-            historyFailures: options.sessions.agentProjection.historyFailures,
-            ...(eventObserver ? { observer: eventObserver } : {}),
-            onObservationFailure: ({ sessionId, error }) => {
-                options.product.executor.reportFailure?.(sessionId, `agent_event_observation_failed:${describeError(error)}`);
-            },
+        limits: UNBOUNDED_HARNESS_LIMITS,
+        observability: {
+            ...runnerSinks,
+            beginComputerUseCapture: createComputerUseCaptureStarter(options.resolveComputerUseCapture, runnerSinks.logger),
         },
+        toolResultHistoryFinalizer: (base) => withAssetsUploadSyncRecorder(options, base),
         isRuntimeErrorRetryable: isProductionRuntimeErrorRetryable,
-    });
-    // A Turn ended by force never writes again (context reset spec 3.2).
-    const host = new LocalAgentHost(fenceForceReleasedTurns(dependencies));
+        promptSuggestion: options.promptSuggestion,
+        onReplyCommitted: options.product.executor.onReplyCommitted,
+        pluginHooks: options.pluginHooks,
+        ptc: {
+            workerUrl: packagedPtcWorkerUrl(),
+            unavailableMessage: 'run_code is available only during an active Desktop turn.',
+            // `ptc.catalog` is empty when both beta switches are off, and each field
+            // is dropped on its own, so the harness sees no store and no script host
+            // unless this Host really wired one. `ptc.executor` is not passed: the
+            // harness derives the executor's store and `ptcScriptsEnabled` from these
+            // two, so the two views of the same wiring can never disagree.
+            ...(ptc.catalog.ptcSessionStore ? { sessionStore: ptc.catalog.ptcSessionStore } : {}),
+            ...(ptc.catalog.ptcScripts
+                ? {
+                    scripts: {
+                        ...ptc.catalog.ptcScripts,
+                        // The save tool writes files and the save boundary is path
+                        // arithmetic; both belong to this Host, so the harness reaches
+                        // them through its script port instead of agent-tools' desktop
+                        // entry, which carries that Node IO.
+                        createSaveTool: createSavePtcScriptTool,
+                        containingDirectory: (directory) => dirname(directory),
+                    },
+                }
+                : {}),
+            ...(options.ptcScriptCatalog ? { scriptCatalog: options.ptcScriptCatalog } : {}),
+            ...(options.ptcScriptCatalogInjected
+                ? { scriptCatalogInjected: options.ptcScriptCatalogInjected }
+                : {}),
+        },
+        // TurnController.close has already aborted and drained (bounded) every run and compaction.
+        closeDrainTimeoutMs: 0,
+    };
+    const scope = {
+        agent: {
+            source: options.product.agents,
+            preparation: options.preparation,
+            promptSnapshots: options.product.promptSnapshots,
+            internalTurnPromptReads: options.product.internalTurnPromptReads,
+            turnRuntimeFacts: options.product.turnRuntimeFacts,
+        },
+        host: createHostBinding(options, toolOutputArtifacts, contextUsage, createHostCompactionBinding(options, isSideChat, requestMessages, segmentCompaction)),
+        model: { credential: (model) => options.preparation.credential(model) },
+        artifacts: {
+            write: (input) => toolOutputArtifacts.write(input),
+            writeImage: (input) => toolOutputArtifacts.writeImage(input),
+            resolveEarlierFiles: createEarlierFilesResolver(options, toolOutputArtifacts),
+        },
+        turnDiff: options.product.executor.fileChanges,
+        compute: createLocalMachineCompute({
+            dataDir: () => options.product.preparation.configBuilder.config().dataDir,
+        }),
+        telemetry: {
+            usage: {
+                projector: options.sessions.usage.projector,
+                onFailure: ({ sessionId, error }) => {
+                    options.product.executor.reportFailure?.(sessionId, `agent_usage_projection_failed:${describeError(error)}`);
+                },
+            },
+            assemblyObserver: options.assemblyObserver,
+            turnTiming: options.turnTiming,
+        },
+    };
+    const composition = createLocalHarness(dependencies, withForceReleaseProbe(createLocalRunScopes(scope, options.turnControl), options.turnControl));
     return {
-        host,
+        ...composition,
         // Bound by the Runtime composition so a committed context reset reaches it.
         ...(ptc.store.store ? { ptcSessionStore: ptc.store.store } : {}),
-        lifecycle: ptc.store.bindLifecycle(dependencies.lifecycle),
+        lifecycle: ptc.store.bindLifecycle(composition.lifecycle),
     };
 }
-function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultCompactionConfig, getImageEncoding) {
+function createHostProductPolicy(options, getImageEncoding) {
+    const config = () => options.product.preparation.configBuilder.config();
+    return {
+        cliProductPolicy: options.cliProductPolicy,
+        tuiProductPolicy: options.tuiProductPolicy,
+        ptcSurface: options.product.executor.ptcSurface,
+        // Desktop bounds a run_code child's display copy the same way Cloud does.
+        // Without it a single child keeps its whole result in the display copy,
+        // history and the UI, which is what the preview exists to prevent.
+        ptcChildDisplayPreview: true,
+        // Default SafetyPolicy: the desktop reviews input, output and thinking only.
+        safety: { host: 'desktop' },
+        nativeDelete: () => config().permission?.nativeDelete === true,
+        createTurnToolSafetyGuard: options.product.executor.createTurnToolSafetyGuard,
+        toolPolicyGuard: options.toolPolicyGuard,
+        nowMs: options.nowMs,
+        getImageEncoding,
+        askUserPolicy: options.askUserPolicy,
+        suppressExecutionReminders: (_session, agentConfig) => overridesGenericReminders(readTrustedAgentProfileCoordination(agentConfig.agent_profile)),
+        toolCatalog: {
+            config: config().mcpToolSearch,
+            env: process.env,
+            // The Runtime's one receipt store: the catalog gate, the first-Turn
+            // preload and the committed-compaction clear all read this instance, and
+            // the Application layer's rewind / session-deleted clears share it.
+            skillReceipts: options.skillReceipts,
+        },
+    };
+}
+/** Session-side ports shared by every run; Turn control is added per accepted lease. */
+function createHostBinding(options, toolOutputArtifacts, contextUsage, compaction) {
+    return {
+        events: createHostEventPorts(options),
+        history: adaptCanonicalHistory(options.sessions.canonicalHistory, options.sessions.sessions.historyMutation),
+        session: {
+            get: (sessionId) => options.sessions.sessions.execution.getExecutionSnapshot(sessionId),
+            planDocuments: options.sessions.planDocuments,
+        },
+        compaction,
+        permissions: createHostPermissionPolicy(options, toolOutputArtifacts),
+        input: options.product.inputPreparation,
+        tools: {
+            contribute: async (input) => ({
+                tools: await resolveHostToolSources(options, input),
+                promptBlocks: desktopPromptBlocks,
+            }),
+            capabilities: createHostCapabilityRegistry(options.cliProductPolicy),
+            createChildBashLifecycle: options.product.executor.createChildBashLifecycle,
+            prepareBashTools: prepareDesktopBashTools,
+            createPtcResultProjection: createNativePtcResultProjection,
+            // Read per Turn: the coordination owners bind their extension after the Host exists.
+            coordinatorMemoryTools: (input) => options.coordinatorExtension?.()?.memoryTools?.(input) ?? [],
+        },
+        // 本地送审端口一直给；服务端审核开关开着的轮次，runner 转去网关模式，由模型网关审核。
+        safety: {
+            reviewContent: options.safety.review,
+            check: createDesktopSafetyCheck(options.safety.review),
+            onSlowReview: options.onSlowReview,
+            ...(options.reviewOfflineWait ? { reviewOfflineWait: options.reviewOfflineWait } : {}),
+            ...(options.gatewayReviewEnabled
+                ? { gatewayReviewEnabled: options.gatewayReviewEnabled }
+                : {}),
+            onInputReviewResolved: options.onInputReviewResolved,
+        },
+        projection: {
+            attemptRecall: options.sessions.agentProjection.attemptRecall,
+            onSteeringConsumed: options.onSteeringConsumed,
+            reportFailure: options.product.executor.reportFailure,
+            projectRuntimeEvent: options.product.executor.projectRuntimeEvent,
+            contextUsage,
+        },
+        accounting: {
+            outputTokenCap: options.outputTokenCap,
+            resolveLlmRetry: options.resolveLlmRetry,
+            resolveTurnRequestControl: options.product.turnRequestControl,
+            resolveTurnUsageRecorder: options.product.turnUsageRecorder,
+        },
+        fileApi: createFileApiRuntime({
+            db: options.db,
+            nowMs: options.nowMs,
+            product: options.product.fileApi,
+        }),
+        hooks: createHostPluginHooks(options),
+        backgroundTasks: {
+            confirm: async (input) => await options.product.inputPreparation.reminders.confirmBackgroundTaskReads(input),
+        },
+        ...(options.memorySummaryContext ? { memorySummary: options.memorySummaryContext } : {}),
+        turnState: () => options.coordinatorExtension?.()?.turnState,
+        ...(options.turnFaults ? { turnFaults: options.turnFaults } : {}),
+    };
+}
+/**
+ * Records every `space_upload` ToolResult beside the harness History finalizer, so the Working
+ * folder can show its cloud sync state. The recorder only reads the ToolResult and never changes
+ * it; the harness finalizer still decides what reaches History.
+ */
+function withAssetsUploadSyncRecorder(options, base) {
+    const record = createAssetsUploadSyncRecorder({
+        record: (input) => options.sessions.files.recordSessionFileSync(input),
+        logger: options.product.runner.logger,
+    });
+    return async (input, signal) => {
+        await record(input, signal);
+        return base(input, signal);
+    };
+}
+/**
+ * `createLocalRunScopes` lifts only the lease-scoped callbacks. The force-release probe is
+ * lease-independent, so it is re-attached here for the run fence that drops every late write of
+ * a Turn ended by force (context reset spec 3.2).
+ */
+function withForceReleaseProbe(scopes, turnControl) {
+    const isForceReleased = turnControl.isForceReleased?.bind(turnControl);
+    if (!isForceReleased)
+        return scopes;
+    return {
+        compaction: scopes.compaction,
+        run: (lease, beforeCapabilityCapture) => {
+            const run = scopes.run(lease, beforeCapabilityCapture);
+            return {
+                ...run,
+                host: { ...run.host, control: { ...run.host.control, isForceReleased } },
+            };
+        },
+    };
+}
+function createHostEventPorts(options) {
+    const eventObserver = combineAgentEventObservers(options.product.eventObserver, options.eventObserver);
+    return {
+        projectors: {
+            session: options.sessions.agentProjection.session,
+            messages: withContextUsageProjection(options.sessions.agentProjection.messages, options.contextUsageProjection),
+            stream: options.sessions.agentProjection.stream,
+            turnFacts: options.turnFacts,
+        },
+        historyFailures: options.sessions.agentProjection.historyFailures,
+        ...(eventObserver ? { observer: eventObserver } : {}),
+        onObservationFailure: ({ sessionId, error }) => {
+            options.product.executor.reportFailure?.(sessionId, `agent_event_observation_failed:${describeError(error)}`);
+        },
+    };
+}
+/** A side chat keeps its mode messages; every other Session drops them from Provider requests. */
+function createRequestMessageFilter(isSideChat) {
+    return (sessionId, messages) => isSideChat(sessionId)
+        ? messages
+        : messages.filter((message) => !isSideChatModeMessage(message));
+}
+function createHostCompactionBinding(options, isSideChat, requestMessages, segmentCompaction) {
+    return {
+        control: options.turnControl,
+        lifecycle: options.sessions.agentProjection.compactionLifecycle,
+        barrier: options.sessions.sessions.historyMutation.compactionBarrier,
+        observer: options.sessions.agentProjection.compactionObserver,
+        checkpointState: options.product.checkpointState,
+        checkpointReminder: (sessionId, timestamp) => isSideChat(sessionId) ? createSideChatModeMessage(timestamp) : undefined,
+        requestMessages,
+        segments: segmentCompaction.segments,
+        segmentPrefixLength: segmentCompaction.segmentPrefixLength,
+    };
+}
+function createHostPluginHooks(options) {
+    return {
+        capabilities: options.turnCapabilities,
+        resolveRuntimeContext: (session) => {
+            const config = options.product.preparation.configBuilder.config();
+            return {
+                transcriptPath: resolveSessionHistoryPaths(config.dataDir, session).messages,
+                permissionMode: config.permissionMode,
+            };
+        },
+        prepareSessionOwnership: options.pluginHookSessionOwnership.prepare,
+        activateSessionOwnership: options.pluginHookSessionOwnership.activate,
+    };
+}
+async function resolveHostToolSources(options, input) {
+    const session = await requireExecutionSession(options.sessions, input);
+    return options.product.toolSources.resolve({
+        session,
+        turnId: input.turnId,
+        resourceAgentName: input.resourceAgentName,
+        ...(input.excludeAgentResources ? { excludeAgentResources: true } : {}),
+        ...(input.skipAgentResolution ? { skipAgentResolution: true } : {}),
+        ...(input.expectedAgentInstanceId
+            ? { expectedAgentInstanceId: input.expectedAgentInstanceId }
+            : {}),
+        ...(input.builtinCapabilities ? { builtinCapabilities: input.builtinCapabilities } : {}),
+        toolsDisabled: process.env.MAVIS_LOCAL_RUNTIME_DISABLE_TOOLS === '1',
+        computerUseActive: input.computerUseActive,
+        ...(input.agentMemoryEnabled === undefined
+            ? {}
+            : { agentMemoryEnabled: input.agentMemoryEnabled }),
+        ...(input.agentMemoryReadNames === undefined
+            ? {}
+            : { agentMemoryReadNames: input.agentMemoryReadNames }),
+        ...optionalTurnCapabilitySources(input),
+    });
+}
+/**
+ * Host builtins; Turn progress comes from the scope of the run owning the Turn. The harness
+ * appends output-limit recovery, request media and the tool-output budget after these.
+ */
+function createHostNormalExtensions(options, runs, toolOutputArtifacts) {
     return mergeNormalExtensions([
         sessionReportExtension({
             reports: options.sessions.llmCalls,
             reportFailure: options.product.executor.reportFailure,
         }),
-        createHostRunawayGuardExtension(options),
-        createHostOutputLimitRecoveryExtension(options),
-        requestMediaExtension({ getImageEncoding }),
+        createHostRunawayGuardExtension(options, runs),
         // Before the output budget: each page is bounded first, so the whole result rarely needs a receipt.
         webSearchContentBudgetExtension({
             writeArtifact: (input) => toolOutputArtifacts.write(input),
@@ -397,38 +523,14 @@ function createHostNormalExtensions(options, toolOutputArtifacts, getToolResultC
                 reason: safeErrorReason(error),
             }, '[local-runtime-v2] web_search content kept whole: artifact write failed'),
         }),
-        toolOutputBudgetExtension({
-            maxInlineBytes: TOOL_RESULT_COMPACTION_DEFAULTS.maxInlineKiB * 1_024,
-            getMaxInlineBytes: () => getToolResultCompactionConfig().maxInlineBytes,
-            fallbackPreviewBytes: 2 * 1_024,
-            writeArtifact: async (input) => {
-                const maxInlineBytes = getToolResultCompactionConfig().maxInlineBytes ??
-                    TOOL_RESULT_COMPACTION_DEFAULTS.maxInlineKiB * 1_024;
-                const artifact = await toolOutputArtifacts.write(input);
-                logToolOutputBudgetDecisionBestEffort(options.product.runner.logger, {
-                    input,
-                    maxInlineBytes,
-                    outcome: 'externalized',
-                    artifactReadFormat: artifact.metadata?.read_format,
-                });
-                return artifact;
-            },
-            onArtifactError: (error, input) => logToolOutputBudgetDecisionBestEffort(options.product.runner.logger, {
-                input,
-                maxInlineBytes: getToolResultCompactionConfig().maxInlineBytes ??
-                    TOOL_RESULT_COMPACTION_DEFAULTS.maxInlineKiB * 1_024,
-                outcome: 'fallback',
-                reason: safeErrorReason(error),
-            }),
-        }),
     ], options.product.normalExtensions, options.normalExtensions);
 }
-function createHostRunawayGuardExtension(options) {
+function createHostRunawayGuardExtension(options, runs) {
     const computerUseTurns = new Set();
     const guard = createProductionRunawayGuardExtension({
         readLocalConfig: () => options.product.preparation.configBuilder.config().runawayGuard,
         readRemoteConfig: options.getRunawayGuardConfig,
-        readVerifiedProgress: (input) => options.product.executor.fileChanges.takeToolProgress?.(input) ?? [],
+        readVerifiedProgress: (input) => runs.scope(input)?.turnDiff.takeToolProgress?.(input) ?? [],
         logger: options.product.runner.logger,
         reportEvent: (sessionId, event) => {
             if (computerUseTurns.has(JSON.stringify([sessionId, event.payload.turn_id])))
@@ -471,34 +573,6 @@ function hasComputerUseHistory(messages) {
     return messages.some((message) => (message.role === 'toolResult' && message.toolName.startsWith('computer_')) ||
         (message.role === 'assistant' &&
             message.content.some((part) => part.type === 'toolCall' && part.name.startsWith('computer_'))));
-}
-function createHostOutputLimitRecoveryExtension(options) {
-    const log = (outcome) => (observation) => {
-        options.product.runner.logger?.[outcome === 'exhausted' ? 'error' : 'info']?.({
-            event: 'output_limit_recovery',
-            outcome,
-            session_id: observation.sessionId,
-            turn_id: observation.turnId,
-            attempts: observation.attempts,
-            ...(observation.truncatedToolCall === undefined
-                ? {}
-                : { truncated_tool_call: observation.truncatedToolCall }),
-            ...(observation.model === undefined ? {} : { model: observation.model }),
-        }, '[local-runtime-v2] Output limit recovery');
-    };
-    return outputLimitRecoveryExtension({
-        onRetry: log('retry'),
-        onRecovered: log('recovered'),
-        onExhausted: log('exhausted'),
-    });
-}
-function createMcpToolResultHistoryExternalizer(options, artifacts, getConfig) {
-    return new McpToolResultHistoryExternalizer({
-        maxInlineBytes: TOOL_RESULT_COMPACTION_DEFAULTS.mcpDetailsMaxInlineKiB * 1_024,
-        getMaxInlineBytes: () => getConfig().mcpDetailsMaxInlineBytes,
-        writeArtifact: (input) => artifacts.write(input),
-        logger: options.product.runner.logger,
-    });
 }
 function createEarlierFilesResolver(options, toolOutputArtifacts) {
     return async (sessionId) => {
@@ -547,37 +621,6 @@ function createToolResultCompactionConfigGetter(options) {
         };
     };
 }
-function logToolOutputBudgetDecisionBestEffort(logger, decision) {
-    try {
-        const { input, maxInlineBytes, outcome, artifactReadFormat, reason } = decision;
-        const fields = {
-            event: 'tool_output_budget_decision',
-            session_id: input.sessionId,
-            turn_id: input.turnId,
-            tool_name: input.toolName,
-            outcome,
-            original_bytes: input.originalBytes,
-            max_inline_bytes: maxInlineBytes,
-            ...(typeof artifactReadFormat === 'string' && artifactReadFormat.trim()
-                ? { artifact_read_format: artifactReadFormat.trim() }
-                : {}),
-            ...(reason ? { reason } : {}),
-        };
-        logger?.[outcome === 'fallback' ? 'error' : 'info']?.(fields, '[local-runtime-v2] Tool output budget');
-    }
-    catch {
-        // Diagnostics must not change the ToolResult returned to History.
-    }
-}
-function safeErrorReason(error) {
-    if (isRecord(error) && typeof error.code === 'string' && error.code.trim()) {
-        return error.code.trim();
-    }
-    return error instanceof Error && error.name.trim() ? error.name.trim() : 'unknown_error';
-}
-function isRecord(value) {
-    return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
 function readToolResultCompactionFileConfig(options) {
     try {
         return options.product.preparation.configBuilder.config().toolResultCompaction;
@@ -596,14 +639,6 @@ function readToolResultCompactionOverride(getter) {
 }
 function positiveSafeInteger(value) {
     return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
-}
-function optionalPromptReadDependencies(product) {
-    return {
-        ...(product.promptSnapshots ? { promptSnapshots: product.promptSnapshots } : {}),
-        ...(product.internalTurnPromptReads
-            ? { internalTurnPromptReads: product.internalTurnPromptReads }
-            : {}),
-    };
 }
 function withContextUsageProjection(messages, contextUsage) {
     if (!contextUsage)
@@ -626,40 +661,7 @@ function mergeNormalExtensions(builtins, product, additional) {
         // after_tool_call rewrite and cannot be replaced by a configured extension with the same id.
         ...builtins,
     ];
-    return merged.length > 0 ? merged : undefined;
-}
-function optionalTurnAccounting(product) {
-    return {
-        ...(product.turnRequestControl
-            ? { resolveTurnRequestControl: product.turnRequestControl }
-            : {}),
-        ...(product.turnUsageRecorder ? { resolveTurnUsageRecorder: product.turnUsageRecorder } : {}),
-    };
-}
-function optionalToolPolicyGuard(toolPolicyGuard) {
-    return toolPolicyGuard ? { toolPolicyGuard } : {};
-}
-function createHostCapabilityRegistry(cliProductPolicy) {
-    return new HostCapabilityRegistry([
-        // CLI keeps its native Browser path; only CU uses the shared interactive Binding.
-        ...(cliProductPolicy
-            ? []
-            : [createBrowserHostCapabilityAdapter(describeLocalBrowserToolInput)]),
-        createComputerUseHostCapabilityAdapter(),
-    ], { reserveInlineGateway: !cliProductPolicy });
-}
-function optionalNormalExtensions(normalExtensions) {
-    return normalExtensions ? { normalExtensions } : {};
-}
-/** Optional per-Turn seams; absent ones are omitted rather than set to undefined. */
-function optionalTurnHooks(options) {
-    return {
-        ...(options.turnTiming ? { turnTiming: options.turnTiming } : {}),
-        ...(options.askUserPolicy ? { askUserPolicy: options.askUserPolicy } : {}),
-        ...(options.turnCapabilities ? { turnCapabilities: options.turnCapabilities } : {}),
-        ...(options.assemblyObserver ? { assemblyObserver: options.assemblyObserver } : {}),
-        ...(options.promptSuggestion ? { promptSuggestion: options.promptSuggestion } : {}),
-    };
+    return merged;
 }
 async function requireExecutionSession(sessions, input) {
     const session = await sessions.sessions.repository.get(input.sessionId);
@@ -673,4 +675,33 @@ async function requireExecutionSession(sessions, input) {
 function describeError(error) {
     return error instanceof Error ? error.message : String(error);
 }
+function safeErrorReason(error) {
+    if (typeof error === 'object' && error !== null && 'code' in error) {
+        const code = error.code;
+        if (typeof code === 'string' && code.trim())
+            return code.trim();
+    }
+    return error instanceof Error && error.name.trim() ? error.name.trim() : 'unknown_error';
+}
+/**
+ * 记忆整理 Agent 的上下文压缩：与普通会话共用同一套压缩算法，reminder 是压缩后补回的接续消息。
+ * 整理不属于任何 Session，sessionId 只是固定标识。
+ */
+export const createMemoryContextCompactor = (reminder) => {
+    const compactor = new AutomaticContextCompactor(undefined, undefined, undefined, {
+        checkpointReminder: reminder,
+    });
+    return async (input) => {
+        const result = await compactor.compactBeforeLlm({
+            ...input,
+            tools: [...input.tools],
+            messages: [...input.messages],
+            sessionId: 'memory-v2:consolidation',
+            phase: 'iteration',
+        });
+        return result.status === 'unchanged'
+            ? undefined
+            : result.replacementMessages;
+    };
+};
 //# sourceMappingURL=production-composition.js.map

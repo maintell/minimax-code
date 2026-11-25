@@ -1,21 +1,42 @@
+import { PluginHookTranscript } from '@mavis/agent-tools/plugin-hooks';
+import { PluginHookRunner } from '@mavis/plugin-hooks';
 import { initializeHookConfigService, } from '../../service/hook-config/index.js';
-import { configureLocalConfigHookSource, configureLocalPluginHookEnabledResolver, configureLocalPluginHookObservability, configureLocalPluginHookSessionEndFence, endAllLocalPluginHookSessionsForLogout, } from '../../service/turn-system/index.js';
+import { requireTurnSystem, } from '../../service/turn-system/index.js';
 import { createRuntimePluginAuthContextNotifier, } from './runtime-services-lifecycle.js';
 /**
- * Binds process-local Plugin Hook observation, SessionEnd fencing, auth
- * lifecycle, and the user / project config hooks merged ahead of Plugin hooks.
+ * Builds the harness Plugin Hook config: the Host-owned command runner, the
+ * file-backed vendor transcripts, the user / project config hooks merged ahead
+ * of Plugin hooks, the enabled Plugin resolver, SessionEnd fencing and Hook
+ * observation.
  */
-export function configureRuntimePluginHooks(input) {
-    const { plugin, turnSystem } = input;
+export function createRuntimePluginHookConfig(input, plugin, 
+/** Read at SessionEnd time: the harness owning the hooks is built inside the TurnSystem. */
+readTurnSystem) {
+    const { dataDir, logger, metrics } = input.options;
     const hookConfig = initializeHookConfigService({
-        dataDir: input.dataDir,
+        dataDir,
         ...(input.nowMs ? { nowMs: input.nowMs } : {}),
-        ...(input.logger ? { logger: input.logger } : {}),
+        ...(logger ? { logger } : {}),
     });
-    configureLocalConfigHookSource(hookConfig.turnHooks);
-    configureLocalPluginHookEnabledResolver(() => plugin.enabledHookPluginNames());
-    configureLocalPluginHookSessionEndFence({
+    return {
+        harness: {
+            runner: new PluginHookRunner(),
+            createTranscript: (transcript) => PluginHookTranscript.create(transcript),
+            configSource: hookConfig.turnHooks,
+            enabledPluginNames: () => plugin.enabledHookPluginNames(),
+            sessionEndFence: createRuntimePluginHookSessionEndFence(() => requireTurnSystem(readTurnSystem())),
+            ...(logger ? { logger } : {}),
+            ...(metrics ? { metrics } : {}),
+            runtime: 'desktop',
+            deferredExecutionReason: 'PreToolUse Plugin Hook requested deferred execution, which Desktop does not support.',
+        },
+        hookConfig: hookConfig.management,
+    };
+}
+function createRuntimePluginHookSessionEndFence(readTurnSystem) {
+    return {
         run: async (fenceInput) => {
+            const turnSystem = readTurnSystem();
             const tryRunExclusive = turnSystem.sessionLifecycle.tryRunExclusive;
             if (!tryRunExclusive) {
                 return { status: 'executed', result: await fenceInput.operation() };
@@ -59,17 +80,18 @@ export function configureRuntimePluginHooks(input) {
             });
             return attempt.acquired ? attempt.value : { status: 'deferred' };
         },
-    });
-    configureLocalPluginHookObservability({
-        ...(input.logger ? { logger: input.logger } : {}),
-        ...(input.metrics ? { metrics: input.metrics } : {}),
-    });
-    const notifyAuthContextChanged = createRuntimePluginAuthContextNotifier({
+    };
+}
+/** Auth lifecycle of Plugin Hooks; logout ends their Sessions through the harness lifecycle. */
+export function createRuntimePluginHookAuthNotifier(input) {
+    const { plugin, turnSystem } = input;
+    return createRuntimePluginAuthContextNotifier({
         authContextChanged: () => plugin.authContextChanged(),
         enabledHookPluginNames: () => plugin.enabledHookPluginNames(),
         abortSession: (sessionId) => turnSystem.turns.abort({ sessionId, reason: 'logout' }),
-        endAllSessionsForLogout: endAllLocalPluginHookSessionsForLogout,
+        endAllSessionsForLogout: async (enabledPluginNames, abortSession) => {
+            await turnSystem.pluginHooks?.endAllForLogout(enabledPluginNames, abortSession);
+        },
     });
-    return { notifyAuthContextChanged, hookConfig: hookConfig.management };
 }
 //# sourceMappingURL=runtime-plugin-hook-composition.js.map

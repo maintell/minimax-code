@@ -7,13 +7,33 @@ import { isMap, isNode, isScalar, parseDocument, visit, } from 'yaml';
  * paths hand that mutable object to a callback that aliases into it.
  */
 export function parseConfigText(text) {
+    return inspectConfigText(text).raw;
+}
+/**
+ * The rule parseConfigText and getConfig() share for turning config.yaml text
+ * into a config object (file-loader and local-runtime-v2 still keep their own
+ * stricter readers for explicit files and writes): invalid
+ * YAML or a root that is not a mapping yields `{}` plus the reason. The reason
+ * carries a line number only, never source text, which may contain credentials.
+ */
+export function inspectConfigText(text) {
+    let parsed;
     try {
-        const parsed = yaml.load(text);
-        return isPlainRecord(parsed) ? parsed : {};
+        parsed = yaml.load(text);
     }
-    catch {
-        return {};
+    catch (error) {
+        const zeroBasedLine = error?.mark?.line;
+        return {
+            raw: {},
+            problem: {
+                kind: 'invalid_yaml',
+                ...(typeof zeroBasedLine === 'number' ? { line: zeroBasedLine + 1 } : {}),
+            },
+        };
     }
+    if (parsed == null)
+        return { raw: {} };
+    return isPlainRecord(parsed) ? { raw: parsed } : { raw: {}, problem: { kind: 'invalid_root' } };
 }
 /**
  * Serializes `next` over `previous` while keeping comments and formatting from

@@ -86,7 +86,7 @@ export class ProjectService {
      * Creates a workspace Project keyed by its primary folder. A row that only
      * exists implicitly (created by an earlier conversation and never set up by
      * the user) or was removed from the sidebar is taken over; a project the
-     * user already set up is a conflict.
+     * user already set up is a conflict. The project is listed first.
      */
     async create(input) {
         const workspaceDir = createWorkspaceDir(input);
@@ -104,7 +104,21 @@ export class ProjectService {
             workspaceRoots,
             ...(iconJson !== undefined ? { iconJson } : {}),
             ...(project.hidden ? { unhide: true } : {}),
+            relist: true,
         }, this.nowMs()));
+    }
+    /**
+     * Keeps a visible workspace Project in the sidebar after a task moves out of it, as if the
+     * user had created it: an implicit row gets its folder list (the primary folder) stored, the
+     * field CreateProject writes. Name and icon stay; set-up, hidden and default rows are left.
+     */
+    async keepWorkspaceProjectListed(projectId) {
+        const project = await this.options.projects.getById(projectId);
+        if (!project || project.hidden || project.projectKind !== 'workspace')
+            return;
+        if (hasStoredWorkspaceRoots(project))
+            return;
+        await this.options.projects.setMetadata(project.projectId, { workspaceRoots: projectWorkspaceRoots(project) }, this.nowMs());
     }
     async setPinned(reference, pinned) {
         const project = await this.resolve(reference, true);
@@ -112,7 +126,29 @@ export class ProjectService {
     }
     async setHidden(reference, hidden) {
         const project = await this.resolve(reference, true);
+        // The default Project is the bucket of chats that belong to no project: it
+        // has no folder and no name the user chose, and hiding it would take every
+        // one of those chats out of the sidebar at once. No surface can ask for
+        // that, so the write is refused here instead of in each caller.
+        if (hidden && project.projectKind === 'default') {
+            throw new ProjectServiceError('default-project-hidden', 'The default project cannot be hidden');
+        }
         return requireProject(await this.options.projects.setHidden(project.projectId, hidden, this.nowMs()));
+    }
+    /**
+     * Places a workspace Project right below another one in the sidebar list, or first without one:
+     * the user dragging it. Only its list position changes; the pinned order and the catalog,
+     * ordered by activity, stay as they are.
+     */
+    async moveInSidebar(reference, after) {
+        const project = await this.resolve(reference);
+        const anchor = after ? await this.resolve(after) : undefined;
+        if (project.projectKind !== 'workspace' ||
+            anchor?.projectKind === 'default' ||
+            anchor?.projectId === project.projectId) {
+            throw new ProjectServiceError('invalid-project-move', 'Only a workspace project moves, below another workspace project');
+        }
+        return requireProject(await this.options.projects.moveListed(project.projectId, anchor?.projectId ?? null, this.nowMs()));
     }
     async putOrder(references) {
         const records = await this.resolveOrder(references);
@@ -359,7 +395,10 @@ async function replacementWorkspaceRoots(project, requested) {
     return validateWorkspaceRoots(withCanonicalPrimary(requested, primary), primary, projectWorkspaceRoots(project));
 }
 function projectFolderName(workspaceDir) {
-    return workspaceDir.split(/[\\/]+/u).filter(Boolean).at(-1) ?? workspaceDir;
+    return (workspaceDir
+        .split(/[\\/]+/u)
+        .filter(Boolean)
+        .at(-1) ?? workspaceDir);
 }
 function normalizeLimit(value, fallback) {
     if (!Number.isFinite(value))

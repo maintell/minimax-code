@@ -227,10 +227,12 @@ function buildEvaluatorPrompt(attempt, serializedTail) {
                 ? {
                     goalResources: {
                         trust: 'untrusted_data',
-                        value: attempt.objectiveResources.map(({ fileName, filePath, mimeType }) => ({
+                        value: attempt.objectiveResources.map(({ fileName, filePath, mimeType, driveNodeId, drivePath }) => ({
                             fileName,
                             filePath,
                             mimeType,
+                            ...(driveNodeId ? { driveNodeId } : {}),
+                            ...(drivePath ? { drivePath } : {}),
                         })),
                     },
                 }

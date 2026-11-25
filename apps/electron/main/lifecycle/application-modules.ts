@@ -1,3 +1,4 @@
+import { CAPTURE_SHUTDOWN_TIMEOUT_MS } from "../modules/screenshot/capture-contract";
 import { isOffline } from "../modules/connectivity/offline-mode";
 export let REQUIRED_LIFECYCLE_MODULES = Object.freeze([
     'protocol-scheme',
@@ -191,7 +192,13 @@ export function registerApplicationLifecycleModules(kernel, dependencies) {
             phase: 'whenReady',
             init: () => {
                 dependencies.recordStartupMainMilestone?.('initial_window_creation_started');
-                void dependencies.createInitialWindow().then(dependencies.flushDockFileQueue);
+                void dependencies.createInitialWindow().then(() => {
+                    dependencies.flushDockFileQueue();
+                    // Advisory only: a failed notice must not affect the window or startup.
+                    void Promise.resolve()
+                        .then(() => dependencies.notifyConfigIssues?.())
+                        .catch((error) => dependencies.onConfigIssuesNoticeFailed?.(error));
+                });
                 // This owner starts the window, but production registers activate only after fatal settings init.
                 registerActivateAfterDesktopSettings = dependencies.registerActivateHandler;
             },
@@ -217,8 +224,13 @@ export function registerApplicationLifecycleModules(kernel, dependencies) {
         {
             name: 'screenshots',
             phase: 'whenReady',
-            init: dependencies.initScreenshots,
+            // Capture windows are created on demand; this module owns shutdown only.
+            init: () => { },
             onInitError: 'continue',
+            dispose: dependencies.disposeScreenshots,
+            disposeStage: 'parallel',
+            // Allow the encoder deadline to expire and the file handle to close.
+            disposeTimeoutMs: CAPTURE_SHUTDOWN_TIMEOUT_MS,
         },
         {
             name: 'runtime-fetch-devtools',

@@ -1,10 +1,9 @@
 import { streamSimple } from '@earendil-works/pi-ai';
 import { withLLMRetry } from '@mavis/agent-core/pi-turn-runner';
+import { buildLocalTurnPayloadTransform, readSessionAgentExecutionSnapshot, } from '@mavis/harness';
 import { SessionTitleModelAdapter, } from '../../session-system/index.js';
 import { completeTitleModel } from '../../session-system/sessions/title/title-model-completion.js';
-import { buildLocalTurnPayloadTransform } from '../agent-host/assembly/payload/local-turn-payload-transform.js';
-import { readSessionAgentExecutionSnapshot } from '../agent-host/preparation/config/session-agent-execution-snapshot.js';
-import { mutableTitleContext, textCompletionStream, } from '../agent-host/preparation/config/text-completion.js';
+import { mutableTitleContext, textCompletionStream, } from '../agent-host/preparation/text-completion.js';
 /** Auxiliary text-only calls reuse the current Session's immutable model policy. */
 export function createProductionModelTextCompletion(product, nowMs) {
     return (input) => completeTitleModel({

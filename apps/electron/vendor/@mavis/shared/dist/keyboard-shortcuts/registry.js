@@ -2,6 +2,17 @@ import { normalizeAccelerator } from './accelerator.js';
 const definition = (value) => value;
 const baseDefinitions = [
     definition({
+        id: 'composer.screenshot',
+        category: 'common',
+        scope: 'global',
+        labelKey: 'settings.shortcuts.actions.screenshot.label',
+        descriptionKey: 'settings.shortcuts.actions.screenshot.description',
+        searchKeywordsKey: 'settings.shortcuts.actions.screenshot.keywords',
+        defaults: { mac: 'Command+Shift+S', windows: 'Ctrl+Shift+S' },
+        configurable: true,
+        handledBy: 'electron-global',
+    }),
+    definition({
         id: 'miniChat.toggle',
         category: 'miniChat',
         scope: 'global',
@@ -292,6 +303,17 @@ const baseDefinitions = [
         descriptionKey: 'settings.shortcuts.actions.session_pin.description',
         searchKeywordsKey: 'settings.shortcuts.actions.session_pin.keywords',
         defaults: { mac: 'Command+Alt+P', windows: 'Ctrl+Alt+P' },
+        configurable: true,
+        handledBy: 'renderer',
+    }),
+    definition({
+        id: 'session.markUnread',
+        category: 'common',
+        scope: 'session',
+        labelKey: 'settings.shortcuts.actions.session_mark_unread.label',
+        descriptionKey: 'settings.shortcuts.actions.session_mark_unread.description',
+        searchKeywordsKey: 'settings.shortcuts.actions.session_mark_unread.keywords',
+        defaults: { mac: 'Command+Shift+U', windows: 'Ctrl+Shift+U' },
         configurable: true,
         handledBy: 'renderer',
     }),

@@ -55,7 +55,7 @@ import { isAbsolute, resolve as resolvePath } from 'node:path';
 import { Type } from '@sinclair/typebox';
 import { shellQuote } from './sandbox-rg-runner.js';
 import { bindTool, } from '@mavis/agent-core/tools';
-import { CloudBashToolDef as BashToolDef, } from './builtin-defs.js';
+import { CLOUD_BASH_DEFAULT_TIMEOUT_SECONDS, CLOUD_BASH_MAX_TIMEOUT_SECONDS, CloudBashToolDef as BashToolDef, } from './builtin-defs.js';
 import { SHELL_EXECUTION_POLICY, logger } from './runtime-types.js';
 import { BackgroundTaskKind, BackgroundTaskStatus, ShellExecutionPolicy, ShellJobStatus, } from './runtime-types.js';
 import { tryLocalDispatch } from './local-shell/index.js';
@@ -86,6 +86,12 @@ const BackgroundBashToolDef = {
     ].join('\n'),
     schema: Type.Object({
         ...BashToolDef.schema.properties,
+        // Only the foreground path falls back to the default; a background job
+        // without a timeout is bounded by the task's maxRunMs instead.
+        timeout: Type.Optional(Type.Number({
+            description: `Timeout in seconds, max ${CLOUD_BASH_MAX_TIMEOUT_SECONDS}. Default ${CLOUD_BASH_DEFAULT_TIMEOUT_SECONDS} for foreground commands; ` +
+                'with run_in_background and no timeout, the command runs until it finishes, is stopped, or reaches the background task time limit.',
+        })),
         run_in_background: Type.Optional(Type.Boolean({
             description: 'Run the shell command asynchronously and return a background task id immediately, ' +
                 'instead of blocking until it finishes. ' +
@@ -169,26 +175,49 @@ let CloudBashTool = (() => {
             // 注意:这里**不**对 env_vars 做 mask(masker 是出方向闸口);sandbox
             // 必须收到真实 value 才能跑命令,这是设计意图。
             const envVars = collectSecretEnvVars(ctx.secretStore);
+            // Always sent: without it archon-server leaves the limit to the sandbox
+            // provider's own default, which differs between providers. Clamped to the
+            // cap archon-server applies anyway, so the sent value is the effective one.
+            const timeoutSeconds = input.timeout !== undefined && input.timeout > 0
+                ? Math.min(input.timeout, CLOUD_BASH_MAX_TIMEOUT_SECONDS)
+                : CLOUD_BASH_DEFAULT_TIMEOUT_SECONDS;
             let res;
             try {
                 res = await this.archonServer.executeShell(ctx, {
                     command: this.shellCommand(ctx, input.command),
-                    ...(input.timeout ? { timeout_seconds: input.timeout } : {}),
+                    timeout_seconds: timeoutSeconds,
                     execution_policy: SHELL_EXECUTION_POLICY.ReusePersistent,
                     ...(envVars ? { env_vars: envVars } : {}),
                 }, signal);
             }
-            catch {
+            catch (error) {
                 if (signal?.aborted)
                     throw new Error('Operation aborted');
-                logger.error(`[cloud-bash] stage=shell_execute code=CLOUD_BASH_SHELL_EXECUTION_FAILED session_id=${ctx.sessionId} turn_id=${ctx.turnId} tool_call_id=${ctx.toolCallId ?? 'none'}`);
-                const text = '<bash_error>CLOUD_BASH_SHELL_EXECUTION_FAILED: Shell command execution failed</bash_error>';
+                // cloud-runtime's RemoteArchonServerError sets `requestTimedOut` when no
+                // response arrived in time. The command may have run anyway, so the model
+                // must not read this as "nothing happened" and blindly send it again.
+                const requestTimedOut = error instanceof Error && 'requestTimedOut' in error && error.requestTimedOut === true;
+                const code = requestTimedOut
+                    ? 'CLOUD_BASH_SHELL_REQUEST_TIMED_OUT'
+                    : 'CLOUD_BASH_SHELL_EXECUTION_FAILED';
+                logger.error(`[cloud-bash] stage=shell_execute code=${code} session_id=${ctx.sessionId} turn_id=${ctx.turnId} tool_call_id=${ctx.toolCallId ?? 'none'}`);
+                // `unprocessed` marks failures where archon-server is known never to
+                // have received the request (connection refused, 429). Any other failure
+                // (dropped connection, 5xx, business error) may come after the sandbox
+                // already started the command, so warn before a blind re-run.
+                const unprocessed = error instanceof Error && 'unprocessed' in error && error.unprocessed === true;
+                const text = requestTimedOut
+                    ? '<bash_error>CLOUD_BASH_SHELL_REQUEST_TIMED_OUT: No result came back from the sandbox before the shell request timed out. The command may still be running or may already have finished; check its output files before running it again.</bash_error>'
+                    : unprocessed
+                        ? '<bash_error>CLOUD_BASH_SHELL_EXECUTION_FAILED: Shell command execution failed</bash_error>'
+                        : '<bash_error>CLOUD_BASH_SHELL_EXECUTION_FAILED: Shell command execution failed. The request may have reached the sandbox, so the command may have run or may still be running; check its output files before running it again.</bash_error>';
                 return {
                     tool_name: BashToolDef.name,
                     text,
                     content: [{ type: 'text', text }],
                     details: {
-                        status: 'shell_execution_failed',
+                        status: requestTimedOut ? 'shell_request_timed_out' : 'shell_execution_failed',
+                        ...(requestTimedOut ? { timed_out: true } : {}),
                         dispatched_locally: false,
                         local_dispatch_skip_reason: outcome.reason,
                     },
@@ -204,7 +233,18 @@ let CloudBashTool = (() => {
             // text (its global_head_tail strategy preserves the tail, so a tail-anchored
             // marker survives whenever any tail budget is left).
             const rawText = (res.stdout ?? '') + (res.stderr ?? '');
-            const text = res.output_truncated ? `${rawText}${BASH_OUTPUT_TRUNCATED_MARKER}` : rawText;
+            // `details.timed_out` never reaches the model prompt, so a sandbox timeout
+            // would otherwise look like a plain failure of the command itself.
+            const timedOutText = res.timed_out
+                ? `${rawText}${bashTimedOutMarker(res, {
+                    timeoutSeconds,
+                    backgroundAvailable: this.background !== undefined &&
+                        ctx.parentAgentConfig?.background_task_enabled === true,
+                })}`
+                : rawText;
+            const text = res.output_truncated
+                ? `${timedOutText}${BASH_OUTPUT_TRUNCATED_MARKER}`
+                : timedOutText;
             return withCloudCompatibleToolResponse(withStorageFailure({
                 tool_name: BashToolDef.name,
                 text,
@@ -486,6 +526,27 @@ export { CloudBashTool };
  * pi-agent does not pass back into the model prompt).
  */
 const BASH_OUTPUT_TRUNCATED_MARKER = '\n\n[bash: output truncated by sandbox-control (per-stream cap; tail dropped). Re-run with a narrower command or pipe through `head`/`tail` to retrieve specific regions.]';
+// archon-server reports a broken sandbox exec channel as `timed_out=true`
+// with this stderr prefix (shell/service execShellUnhealthyStderrPrefix).
+const SANDBOX_EXEC_CHANNEL_UNHEALTHY_PREFIX = 'sandbox exec channel unhealthy:';
+function bashTimedOutMarker(res, limit) {
+    const exit = typeof res.exit_code === 'number' ? ` (exit code ${res.exit_code})` : '';
+    if ((res.stderr ?? '').startsWith(SANDBOX_EXEC_CHANNEL_UNHEALTHY_PREFIX)) {
+        return `\n\n[bash: the sandbox exec channel was unhealthy and the command was interrupted${exit}. This is a sandbox infrastructure failure unrelated to the command itself; you can retry it.]`;
+    }
+    const elapsed = typeof res.duration_ms === 'number' && res.duration_ms > 0
+        ? ` after ${Math.round(res.duration_ms / 1000)}s`
+        : '';
+    const background = limit.backgroundAvailable ? ', or run it with run_in_background: true' : '';
+    const timeoutSeconds = limit.timeoutSeconds;
+    if (timeoutSeconds >= CLOUD_BASH_MAX_TIMEOUT_SECONDS) {
+        return `\n\n[bash: command timed out${elapsed} at the ${CLOUD_BASH_MAX_TIMEOUT_SECONDS}s maximum and was killed by the sandbox${exit}. Running the same command again will time out again; make it faster or split it into smaller steps${background}.]`;
+    }
+    const longRunning = limit.backgroundAvailable
+        ? '; for long-running commands use run_in_background: true'
+        : '';
+    return `\n\n[bash: command was killed by the sandbox when it reached its ${timeoutSeconds}s timeout${exit}. Pass a larger timeout (max ${CLOUD_BASH_MAX_TIMEOUT_SECONDS})${longRunning}.]`;
+}
 function positiveMs(value) {
     return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }

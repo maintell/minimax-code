@@ -10,13 +10,12 @@
  * Bunny's memory (the last section) is read at the end of the system prompt instead, rebuilt
  * when the memory files change, so it is part of the cached system prefix.
  */
-import { SYSTEM_SPACE_GOAL } from './contracts.js';
 // The block's sections and its own lines.
 export const STATE_SECTIONS = {
     tasks: '任务：',
     ledger: '近期约定：',
-    contexts: '空间 context.md：',
-    spaces: '任务空间：',
+    contexts: '事项简报 context.md：',
+    spaces: '事项：',
     projects: '近期项目：',
 };
 /** An empty list. */
@@ -27,12 +26,12 @@ export const STALE_STATE_LINE = '状态可能滞后';
 const STATE_UNREADABLE_LINE = {
     task_view: '任务：这一轮读不出，读得出后补上',
     previous_turn_start: '上一轮开始时间：这一轮读不出',
-    space_list: '任务空间列表：这一轮读不出，读得出后补上',
+    space_list: '事项列表：这一轮读不出，读得出后补上',
     ledger: '近期约定：账本暂时读不出，读得出后补上；需要时用 working_state list 读现行条目',
-    overview: '任务空间和近期项目：这一轮读不出，读得出后补上',
+    overview: '事项和近期项目：这一轮读不出，读得出后补上',
     ui_view: '界面：这一轮读不出',
     recall_precheck: '可能相关的早前对话：这一轮读不出，需要时用 conversation_search 查',
-    space_context: '空间 context.md：这一轮读不出，读得出后补上',
+    space_context: '事项简报 context.md：这一轮读不出，读得出后补上',
     reminders: '提醒：这一轮读不出，读得出后补上',
     memory: '记忆：这一轮读不出，读得出后补上',
 };
@@ -52,15 +51,13 @@ export function panelViewLine(view, nowMs) {
     if (!view.panelOpen)
         return `${prefix}Bunny 面板未打开`;
     const space = view.spaceName === undefined ? '全部' : ` ${view.spaceName}`;
-    return `${prefix}Bunny 面板已打开，打开的任务空间是${space}`;
+    return `${prefix}Bunny 面板已打开，打开的事项是${space}`;
 }
 export function spaceOverviewLine(space) {
     const open = space.openTasks === undefined ? '' : `未结束的任务 ${String(space.openTasks)} 个`;
     return `- ${space.name}（${space.id}）：${spaceDetail(space)}${open}`;
 }
 function spaceDetail(space) {
-    if (space.system)
-        return `${SYSTEM_SPACE_GOAL}。`;
     const goal = space.goal ? `目标是${space.goal}。` : '没有目标。';
     const projects = space.projects.length ? space.projects.join('、') : STATE_NONE;
     return `${goal}关联项目：${projects}。`;
@@ -140,11 +137,14 @@ export function stallHungWork(minutes) {
 /** The heading a change before the first `## ` section is named by. */
 export const CONTEXT_PREAMBLE_HEADING = '开头';
 export function contextRevisionLine(space, revision, changedSections) {
-    const head = `- 空间 ${contextSpaceName(space)}的 context.md 被改过（新版本 ${revision.slice(0, 8)}）`;
+    // Only a prefix, and said to be one: a caller that splices it onto a remembered suffix
+    // writes a revision that never matches. A write needs the full one, which a read returns.
+    const head = `- 事项 ${contextSpaceName(space)}的 context.md 被改过` +
+        `（新版本前缀 ${revision.slice(0, 8)}，不是可写的 revision；写前先 bunny_task_space_context_read）`;
     return changedSections.length ? `${head}，改了：${changedSections.join('、')}` : head;
 }
 export function contextGoalLine(space, goal) {
-    return `- 空间 ${contextSpaceName(space)}的目标改为：${goal || STATE_NONE}`;
+    return `- 事项 ${contextSpaceName(space)}的目标改为：${goal || STATE_NONE}`;
 }
 function contextSpaceName(space) {
     return `${space.name}（${space.id}）`;
@@ -199,7 +199,7 @@ function closedMark(entry) {
 function formatLedgerEntry(entry) {
     const details = [
         closeNote(entry),
-        entry.scope === 'global' ? '' : `空间 ${entry.scope.slice('space:'.length)}`,
+        entry.scope === 'global' ? '' : `事项 ${entry.scope.slice('space:'.length)}`,
         entry.replaces ? `不要再：${entry.replaces}` : '',
         entry.expiresAtMs === undefined ? '' : `到期 ${ledgerLocalTime(entry.expiresAtMs)}`,
         entry.inferred ? '推断' : '',

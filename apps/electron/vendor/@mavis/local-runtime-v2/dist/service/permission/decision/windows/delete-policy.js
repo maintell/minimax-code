@@ -5,7 +5,7 @@
  */
 import path from 'node:path';
 import { commandHasExecutedHeredocBody, findHeredocBodies, gitBashCommandName, isRmCommand, matchHardBlockedBash, parseWindowsNativeDelete, readBashCommand, splitCommand, unwrapBashCommandWrappers, unwrapCommandWrappers, } from '@mavis/permission';
-import { readBashSubstitutions } from '../bash-substitutions.js';
+import { readBashSubstitutions } from '../git-bash/bash-substitutions.js';
 import { expandWindowsCommandSurfaces, hasWindowsWriteRedirection, parseWindowsShellFamily, splitWindowsCommandSegments, } from './command-surfaces.js';
 import { hasWindowsWriteOrDeleteCommand } from './write-targets.js';
 const POSIX_DELETE_COMMANDS = new Set([
@@ -63,11 +63,11 @@ function isMavisTrashExecutable(command) {
         .replace(/\.(?:cmd|bat|exe)$/i, '')
         .toLowerCase() === 'mavis-trash');
 }
-export function isRecoverableDeleteInsideWorkspace(targets, workspaceDir) {
-    const workspace = path.win32
-        .normalize(workspaceDir)
+export function isRecoverableDeleteInsideWorkspace(targets, workspaceDir, additionalWorkspaceDirs = []) {
+    const workspaces = [workspaceDir, ...additionalWorkspaceDirs].map((root) => path.win32
+        .normalize(root)
         .toLowerCase()
-        .replace(/[\\/]$/, '');
+        .replace(/[\\/]$/, ''));
     return targets.every((target) => {
         const normalized = path.win32
             .normalize(target)
@@ -77,7 +77,7 @@ export function isRecoverableDeleteInsideWorkspace(targets, workspaceDir) {
             /^[a-z]:\\(?:windows|program files(?: \(x86\))?)(?:\\|$)/i.test(normalized)) {
             return false;
         }
-        return normalized === workspace || normalized.startsWith(`${workspace}\\`);
+        return workspaces.some((workspace) => normalized === workspace || normalized.startsWith(`${workspace}\\`));
     });
 }
 /**

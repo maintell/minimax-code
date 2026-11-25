@@ -9,6 +9,21 @@ import { SessionHandoffApplication } from './session/handoff-application.js';
 import { SessionRootApplication, SessionRootEventProjector, } from './session/root-application.js';
 import { PinApplication } from './session/pin-application.js';
 import { SessionConversationMutationApplication, } from './session/conversation-mutation-application.js';
+/** What archiving a Session runs around its commit: Goal pause and Plugin SessionEnd. */
+function sessionEndOptions(options) {
+    return {
+        ...(options.runPluginHookSessionEndFence
+            ? { runPluginHookSessionEndFence: options.runPluginHookSessionEndFence }
+            : {}),
+        ...(options.preparePluginHookSessionEnd
+            ? { preparePluginHookSessionEnd: options.preparePluginHookSessionEnd }
+            : {}),
+        ...(options.endPluginHookSession ? { endPluginHookSession: options.endPluginHookSession } : {}),
+        ...(options.pauseActiveGoalForArchive
+            ? { pauseActiveGoalForArchive: options.pauseActiveGoalForArchive }
+            : {}),
+    };
+}
 /** Constructs named feature applications without adding an aggregate forwarding facade. */
 export const initializeApplications = (options) => {
     const sideChat = new SideChatApplication({
@@ -61,17 +76,12 @@ export const initializeApplications = (options) => {
             }
             : {}),
         resolveAgentWriteTarget: options.resolveAgentWriteTarget,
-        ...(options.runPluginHookSessionEndFence
-            ? { runPluginHookSessionEndFence: options.runPluginHookSessionEndFence }
-            : {}),
-        ...(options.preparePluginHookSessionEnd
-            ? { preparePluginHookSessionEnd: options.preparePluginHookSessionEnd }
-            : {}),
-        ...(options.endPluginHookSession ? { endPluginHookSession: options.endPluginHookSession } : {}),
+        ...sessionEndOptions(options),
         deletion: { deleteSession },
         ...(options.assertSessionDeletionAllowed
             ? { assertSessionDeletionAllowed: options.assertSessionDeletionAllowed }
             : {}),
+        projectMove: options.sessionProjectMove,
         ...(options.metrics ? { metrics: options.metrics } : {}),
         assignments: options.sessionSystem.repositories.assignmentTasks,
     });

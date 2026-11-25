@@ -1,4 +1,5 @@
-import { currentBetaResolutionContext, resolveBetaFeature } from './config.js';
+import { betaResolutionContextFor } from './beta-resolution-context.js';
+import { resolveBetaFeature } from './config.js';
 import { resolvePtcToolCallMode } from './ptc-default-config.js';
 /**
  * The tool call mode new Sessions take, and what decided it. New Sessions, the post-compaction
@@ -10,7 +11,7 @@ import { resolvePtcToolCallMode } from './ptc-default-config.js';
  * to tell a choice from "unset".
  */
 export function resolveEffectivePtc(config) {
-    const buildDefault = resolveBetaFeature('ptc', undefined, currentBetaResolutionContext());
+    const buildDefault = resolveBetaFeature('ptc', undefined, betaResolutionContextFor(config));
     const configured = config.beta?.ptc;
     return resolvePtcToolCallMode({
         explicit: config.explicitPtc === undefined && configured === buildDefault ? undefined : configured,

@@ -140,6 +140,7 @@ function shouldWriteFileInDev(category, filenamePrefix) {
                 filenamePrefix === 'git-review-trace' ||
                 filenamePrefix === 'ssh-perf' ||
                 filenamePrefix === 'ssh-diagnostics' ||
+                filenamePrefix === 'runtime-http' ||
                 filenamePrefix === 'computer-use')));
 }
 /** Queue bounded, best-effort writes without blocking the main process. */
@@ -159,7 +160,8 @@ function writeToFile(category, content, filenamePrefix) {
         }
         const policy = isComputerUseLog(category, filenamePrefix)
             ? { maxBytes: 5 * 1024 * 1024, backups: 3 }
-            : category === 'main' && filenamePrefix === 'ssh-diagnostics'
+            : category === 'main' &&
+                (filenamePrefix === 'ssh-diagnostics' || filenamePrefix === 'runtime-http')
                 ? { maxBytes: 8 * 1024 * 1024, backups: 3, mode: 0o600 }
                 : undefined;
         pendingCount++;

@@ -22,7 +22,7 @@ import { buildPermissionKeyboard, decodePermissionCallback } from './telegram-ke
 import { LocalTelegramPollWire } from './telegram-poll-wire.js';
 import { IDLE_CHANNEL_TRANSPORT, } from '../../ingress/channel-transport-status.js';
 import { TelegramQuestionnaireRuntime } from './questionnaire/telegram-questionnaire-runtime.js';
-import { TelegramSender } from './outbound/telegram-sender.js';
+import { SingleReplyQuote, TelegramSender, toTelegramReplyAnchor, } from './outbound/telegram-sender.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
 /**
  * Decompose `clientName` into the underlying agent name. Strips the
@@ -312,6 +312,9 @@ export class TelegramPlatformAdapter {
         }
         const sender = this.senderFactory(record.botToken);
         try {
+            // Quote the inbound message this reply answers; one quote per reply, so
+            // the first thing actually sent carries it.
+            const quote = new SingleReplyQuote(toTelegramReplyAnchor(outbound.ctx.sourceMessageId));
             const text = outbound.text?.trim() ?? '';
             if (outbound.questionnaire) {
                 await this.questionnaires.sendInitial({
@@ -321,11 +324,9 @@ export class TelegramPlatformAdapter {
                 });
             }
             else if (text) {
-                await sender.sendRichText(outbound.ctx.chatId, outbound.text, outbound.ctx.threadId);
+                await sender.sendRichText(outbound.ctx.chatId, outbound.text, outbound.ctx.threadId, quote.take());
             }
-            for (const ref of outbound.media ?? []) {
-                await this.sendOneMediaSafely(sender, outbound.ctx.chatId, ref, outbound.ctx.threadId);
-            }
+            await this.sendMediaParts(sender, outbound, quote);
             return { id, status: 'sent' };
         }
         catch (err) {
@@ -374,19 +375,29 @@ export class TelegramPlatformAdapter {
             ...(a.error ? { error: a.error } : {}),
         };
     }
+    /** Media refs in order; only the first one that is sent carries the quote. */
+    async sendMediaParts(sender, outbound, quote) {
+        for (const ref of outbound.media ?? []) {
+            const anchor = quote.take();
+            await this.sendOneMediaSafely(sender, outbound.ctx.chatId, ref, {
+                ...(outbound.ctx.threadId !== undefined ? { messageThreadId: outbound.ctx.threadId } : {}),
+                ...(anchor !== undefined ? { replyToMessageId: anchor } : {}),
+            });
+        }
+    }
     /**
      * Send a single media attachment, isolating per-media failures behind a
      * `[媒体发送失败: …]` text note.
      */
-    async sendOneMediaSafely(sender, chatId, ref, messageThreadId) {
+    async sendOneMediaSafely(sender, chatId, ref, options = {}) {
         try {
-            await sender.sendMedia(chatId, ref, messageThreadId);
+            await sender.sendMedia(chatId, ref, options.messageThreadId, options.replyToMessageId);
         }
         catch (err) {
             const name = ref.name || basenamePath(ref.path) || ref.kind;
             logger.warn({ err, kind: ref.kind, name, chatId }, 'Telegram media send failed');
             try {
-                await sender.sendText(chatId, `[媒体发送失败: ${name}]`, undefined, messageThreadId);
+                await sender.sendText(chatId, `[媒体发送失败: ${name}]`, undefined, options.messageThreadId);
             }
             catch {
                 /* placeholder is best-effort too */

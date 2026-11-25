@@ -5,38 +5,10 @@ import { writeFile } from 'node:fs/promises';
 import { basename, extname, join } from 'node:path';
 import { buildReplyCard, buildThinkingCard } from './cards/feishu-card.js';
 import { isElectronNetFetchByteStringError, resolveInboundAttachments, } from './feishu-inbound-attachments.js';
+import { resolveReplyAnchor } from './outbound/feishu-reply-delivery.js';
+import { FEISHU_ACK_EMOJI, removeAckReaction, sweepExpiredReactions, } from './outbound/feishu-reactions.js';
 import { imLogger as logger } from '@mavis/shared/local-runtime-logging/im-logger';
-/** Pending-ack entries older than this are swept (reply never delivered). */
-const PENDING_REACTION_TTL_MS = 10 * 60_000;
 const FEISHU_RESOURCE_ERROR_REPLY = '抱歉，这个文件暂时没能接收成功。请尝试将文件名中的中文改为英文或数字，保留扩展名后重新发送。';
-/**
- * Revoke the 👀 `OnIt` inbound ack reaction after the final reply for
- * `inboundMessageId` has been delivered. Shared by the two completion-side
- * callers (`FeishuPlatformAdapter.sendMessage` and
- * `LocalFeishuChannelClient.deliver`) so the semantics stay identical:
- *
- *   - missing store / missing inbound id → no-op (nothing to revoke);
- *   - the entry is deleted from the store up-front (success or failure —
- *     a failed removal must not be retried on the next turn with a stale id);
- *   - the actual `remove` call is best-effort: failures are logged at warn
- *     (no message bodies) and never thrown, so a reaction outage can never
- *     break an already-delivered reply.
- */
-export async function removeAckReaction(input) {
-    const { store, inboundMessageId } = input;
-    if (!store || !inboundMessageId)
-        return;
-    const entry = store.get(inboundMessageId);
-    if (!entry)
-        return;
-    store.delete(inboundMessageId);
-    try {
-        await input.remove(inboundMessageId, entry.reactionId);
-    }
-    catch (err) {
-        logger.warn({ messageId: inboundMessageId, err: err instanceof Error ? err.message : String(err) }, 'Feishu ack reaction removal failed');
-    }
-}
 export async function startFeishuEventDispatcher(input) {
     const sdkSpecifier = '@larksuiteoapi/node-sdk';
     const sdk = (await import(sdkSpecifier));
@@ -75,7 +47,7 @@ export async function startFeishuEventDispatcher(input) {
             if (preflight && !preflight.allowed)
                 return;
             const ack = startInboundAckReaction(input, envelope);
-            await postThinkingCardOnce(input, envelope);
+            await postThinkingCard(input, envelope);
             const attachments = await resolveAttachmentsOrReportError(input, envelope, ack);
             if (!attachments)
                 return;
@@ -114,12 +86,15 @@ async function resolveAttachmentsOrReportError(input, envelope, ack) {
     catch (err) {
         if (!isElectronNetFetchByteStringError(err))
             throw err;
+        const anchor = resolveReplyAnchor({
+            sourceMessageId: envelope.messageId,
+            threadId: envelope.ctx.threadId,
+        });
         await handleFeishuResourceError({
             sender: input.sender,
+            clientName: resolveStoreClientName(envelope.ctx.clientName, input.clientName),
             chatId: envelope.ctx.chatId,
-            thread: envelope.ctx.threadId && envelope.messageId
-                ? { replyToMessageId: envelope.messageId }
-                : undefined,
+            ...(anchor ? { anchor } : {}),
             pendingThinkingStore: input.pendingThinkingStore,
             pendingReactionStore: input.pendingReactionStore,
             inboundMessageId: envelope.messageId,
@@ -173,7 +148,7 @@ function startInboundAckReaction(input, envelope) {
     const sender = input.sender;
     const run = async () => {
         try {
-            const reactionId = await sender.addReaction(ackMessageId, 'OnIt');
+            const reactionId = await sender.addReaction(ackMessageId, FEISHU_ACK_EMOJI);
             ackReactionId = reactionId;
             const store = input.pendingReactionStore;
             if (!store || !reactionId)
@@ -181,11 +156,13 @@ function startInboundAckReaction(input, envelope) {
             // Sweep entries whose reply never delivered (mirrors the WS dedup
             // sweep) so the map cannot grow unbounded.
             const now = Date.now();
-            for (const [k, entry] of store) {
-                if (now - entry.createdAtMs > PENDING_REACTION_TTL_MS)
-                    store.delete(k);
-            }
-            store.set(ackMessageId, { reactionId, createdAtMs: now });
+            sweepExpiredReactions(store, now);
+            store.set(ackMessageId, {
+                reactionId,
+                createdAtMs: now,
+                emojiType: FEISHU_ACK_EMOJI,
+                phase: 'ack',
+            });
         }
         catch (err) {
             logger.warn({
@@ -196,30 +173,59 @@ function startInboundAckReaction(input, envelope) {
     };
     return { promise: run(), reactionId: () => ackReactionId };
 }
-/** Post the grey "🤔 思考中…" card once per chat; best-effort by design. */
-async function postThinkingCardOnce(input, envelope) {
-    if (!input.sender || !input.pendingThinkingStore || !envelope.ctx.chatId)
-        return;
+/**
+ * Store namespace for one inbound event. The envelope's own `clientName` wins
+ * (the adapter stamps it), with the dispatcher's as a fallback for wire shapes
+ * that omit it. Several agents share one store, so the key must carry it.
+ */
+function resolveStoreClientName(ctxClientName, fallback) {
+    return ctxClientName?.trim() || fallback?.trim() || '';
+}
+/**
+ * Post one grey "🤔 思考中…" card for THIS inbound message, quoting it.
+ *
+ * One card per inbound message, not per chat: while an earlier turn is still
+ * running the user can send more messages, and each of them gets its own card
+ * so a later send can only ever rewrite the card of the message it answers.
+ * Best-effort by design — a failed card never blocks dispatch.
+ */
+async function postThinkingCard(input, envelope) {
+    const sender = input.sender;
+    const store = input.pendingThinkingStore;
     const chatId = envelope.ctx.chatId;
     const inboundMessageId = envelope.messageId;
-    if (input.pendingThinkingStore.get(chatId))
+    if (!sender || !store || !chatId || !inboundMessageId)
+        return;
+    const clientName = resolveStoreClientName(envelope.ctx.clientName, input.clientName);
+    // The newest inbound message of this chat AND topic decides whether a final
+    // reply may still patch its own card in place — a sibling topic's message
+    // must not push this one out of its own card.
+    store.setLatestInboundMessageId(clientName, chatId, envelope.ctx.threadId, inboundMessageId);
+    if (store.getCard(clientName, inboundMessageId))
+        return;
+    const anchor = resolveReplyAnchor({
+        sourceMessageId: inboundMessageId,
+        threadId: envelope.ctx.threadId,
+    });
+    if (!anchor)
         return;
     try {
         const card = buildThinkingCard(input.botName);
-        // Thread-aware: when the inbound message lived inside a Feishu
-        // thread/topic, post the thinking card into that thread too, so the
-        // later PATCH-into-final-reply also stays in-thread.
-        const thread = envelope.ctx.threadId && inboundMessageId
-            ? { replyToMessageId: inboundMessageId }
-            : undefined;
-        const result = await input.sender.sendCard(chatId, card, 'chat_id', thread);
-        if (result?.messageId) {
-            input.pendingThinkingStore.set(chatId, {
-                messageId: result.messageId,
-                createdAtMs: Date.now(),
-                ...(inboundMessageId ? { inboundMessageId } : {}),
-            });
-        }
+        const result = await sender.sendCard(chatId, card, 'chat_id', anchor);
+        if (!result?.messageId)
+            return;
+        store.setCard(clientName, inboundMessageId, {
+            messageId: result.messageId,
+            createdAtMs: Date.now(),
+            inboundMessageId,
+        });
+        logger.info({
+            clientName,
+            chatId,
+            inboundMessageId,
+            cardMessageId: result.messageId,
+            inThread: anchor.inThread,
+        }, 'Feishu thinking card posted for inbound message');
     }
     catch {
         /* swallow — thinking card is best-effort */
@@ -252,21 +258,32 @@ async function handleFeishuResourceError(input) {
         }, 'Feishu resource error ack cleanup failed');
     }
 }
-/** PATCH the thinking card into the error reply; fall back to a plain text. */
+/**
+ * PATCH the message's own thinking card into the error reply; else quote it.
+ *
+ * Deliberately NOT routed through `deliverFeishuReply`: that path asks whether
+ * this message is still the newest inbound of the chat and, when it is not,
+ * sends a fresh quoted card plus a "已回复，见下方" settle. A resource error is
+ * not a reply that went out below — there is nothing below it — so the card is
+ * always rewritten in place, and no ack-reaction transition is driven from here.
+ */
 async function deliverResourceErrorReply(sender, input) {
-    const pendingThinking = input.pendingThinkingStore?.get(input.chatId);
-    if (pendingThinking) {
-        input.pendingThinkingStore?.delete(input.chatId);
+    const inboundMessageId = input.anchor?.replyToMessageId;
+    const pending = inboundMessageId
+        ? input.pendingThinkingStore?.getCard(input.clientName, inboundMessageId)
+        : undefined;
+    if (pending && inboundMessageId) {
+        input.pendingThinkingStore?.deleteCard(input.clientName, inboundMessageId);
         try {
-            await sender.patchCard(pendingThinking.messageId, buildReplyCard(FEISHU_RESOURCE_ERROR_REPLY));
+            await sender.patchCard(pending.messageId, buildReplyCard(FEISHU_RESOURCE_ERROR_REPLY));
             return;
         }
         catch {
-            // Fall through to a text reply when the transient card can no longer be patched.
+            // Fall through to a quoted reply when the transient card can no longer be patched.
         }
     }
     try {
-        await sender.sendText(input.chatId, FEISHU_RESOURCE_ERROR_REPLY, 'chat_id', input.thread);
+        await sender.sendText(input.chatId, FEISHU_RESOURCE_ERROR_REPLY, 'chat_id', input.anchor);
     }
     catch (err) {
         logger.warn({

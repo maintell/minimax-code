@@ -15,8 +15,6 @@
  * any of its producers, and it reads references a message was already sent with.
  */
 import { finalReply, lastReply } from './orchestration/report.service.js';
-/** How far back a reviewed task's reply is looked for when its last round is unknown. */
-const REPLY_LOOKBACK_MESSAGES = 50;
 /** How far back this turn's user input is looked for when the dispatch names no Turn. */
 const INPUT_LOOKBACK_MESSAGES = 20;
 /**
@@ -68,24 +66,28 @@ async function readNamedReport(sources, sessionId, reportKey) {
 /**
  * The checked task's latest round; used only when the dispatch names no report.
  *
- * The reply and the delivered files are read with that same Turn. Reading the files across the
- * whole Session would put an earlier round's deliveries next to the latest round's reply — a
- * task that delivered a draft in one round and the final version in the next would hand the
- * reviewer both, and the reviewer could check a version the task has already replaced. Only
- * the round-is-unknown fallback reads the Session as a whole, because then there is no Turn to
- * read by; that matches how the reply falls back to recent messages.
+ * The reply and the delivered files are read with that same Turn, and with no Turn to read by
+ * there is nothing to hand over at all: neither another round's reply nor its files are
+ * labelled as this round's. Reading the Session as a whole instead would put an unlabelled
+ * round's materials in a block that says it is the round under review — a task that delivered
+ * a draft in one round and the final version in the next would hand the reviewer both, and a
+ * review that passes on those is worse than one that finds nothing.
+ *
+ * With no round located, the block carries the same explicit degradation line the named-report
+ * path uses, so the reviewer can see the materials are missing rather than read a round nobody
+ * named. That line promises no other round's reply or files were injected, and both paths keep
+ * that promise.
  */
 async function readLatestRound(sources, sessionId) {
     const last = await read(() => sources.facts.lastTurn(sessionId));
-    const messages = last
-        ? await read(() => sources.facts.messages(sessionId, last.turnId))
-        : await read(() => sources.messages.listRecent(sessionId, { limit: REPLY_LOOKBACK_MESSAGES }));
+    if (!last)
+        return { reply: [], files: undefined, unavailable: true };
+    const messages = await read(() => sources.facts.messages(sessionId, last.turnId));
     return {
         reply: boundReply(messages ?? [], sessionId),
-        files: last
-            ? await read(() => sources.assets(sessionId, last.turnId))
-            : await read(() => sources.assets(sessionId)),
-        ...(last ? { turnId: last.turnId } : {}),
+        // Delivered files are read with the same round as the reply, never across the Session.
+        files: await read(() => sources.assets(sessionId, last.turnId)),
+        turnId: last.turnId,
     };
 }
 /** The Turn a report key names, or undefined when it names none this reader can locate. */

@@ -2,6 +2,8 @@ import { isComputerUseEnabled, setComputerUseEnabled, } from './state.js';
 import { resolveComputerUseSelection, createComputerUsePluginRevocationHandler, } from './session-selection.js';
 import { buildComputerUseRuntimeTools } from './tools.js';
 import { readComputerUseDefault } from './default-preference.js';
+/** The official Plugin whose Binding admits Computer Use in harness preflight. */
+export const COMPUTER_USE_PLUGIN_ID = 'computer-use@official';
 /** Bind plugin publication and explicit revocation to the same Computer Use owner. */
 export function createComputerUsePluginCallbacks(client, preferences) {
     const revoke = createComputerUsePluginRevocationHandler(preferences);
@@ -48,6 +50,7 @@ export function initializeComputerUseProductCapabilities(input) {
     const preferences = input.preferences;
     return {
         turnRuntimeFacts: {
+            computerUsePluginId: COMPUTER_USE_PLUGIN_ID,
             // Preflight checks the trusted enabled plugin before resolving session selection.
             ...(input.client && preferences
                 ? {

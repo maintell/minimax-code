@@ -70,6 +70,28 @@ export function createCoordinatorOwnership(options) {
         owner,
     };
 }
+/**
+ * Whether the Session's own Agent is a trusted built-in coordinator.
+ *
+ * Read from the built-in roster through `coordinatorOwnership.standing`, which
+ * is the same list the harness tool authority reads (`isTrustedCoordinator`):
+ * only the bundled built-in catalog can declare coordination, so both sides
+ * answer from one source.
+ *
+ * A Session that cannot be read is an ordinary Session: the caller keeps the
+ * ordinary wording rather than claiming a coordination it could not verify.
+ */
+export async function sessionIsCoordinator(system, sessionId) {
+    try {
+        const session = await system.sessions.repository.get(sessionId);
+        if (!session)
+            return false;
+        return system.coordinatorOwnership.standing(session) === 'coordinator';
+    }
+    catch {
+        return false;
+    }
+}
 /** How many parent links a lookup climbs, far beyond real subagent nesting. */
 const MAX_SESSION_ANCESTRY_DEPTH = 32;
 /**

@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { MINIAPP_DEVICE_ACCESS_ITEMS, isMiniAppAgentAccess, isMiniAppDeviceAccessItem, isMiniAppHostAccess, validateMiniAppSurfaceWindow, } from '@mavis/shared/miniapp-surface';
+import { MINIAPP_DEVICE_ACCESS_ITEMS, isMiniAppAgentAccess, isMiniAppDeviceAccessItem, isMiniAppHostAccess, validateMiniAppFileHandlers, validateMiniAppSurfaceWindow, } from '@mavis/shared/miniapp-surface';
 import { MINIAPP_AGENT_MAX_CONCURRENCY } from '../../../../miniapp/index.js';
 import { isRecord, resolvePluginDirectory, resolvePluginFile, } from '../filesystem.js';
 import { validatePluginPortablePath } from '../package-contract.js';
@@ -19,6 +19,7 @@ const MINIAPP_FIELDS = new Set([
     'toolAccess',
     'deviceAccess',
     'hostAccess',
+    'fileHandlers',
 ]);
 const ARTIFACT_FIELDS = new Set(['client', 'node']);
 const PROCESS_RUNTIME_FIELDS = new Set(['kind', 'entry', 'lifecycle']);
@@ -47,19 +48,27 @@ export async function readMiniAppManifest(root, value, mcpServerNames, payloadDi
     const toolAccess = readToolAccess(value.toolAccess);
     const deviceAccess = readDeviceAccess(value.deviceAccess);
     const hostAccess = readHostAccess(value.hostAccess);
+    const fileHandlers = readFileHandlers(value.fileHandlers);
     return {
         artifacts,
         runtime,
         surface,
         mcpEndpoints,
-        ...(hostConnectorAccess ? { hostConnectorAccess } : {}),
-        ...(agentAccess ? { agentAccess } : {}),
-        ...(agentConcurrency === undefined ? {} : { agentConcurrency }),
-        ...(engines ? { engines } : {}),
-        ...(toolAccess ? { toolAccess } : {}),
-        ...(deviceAccess ? { deviceAccess } : {}),
-        ...(hostAccess ? { hostAccess } : {}),
+        ...definedFields({
+            hostConnectorAccess,
+            agentAccess,
+            agentConcurrency,
+            engines,
+            toolAccess,
+            deviceAccess,
+            hostAccess,
+            fileHandlers,
+        }),
     };
+}
+/** Keeps only the optional manifest fields that were declared. */
+function definedFields(fields) {
+    return Object.fromEntries(Object.entries(fields).filter(([, field]) => field !== undefined));
 }
 async function readArtifacts(root, value, payloadDirectory) {
     if (!isRecord(value) || hasUnknownField(value, ARTIFACT_FIELDS)) {
@@ -251,6 +260,31 @@ function readDeviceAccess(value) {
         miniAppFail('DEVICE_ACCESS_INVALID', `deviceAccess may only contain ${MINIAPP_DEVICE_ACCESS_ITEMS.join(', ')}`);
     }
     return [...new Set(value)];
+}
+/**
+ * `fileHandlers` declares which file extensions open this Mini App and at which page. Paths get
+ * the `surface.path` normalization (trim, leading `/`); every rule after that is the shared
+ * `validateMiniAppFileHandlers` the Main broker also applies, so a handler kept here passes there.
+ */
+function readFileHandlers(value) {
+    if (value === undefined)
+        return undefined;
+    const result = validateMiniAppFileHandlers(withNormalizedHandlerPaths(value));
+    if (!result.ok) {
+        miniAppFail(result.kind === 'path' ? 'ROUTE_PATH_INVALID' : 'FILE_HANDLERS_INVALID', result.reason);
+    }
+    return result.value;
+}
+/** Normalizes only string paths; anything malformed is left for the shared validator to name. */
+function withNormalizedHandlerPaths(value) {
+    if (!Array.isArray(value))
+        return value;
+    return value.map((item) => {
+        if (!isRecord(item) || typeof item.path !== 'string')
+            return item;
+        const route = item.path.trim();
+        return { ...item, path: route && !route.startsWith('/') ? `/${route}` : route };
+    });
 }
 async function resolveFileOrDirectory(root, relativePath) {
     try {

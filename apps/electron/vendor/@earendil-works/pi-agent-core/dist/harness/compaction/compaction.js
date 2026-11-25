@@ -61,7 +61,9 @@ export const DEFAULT_COMPACTION_SETTINGS = {
 };
 /** Calculate total context tokens from provider usage. */
 export function calculateContextTokens(usage) {
-    return usage.totalTokens || usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+    return (usage.contextTokens ||
+        usage.totalTokens ||
+        usage.input + usage.output + usage.cacheRead + usage.cacheWrite);
 }
 function getAssistantUsage(msg) {
     if (msg.role === "assistant" && "usage" in msg) {

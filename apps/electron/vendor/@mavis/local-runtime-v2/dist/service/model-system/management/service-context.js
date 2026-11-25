@@ -8,7 +8,7 @@ import { generateProviderKey } from './provider-key.js';
 import { buildCustomProviderView } from '../catalog/provider-views.js';
 import { mergeProviderHeaders, normalizeProviderBaseUrl, } from '../connectivity/provider-request.js';
 import { mergeModelsFromInputs, normalizeApiFormat, applyProviderCredentialUpdate, normalizeProviderCredentialUpdate, normalizeHeaderNames, normalizeHeaders, removeHeaderCaseInsensitive, } from './service-input.js';
-import { assertCustomProviderEffortOptions, customProviderKeyFromId, customProviderViewOptions, modelAccessBindingMissingError, modelAccessProviderReadOnlyError, removeLegacyCustomProviderNpm, } from './service-helpers.js';
+import { customProviderKeyFromId, customProviderViewOptions, modelAccessBindingMissingError, modelAccessProviderReadOnlyError, removeLegacyCustomProviderNpm, } from './service-helpers.js';
 import { isModelAccessProvider } from '../model-access/projection.js';
 import { isMiniMaxM3ModelId, normalizeModelThinkingEffortOptions, } from '../resolution/model-ref.js';
 import { byokEffectiveOutputLimit } from '../resolution/model-resolver-byok.js';
@@ -186,7 +186,6 @@ export class ModelProviderServiceContext {
         if (!apiFormat)
             delete provider.api;
         removeLegacyCustomProviderNpm(provider);
-        assertCustomProviderEffortOptions(provider);
         return {
             providerKey: identity.providerKey,
             providerId: `${CUSTOM_PROVIDER_ID_PREFIX}${identity.providerKey}`,

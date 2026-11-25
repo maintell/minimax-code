@@ -9,6 +9,7 @@
  * output format must have exactly one source of truth — otherwise desktop
  * and cloud drift and every format change breaks assertions in two places.
  */
+import { findDegenerateImageReason } from '@mavis/agent-core/pi-turn-runner';
 import { compatibleReadToolResponseFromPiDetails, withPluginHookCompatibleToolResponse, } from '../plugin-hooks/vendor-tool-response.js';
 import { postprocessPiReadText } from './read-postprocess.js';
 /**
@@ -39,10 +40,16 @@ export function readErrorResult(toolName, message) {
  * - `details.media` (video results built by read-video.ts);
  * - `details.truncation.firstLineExceedsLimit` (the whole text is pi's
  *   bash-fallback notice, not file content).
+ *
+ * An image the model provider would reject is refused here (see
+ * `refuseDegenerateImages`), which also sets `details.media`.
  */
 export function piReadResultToToolResult(toolName, res, opts = {}) {
-    const content = res.content;
+    const refused = refuseDegenerateImages(res.content);
+    const content = refused.content;
     const details = { ...(res.details ?? {}) };
+    if (refused.media)
+        details.media = refused.media;
     const hasNonTextContent = content.some((c) => c.type !== 'text');
     const truncation = details.truncation;
     const skipPostprocess = hasNonTextContent || details.media !== undefined || truncation?.firstLineExceedsLimit === true;
@@ -84,5 +91,32 @@ export function piReadResultToToolResult(toolName, res, opts = {}) {
     return compatibleResponse
         ? withPluginHookCompatibleToolResponse(result, compatibleResponse)
         : result;
+}
+/**
+ * Pi reads an image file as it is (autoResizeImages is off). One the model
+ * provider would reject for its size, an edge below 8 px or an aspect ratio
+ * above 200:1 (see `findDegenerateImageReason`), becomes a text note, for
+ * every model alike: in history it would only be replaced by a placeholder on
+ * every later request. Like a broken video (read-video.ts) this is not a tool
+ * error, and `details.media` says the image was not loaded.
+ */
+function refuseDegenerateImages(content) {
+    let media;
+    const checked = content.map((block) => {
+        if (block.type !== 'image' || !block.mimeType.startsWith('image/'))
+            return block;
+        const reason = findDegenerateImageReason(block.data, block.mimeType);
+        if (reason === undefined)
+            return block;
+        media = {
+            kind: 'image',
+            mime_type: block.mimeType,
+            size_bytes: Buffer.byteLength(block.data, 'base64'),
+            inline: false,
+            reason: 'degenerate_image',
+        };
+        return { type: 'text', text: `[Image not loaded: ${reason}.]` };
+    });
+    return media ? { content: checked, media } : { content: [...content] };
 }
 //# sourceMappingURL=read-result.js.map

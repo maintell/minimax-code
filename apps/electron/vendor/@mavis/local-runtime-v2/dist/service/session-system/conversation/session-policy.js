@@ -1,3 +1,4 @@
+import { isGoalVerifierTaskPurpose } from '@mavis/shared/goal-verifier-purpose';
 const LOCAL_DIRECT_TASK_PURPOSE_PREFIXES = ['local-task:', 'local-background-task:'];
 export function isLocalDirectTaskPurpose(purpose) {
     return LOCAL_DIRECT_TASK_PURPOSE_PREFIXES.some((prefix) => purpose?.startsWith(prefix));
@@ -17,6 +18,16 @@ export function isLocalChildWorkerSession(session) {
     // Match Session System's durable Task-purpose fallback; kind-less compatibility
     // callers additionally retain the old structural policy.
     return session.sessionKind === undefined || isLocalTaskWorkerPurpose(session.purpose?.trim());
+}
+/**
+ * Child Sessions whose Turns the parent timeline records as Subagent executions:
+ * delegated workers (Task, background Task, code review, Team). An allowlist, so a new
+ * kind of parented Session (like peek and cron before it) stays out until it opts in.
+ * Goal verification is an internal check the Subagent panel hides, so it writes no
+ * parent execution rows either.
+ */
+export function isSubagentExecutionChild(session) {
+    return isLocalChildWorkerSession(session) && !isGoalVerifierTaskPurpose(session.purpose);
 }
 /**
  * Default sidebar tree projection.

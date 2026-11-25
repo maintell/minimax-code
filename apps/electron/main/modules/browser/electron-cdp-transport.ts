@@ -1,6 +1,15 @@
 import { INACTIVE_BROWSER_JS_DIALOG_SOURCE, browserTransportInterruptionError } from "@mavis/browser-core";
 import { isWebviewGuest, isGuestKeyboardCommand, sendGuestKeyboardCommand, withAgentPointer } from "./webview-guest-input.js";
+import { withAgentInput } from "./agent-input-marker.js";
+import { isAgentScrollInput, isUserScrollGuarded, passAgentScroll } from "./agent-scroll-guard.js";
 import { getBrowserJsDialogGate } from "./browser-js-dialog-registry.js";
+import { detachDebuggerBeforeDestroy } from "./debugger-teardown.js";
+/**
+ * Longest a page read waits for Electron to swap in the main frame that CDP
+ * already reported as committed. The swap follows within milliseconds; the
+ * bound only covers a `did-frame-navigate` that never arrives.
+ */
+const MAIN_FRAME_SWAP_MAX_WAIT_MS = 2000;
 /**
  * Electron implementation of the provider-neutral BrowserPageTransport.
  *
@@ -51,6 +60,18 @@ export class ElectronCdpTransport {
     }
     async send(method, params, sessionId, options = {}) {
         this.ensureAvailable();
+        if (method.startsWith('Input.')) {
+            // Mark Agent input so the user-input block on a controlled tab lets it through.
+            return withAgentInput(this.webContents, async () => {
+                if (isAgentScrollInput(method, params) && isUserScrollGuarded(this.webContents)) {
+                    await passAgentScroll(this.webContents);
+                }
+                return this.sendUnmarked(method, params, sessionId, options);
+            });
+        }
+        return this.sendUnmarked(method, params, sessionId, options);
+    }
+    sendUnmarked(method, params, sessionId, options) {
         return abortableCommand((commandSignal) => {
             if (sessionId === undefined && method === 'Page.reload')
                 return this.reloadPage(params);
@@ -90,11 +111,38 @@ export class ElectronCdpTransport {
     }
     async evaluate(expression, options = {}) {
         this.ensureAvailable();
-        return abortableCommand(() => this.webContents.executeJavaScript(expression, true), 'Runtime.evaluate', options);
+        // `webContents.executeJavaScript` waits for `did-stop-loading` while the
+        // main frame loads, so every read hung behind a slow navigation (in
+        // evaluation the page a forum submit redirected to took 48 s, the
+        // read after the click hit its deadline, and the recovery stopped the
+        // load). The main frame's own executeJavaScript runs in the current
+        // document right away, like CDP Runtime.evaluate in Chrome.
+        //
+        // A cross-document commit replaces the main RenderFrameHost. CDP reports
+        // it (Page.frameNavigated) a moment before Electron swaps
+        // `webContents.mainFrame` (did-frame-navigate), and a script sent to the
+        // old frame in between never answers: real Electron 42, POST -> 302 to a
+        // page that answered after 14 s, Browser Core's first read after the
+        // commit (it waits for Page.frameNavigated) hung until its 30 s deadline,
+        // while the same read 2 ms later, on the new frame, answered in 1 ms. Wait
+        // for the swap and send the script once, to the frame that is current. A
+        // caller that gave up while it waited must not run its script there.
+        return abortableCommand(async (commandSignal) => {
+            await this.mainFrameSwap?.swapped;
+            commandSignal.throwIfAborted();
+            this.ensureAvailable();
+            return this.webContents.mainFrame.executeJavaScript(expression, true);
+        }, 'Runtime.evaluate', options);
     }
     async evaluateInAllFrames(expression, options = {}) {
         this.ensureAvailable();
-        const frames = this.webContents.mainFrame.framesInSubtree.filter((frame) => !frame.isDestroyed() && !frame.detached);
+        // Frames listed before the main-frame swap belong to the replaced document (see evaluate).
+        const frames = await abortableCommand(async (commandSignal) => {
+            await this.mainFrameSwap?.swapped;
+            commandSignal.throwIfAborted();
+            this.ensureAvailable();
+            return this.webContents.mainFrame.framesInSubtree.filter((frame) => !frame.isDestroyed() && !frame.detached);
+        }, 'Runtime.evaluate(frame)', options);
         return Promise.all(frames.map((frame) => abortableCommand(() => frame.executeJavaScript(expression), 'Runtime.evaluate(frame)', options)));
     }
     listAttachedFrames() {
@@ -217,6 +265,8 @@ export class ElectronCdpTransport {
         try {
             this.webContents.debugger.attach('1.3');
             this.ownsAttachment = true;
+            // A page that closes itself never reaches close(); detach on its way out.
+            detachDebuggerBeforeDestroy(this.webContents);
         }
         catch {
             // Electron throws when another owner already attached the debugger. The
@@ -232,6 +282,11 @@ export class ElectronCdpTransport {
         this.ensureAttached();
         const handler = (_event, method, params, sessionId) => {
             this.trackAttachedTarget(method, params, sessionId);
+            if (!sessionId) {
+                // Before the listeners: Browser Core reads the page as soon as it sees the commit.
+                if (method === 'Page.frameNavigated' && !asRecord(asRecord(params).frame).parentId)
+                    this.beginMainFrameSwap();
+            }
             const event = {
                 method,
                 ...(params === undefined ? {} : { params }),
@@ -254,6 +309,36 @@ export class ElectronCdpTransport {
             // Renderer teardown can race listener removal.
         }
         this.messageHandler = null;
+        this.mainFrameSwap?.end();
+    }
+    /** Holds page reads from the CDP main-frame commit until Electron swaps `mainFrame` (see evaluate). */
+    beginMainFrameSwap() {
+        if (this.mainFrameSwap)
+            return;
+        const webContents = this.webContents;
+        let resolve;
+        const swapped = new Promise((done) => {
+            resolve = done;
+        });
+        const onFrameNavigate = (_event, _url, _httpResponseCode, _httpStatusText, isMainFrame) => {
+            if (isMainFrame)
+                end();
+        };
+        const end = () => {
+            if (this.mainFrameSwap !== swap)
+                return;
+            this.mainFrameSwap = undefined;
+            clearTimeout(timer);
+            webContents.removeListener('did-frame-navigate', onFrameNavigate);
+            webContents.removeListener('destroyed', end);
+            resolve();
+        };
+        const swap = { swapped, end };
+        const timer = setTimeout(end, MAIN_FRAME_SWAP_MAX_WAIT_MS);
+        timer.unref?.();
+        this.mainFrameSwap = swap;
+        webContents.on('did-frame-navigate', onFrameNavigate);
+        webContents.once('destroyed', end);
     }
     trackAttachedTarget(method, params, parentSessionId) {
         const values = asRecord(params);

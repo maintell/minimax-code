@@ -11,23 +11,14 @@
  * 一并导出,方便测试。
  */
 import { SENSITIVE_GLOB_EXCLUDES } from '../shared/rg-sensitive.js';
+import { shellQuote } from '../shared/shell-quote.js';
 // Re-export for downstream consumers (cloud-runtime re-exports it from
 // `@mavis/agent-tools/cloud`); the source of truth lives in shared/.
 export { SENSITIVE_GLOB_EXCLUDES };
+// shellQuote moved to shared/ (host-neutral); cloud tools keep importing it from here.
+export { shellQuote };
 const RG_BINARY = 'rg';
 const DEFAULT_TIMEOUT_SECONDS = 30;
-const SAFE_ARG_RE = /^[A-Za-z0-9_./:=-]+$/;
-/**
- * POSIX 单引号 quoting。安全字符直接原样返回,其它字符走 `'…'` + 内部
- * `'\''` 转义。空串变 `''`。
- */
-export function shellQuote(arg) {
-    if (arg === '')
-        return "''";
-    if (SAFE_ARG_RE.test(arg))
-        return arg;
-    return `'${arg.replace(/'/g, `'\\''`)}'`;
-}
 export function withSensitiveExcludeArgs(args) {
     const out = [...args];
     for (const pattern of SENSITIVE_GLOB_EXCLUDES) {
@@ -58,6 +49,8 @@ export async function runRgInSandbox(executor, opts) {
     const response = await executor.executeShell(opts.ctx, {
         command,
         timeout_seconds: opts.timeoutSeconds ?? DEFAULT_TIMEOUT_SECONDS,
+        // rg only reads the sandbox filesystem, so a re-send is safe.
+        idempotent: true,
     }, opts.signal);
     if (opts.signal?.aborted) {
         throw new Error('Operation aborted');

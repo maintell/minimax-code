@@ -16,6 +16,7 @@ import { newHistory } from './history.js';
 import { setLLMHook, wrapStreamFnWithTimeout } from './llm.js';
 import { newPiTurnMetrics, } from './metrics.js';
 import { _computeFailureTerminationReasonForTest } from './terminal.js';
+import { turnConversation } from './turn-conversation.js';
 import { newTurn, } from './turn.js';
 import { setToolHooks } from './tools.js';
 import { createPtcToolExecutor } from './ptc-tool-executor.js';
@@ -48,6 +49,8 @@ export class PiTurnRunner {
      * - bridge pi AgentEvents into RuntimeEvents
      * - notify history hooks as pi state changes
      * - emit the terminal session.status frame
+     *
+     * 返回值只在本轮因网关 content_error 结束时带 `contentReview` 结果，其余情况为空对象。
      */
     async runTurn(input) {
         // Metrics recorder spans the whole turn; `finish` runs in the outer
@@ -64,6 +67,7 @@ export class PiTurnRunner {
             timing: input.turnTiming,
             agentKind: input.agentKind,
             wake: input.wake,
+            conversation: turnConversation(input.history),
             visibleText: input.turnVisibleText,
         });
         let termination;
@@ -153,8 +157,10 @@ export class PiTurnRunner {
                     events.unsubscribe();
                     await events.drain();
                     termination = { kind: 'aborted' };
-                    await emitTerminal(turn, termination);
-                    return;
+                    // A yielded run leaves no terminal frame; the resuming run owns it.
+                    if (input.isYieldStopped?.() !== true)
+                        await emitTerminal(turn, termination);
+                    return {};
                 }
                 input.signal.addEventListener('abort', () => {
                     agent.abort();
@@ -170,7 +176,7 @@ export class PiTurnRunner {
                 preempt: () => (turn.preemption.active?.preempt() ? 'preempted' : 'not-streaming'),
             });
             try {
-                reason = await runAgent(agent, turn, events.convergeAtIdle);
+                reason = await runAgent(agent, turn, events.convergeAtIdle, events.dispatch);
             }
             finally {
                 unbindPreemption?.();
@@ -184,8 +190,15 @@ export class PiTurnRunner {
             //      没有返回 abort / error reason 时，默认按 `completed` 处理。
             await events.drain();
             await history.flushTail();
+            if (input.isYieldStopped?.() === true) {
+                // A yielded run leaves no terminal frame; the resuming run owns it.
+                termination = { kind: 'aborted' };
+                return {};
+            }
             termination = reason ?? events.forcedTermination() ?? { kind: 'completed' };
             await emitTerminal(turn, termination);
+            const contentReview = turn.contentReview.outcome;
+            return contentReview ? { contentReview } : {};
         }
         catch (error) {
             thrown = error;

@@ -10,9 +10,9 @@ const SESSION_TITLE_TOOL = {
 };
 const SESSION_TITLE_REVIEW_TOOL = {
     name: 'review_session_title',
-    description: 'Defer until a substantive reply, keep the title, or replace it only for a clear improvement.',
+    description: 'Keep the title, or replace it for a clear improvement or when the conversation has no name yet.',
     parameters: Type.Object({
-        action: Type.Union([Type.Literal('defer'), Type.Literal('keep'), Type.Literal('replace')]),
+        action: Type.Union([Type.Literal('keep'), Type.Literal('replace')]),
         title: Type.Optional(Type.String()),
     }, { additionalProperties: false }),
 };

@@ -59,38 +59,48 @@ var __runInitializers = (this && this.__runInitializers) || function (thisArg, i
 import { Type } from '@sinclair/typebox';
 import { bindTool, } from '@mavis/agent-core/tools';
 import { CommunicateDeliveryStatus, CommunicateSource, } from './runtime-types.js';
-export const CommunicateToolDef = {
-    name: 'communicate',
-    description: 'Talk to another session — either an existing peer or a new subordinate spawned just for this task.\n' +
-        '\n' +
-        '**Send mode** (default): { to_session, content }. Use the `mavis` tool first to discover reachable peers: ' +
-        '`mavis({ command: "session list", args: { mode: "peers", session_id: "<current-session-id>" } })`.\n' +
-        '\n' +
-        '**Spawn mode**: { spawn: { agent_name, title? }, content }. Atomically creates a Branch session under ' +
-        'the current session and delivers `content` as its first user message. The new session does the work, ' +
-        'reports back via its own `communicate`, then exits — useful for one-off review / verify / second-opinion ' +
-        'passes when a full `team` cycle is overkill.\n' +
-        '\n' +
-        'Exactly one of `to_session` and `spawn` must be present.',
-    schema: Type.Object({
-        to_session: Type.Optional(Type.String({
-            description: 'Send mode — target peer session_id. Mutually exclusive with `spawn`.',
-        })),
-        spawn: Type.Optional(Type.Object({
-            agent_name: Type.String({
-                description: 'Display name of the agent for the new subordinate session. Resolved by archon-server (single lookup, no fallback).',
-            }),
-            title: Type.Optional(Type.String({
-                description: 'Optional short title for the new session (shown in listings).',
-            })),
-        }, {
-            description: 'Spawn mode — open a fresh Branch session under the current session. Mutually exclusive with `to_session`.',
-        })),
-        content: Type.String({
-            description: 'Message body. In send mode this is delivered to `to_session`. In spawn mode this becomes the first user message of the new session.',
+const CommunicateToolSchema = Type.Object({
+    to_session: Type.Optional(Type.String({
+        description: 'Send mode — target peer session_id. Mutually exclusive with `spawn`.',
+    })),
+    spawn: Type.Optional(Type.Object({
+        agent_name: Type.String({
+            description: 'Display name of the agent for the new subordinate session. Resolved by archon-server (single lookup, no fallback).',
         }),
+        title: Type.Optional(Type.String({
+            description: 'Optional short title for the new session (shown in listings).',
+        })),
+    }, {
+        description: 'Spawn mode — open a fresh Branch session under the current session. Mutually exclusive with `to_session`.',
+    })),
+    content: Type.String({
+        description: 'Message body. In send mode this is delivered to `to_session`. In spawn mode this becomes the first user message of the new session.',
     }),
-};
+});
+/** description 里 team 句之前的部分。 */
+const COMMUNICATE_DESCRIPTION_HEAD = 'Talk to another session — either an existing peer or a new subordinate spawned just for this task.\n' +
+    '\n' +
+    '**Send mode** (default): { to_session, content }. Use the `mavis` tool first to discover reachable peers: ' +
+    '`mavis({ command: "session list", args: { mode: "peers", session_id: "<current-session-id>" } })`.\n' +
+    '\n' +
+    '**Spawn mode**: { spawn: { agent_name, title? }, content }. Atomically creates a Branch session under ' +
+    'the current session and delivers `content` as its first user message. The new session does the work, ' +
+    'reports back via its own `communicate`, then exits — useful for one-off review / verify / second-opinion ';
+/**
+ * `teamTool`：运行时是否注册独立的 `team` 工具（v1 cloud-runtime 有，cloud-harness-server 没有），
+ * 只决定描述里是否有指向它的句子。
+ */
+export function createCommunicateToolDef(options) {
+    const reviewPasses = options.teamTool
+        ? 'passes when a full `team` cycle is overkill.'
+        : 'passes.';
+    return {
+        name: 'communicate',
+        description: `${COMMUNICATE_DESCRIPTION_HEAD}${reviewPasses}\n\nExactly one of \`to_session\` and \`spawn\` must be present.`,
+        schema: CommunicateToolSchema,
+    };
+}
+export const CommunicateToolDef = createCommunicateToolDef({ teamTool: true });
 let CloudCommunicateTool = (() => {
     let _classDecorators = [bindTool(CommunicateToolDef)];
     let _classDescriptor;
@@ -213,7 +223,7 @@ export { CloudCommunicateTool };
  * can act on without reading wire enums:
  *   - Delivered            → ok:true,  status="spawned",       child_session_id present
  *   - CreateOkPromptFailed → ok:false, status="spawn_partial", retry_hint suggests send-mode retry
- *   - CreateFailed         → ok:false, status="spawn_failed",  retry_hint suggests retry from scratch
+ *   - CreateFailed         → ok:false, status="spawn_failed",  retry_hint follows delivery_error.retryable
  */
 function mapSpawnResp(resp) {
     const baseDetails = {
@@ -254,7 +264,9 @@ function mapSpawnResp(resp) {
         };
     }
     // CreateFailed (or any other ok:false / unknown delivery_status with no child)
-    const retryHint = 'Spawn failed before the subordinate session was created. Retry the spawn call from scratch.';
+    const retryHint = resp.delivery_error?.retryable === false
+        ? 'Spawn failed before the subordinate session was created. Do not retry the same call: it will fail again. Change the arguments, for example use a different agent_name, or handle the task in this session.'
+        : 'Spawn failed before the subordinate session was created. Retry the spawn call from scratch.';
     const message = resp.message ? `${resp.message} — ${retryHint}` : retryHint;
     return {
         tool_name: CommunicateToolDef.name,

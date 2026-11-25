@@ -46,9 +46,10 @@ export function spaceLinkOf(input, spaceId, isProject, queuePosition) {
         spaceId,
         ...(queuePosition === undefined ? {} : { queuePosition }),
         ...(input.callerTurnId ? { dispatchTurnId: input.callerTurnId } : {}),
-        spaceType: spaceId === 'default' ? 'bunny' : 'user',
         execLocation: isProject ? 'project' : 'space',
         ...(input.trigger ? { trigger: input.trigger } : {}),
     };
+}
+export class AssignmentCursorError extends Error {
 }
 //# sourceMappingURL=contracts.js.map

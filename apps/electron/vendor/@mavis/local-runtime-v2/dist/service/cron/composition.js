@@ -31,6 +31,9 @@ const FAIL_CLOSED_DELIVERY = {
         error: 'Cron delivery is not available on this runtime host',
     }),
 };
+function scheduleOriginsField(store) {
+    return store ? { scheduleOrigins: store } : {};
+}
 export function composeCronService(options) {
     const nowMs = options.nowMs ?? Date.now;
     const metrics = options.metrics ?? createCronMetrics();
@@ -100,6 +103,7 @@ export function composeCronService(options) {
         nowMs,
         metrics,
         modelSelection: options.modelSelection ?? SOURCE_QUALIFIED_MODEL_SELECTION,
+        ...scheduleOriginsField(options.scheduleOrigins),
     });
     return {
         service,

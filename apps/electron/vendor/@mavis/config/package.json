@@ -20,6 +20,10 @@
       "import": "./dist/sandbox-settings.js",
       "default": "./dist/sandbox-settings.js"
     },
+    "./worktree-config": {
+      "import": "./dist/worktree-config.js",
+      "default": "./dist/worktree-config.js"
+    },
     "./ptc-default-config": {
       "import": "./dist/ptc-default-config.js",
       "default": "./dist/ptc-default-config.js"

@@ -1,6 +1,6 @@
 import { isContextOverflow, } from '@earendil-works/pi-ai';
 import { formatDimensionNote, ImageProcessorUnavailableError, resizeImage, } from '@earendil-works/pi-coding-agent/image-resize';
-import { isLLMImageLimitMessage, isLLMRequestTooLargeMessage, listRequestImages, replaceRequestImages, resolveMaxImagesPerRequest, } from '@mavis/agent-core/pi-turn-runner';
+import { isLLMContextOverflowMessage, isLLMImageLimitMessage, isLLMRequestTooLargeMessage, listRequestImages, replaceRequestImages, resolveMaxImagesPerRequest, } from '@mavis/agent-core/pi-turn-runner';
 import { recordImageEncodedContent } from '@mavis/agent-core/tools';
 /** Strictest known per-image provider limit, in base64 bytes. */
 export const PROVIDER_IMAGE_MAX_BASE64_BYTES = 5 * 1024 * 1024;
@@ -73,11 +73,13 @@ export function boundRequestMedia(messages, budget) {
 /**
  * A provider rejection that compacting the history can fix: a context overflow
  * by tokens or request bytes, or an image count or size limit. The retry layer
- * reads the same classifier, so such a rejection is not resent unchanged first.
+ * reads the same classifier, so such a rejection is not resent unchanged first;
+ * the classifier's own overflow wording covers providers Pi's patterns miss.
  */
 export function isRequestMediaRejection(message) {
     return (message.stopReason === 'error' &&
         (isContextOverflow(message) ||
+            isLLMContextOverflowMessage(message.errorMessage) ||
             isLLMImageLimitMessage(message.errorMessage) ||
             isLLMRequestTooLargeMessage(message.errorMessage)));
 }

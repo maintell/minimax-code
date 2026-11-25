@@ -179,4 +179,8 @@ export function formatShortcut(accelerator, platform) {
     })
         .join('');
 }
+export function normalizePlatformAccelerator(key, platform) {
+    const modifier = platform === 'mac' ? 'Command' : 'Ctrl';
+    return normalizeAccelerator(key.replace(/commandorcontrol|cmdorctrl/gi, modifier).replace(/\breturn\b/gi, 'Enter')).toLowerCase();
+}
 //# sourceMappingURL=accelerator.js.map

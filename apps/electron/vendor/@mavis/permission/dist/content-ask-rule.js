@@ -1,6 +1,7 @@
 import { getContentRulesForTool } from './context.js';
 import { extractFilePath, isFsTool, toolActionForFsTool } from './tools/fs-input.js';
 import { FS_UMBRELLA_TOOL_NAME, matchPathRule, ruleSupportsPathAction, validatePath, } from './tools/fs-permission.js';
+import { resolvePathIdentities, unfoldedAbsolutePath } from './tools/path-identity.js';
 /** Shared by both policy owners; this matches rules, not the host's ASK/mode gate. */
 export function matchesContentAskRule(toolName, input, context) {
     const inputContent = extractToolInputContent(toolName, input);
@@ -21,9 +22,11 @@ export function matchesContentAskRule(toolName, input, context) {
         const path = validatePath(inputContent, context.workingDirectory, context.homeDir);
         if (!path.valid)
             return undefined;
+        // Same locations a deny rule sees, so one rule set judges a symlink one way.
+        const targets = resolvePathIdentities(path.resolved, unfoldedAbsolutePath(inputContent, context.workingDirectory, context.homeDir)) ?? [path.resolved];
         return rules.find((rule) => {
             const ruleContent = rule.ruleValue.ruleContent;
-            return Boolean(ruleContent && matchPathRule(path.resolved, ruleContent));
+            return Boolean(ruleContent && targets.some((target) => matchPathRule(target, ruleContent)));
         });
     }
     // Preserve existing command/URL matching; FS paths must not use substring matching.

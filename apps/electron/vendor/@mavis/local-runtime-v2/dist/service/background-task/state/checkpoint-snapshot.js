@@ -1,5 +1,6 @@
 import { logger } from '@mavis/shared/local-runtime-logging/logger';
 import { BACKGROUND_TASK_CHECKPOINT_DETAILS_HINT, isTerminalTaskStatus, } from '@mavis/background-task/local';
+import { readPluginSpawnOrigin } from '@mavis/background-task/local';
 const TASK_LIMIT = 8;
 const STATE_MAX_BYTES = 4_096;
 const TEXT_LIMIT = 120;
@@ -18,7 +19,8 @@ export async function captureBackgroundTaskCheckpointSnapshot(input) {
                 limit: 500,
                 ...(cursor ? { cursor } : {}),
             });
-            tasks.push(...page.items);
+            // A plugin-spawned child belongs to its plugin: the main Agent is never told about it.
+            tasks.push(...page.items.filter((task) => !readPluginSpawnOrigin(task)));
             cursor = page.nextCursor;
         } while (cursor);
         const counts = {

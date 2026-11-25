@@ -424,24 +424,24 @@ function renderBoardHealthStatus(args) {
     }
     // Stale path — interpret based on session activity + timeout proximity.
     if (recentlyActive) {
-        return `WATCH: board stale ${ageDesc}, session active. Inspect if needed via the \`mavis\` tool: \`mavis({ command: "session messages", args: { session_id: "${sessionId}", limit: 5 } })\`.`;
+        return `WATCH: board stale ${ageDesc}, session active. Inspect if needed with \`session_messages({ session_id: "${sessionId}", limit: 5 })\`.`;
     }
     // Stale and quiet.
     const closeToTimeout = remainingMs <= TIMEOUT_PROXIMITY_THRESHOLD_MS;
     if (health.escalated && closeToTimeout) {
         const remainingDesc = formatDuration(remainingMs);
         return (`WARN: board stale ${ageDesc}, session quiet, ${remainingDesc} until timeout. ` +
-            `Owner should inspect via \`mavis({ command: "session messages", args: { session_id: "${sessionId}", limit: 5 } })\`; ` +
+            `Owner should inspect with \`session_messages({ session_id: "${sessionId}", limit: 5 })\`; ` +
             `if it is still making progress, run \`team({ command: "extend-timeout", args: { plan_id: "${planId}", task_id: "${taskId}", extra_minutes: 15 } })\`; ` +
             `if it is stuck or going in the wrong direction, run \`team({ command: "steer", args: { plan_id: "${planId}", message: "..." } })\` or \`team({ command: "cancel", args: { plan_id: "${planId}" } })\`.`);
     }
     if (health.escalated) {
         return (`WARN: board stale ${ageDesc}, session quiet, needs attention. ` +
-            `Owner should inspect via \`mavis({ command: "session messages", args: { session_id: "${sessionId}", limit: 5 } })\`; ` +
+            `Owner should inspect with \`session_messages({ session_id: "${sessionId}", limit: 5 })\`; ` +
             `if the worker is blocked or drifting, run \`team({ command: "steer", args: { plan_id: "${planId}", message: "..." } })\`; ` +
             `if you need to stop and decide manually, run \`team({ command: "cancel", args: { plan_id: "${planId}" } })\`.`);
     }
-    return `WATCH: board stale ${ageDesc}. Inspect if needed via the \`mavis\` tool: \`mavis({ command: "session messages", args: { session_id: "${sessionId}", limit: 5 } })\`.`;
+    return `WATCH: board stale ${ageDesc}. Inspect if needed with \`session_messages({ session_id: "${sessionId}", limit: 5 })\`.`;
 }
 function formatBoardAge(ms) {
     if (ms === null)

@@ -20,24 +20,12 @@ export function prepareBackgroundTasks(input) {
         // The owner binds late, so it is read on every creation.
         onCreated: (task) => attributeTaskRowRound(host?.subSessionRoundAttribution, task),
         stopRuntime: async (task, reason) => {
-            abortAdmittedBackgroundTask(requireHost(), task.taskId, reason ?? (task.kind === 'bash' ? 'Background bash stopped' : 'Background task stopped'));
+            const setupAborted = abortAdmittedBackgroundTask(requireHost(), task.taskId, reason ?? (task.kind === 'bash' ? 'Background bash stopped' : 'Background task stopped'));
             if (task.kind === 'bash') {
                 await stopBackgroundLocalBashTask(task, reason);
                 return;
             }
-            const childSessionId = task.metadata?.childSessionId;
-            const subTurnId = task.metadata?.subTurnId;
-            if (typeof childSessionId !== 'string' || typeof subTurnId !== 'string')
-                throw new Error('Background task execution owner is unknown');
-            if (!abortChild)
-                throw new Error('Background task Turn owner is unavailable');
-            const result = await abortChild({
-                sessionId: childSessionId,
-                reason: 'lifecycle',
-                turnId: subTurnId,
-            });
-            if (result.status === 'abort-timeout' || result.status === 'turn-mismatch')
-                throw new Error(`Child task stop incomplete: ${result.status}`);
+            await stopChildTurn(task, setupAborted, abortChild);
         },
     });
     return {
@@ -89,5 +77,23 @@ export function prepareBackgroundTasks(input) {
             };
         },
     };
+}
+async function stopChildTurn(task, setupAborted, abortChild) {
+    const childSessionId = task.metadata?.childSessionId;
+    const subTurnId = task.metadata?.subTurnId;
+    // Stopped before its child Session exists: the aborted setup was all that ran it.
+    if (typeof childSessionId !== 'string' && setupAborted)
+        return;
+    if (typeof childSessionId !== 'string' || typeof subTurnId !== 'string')
+        throw new Error('Background task execution owner is unknown');
+    if (!abortChild)
+        throw new Error('Background task Turn owner is unavailable');
+    const result = await abortChild({
+        sessionId: childSessionId,
+        reason: 'lifecycle',
+        turnId: subTurnId,
+    });
+    if (result.status === 'abort-timeout' || result.status === 'turn-mismatch')
+        throw new Error(`Child task stop incomplete: ${result.status}`);
 }
 //# sourceMappingURL=background-task-composition.js.map

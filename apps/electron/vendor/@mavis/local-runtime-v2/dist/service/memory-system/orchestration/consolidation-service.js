@@ -1,18 +1,10 @@
-import { createHash } from 'node:crypto';
 import { countTokens as countO200kBaseTokens } from 'gpt-tokenizer/encoding/o200k_base';
-import { redactMemorySecrets } from '../secret-redactor.js';
-import { isCompatibleLegacyArtifactContract } from '../policies/artifact-contract.js';
-import { MEMORY_SUMMARY_FILE } from '../contracts.js';
-import { exceedsSummaryBudget, formatArtifactSourceDates, isPublishedSummary, listArtifactSourceIds, pruneUnverifiedSummaryPreferences, removeEntriesBySource, summaryPreferenceLines, simpleLineDiff, } from './artifact-edit.js';
 import { noteFilePath, renderStateMirror } from './memory-files.js';
-// 分词规则变化后重新整理既有摘要，避免沿用旧规则的完成标记。
-const SUMMARY_TOKENIZER_CONTRACT = 'gpt-tokenizer@3.4.0/o200k_base:ordinary-text';
-/** changes.md 正文上限；超出截断逐行 diff、保留清单（§5.6）。 */
-const MAX_CHANGES_BYTES = 256 * 1024;
-const CONSOLIDATION_BASELINE_CONTRACT = '.consolidation-contract';
-/** 基线伪文件：摘要中受手改保护的行，随每次发布延续（§5.6 规则 8）。 */
-const SUMMARY_MANUAL_LINES = '.summary-manual-lines';
-const CONSOLIDATION_INPUT_CONTRACT = 'file-agent-v1';
+import { buildBaselineFiles, buildConsolidationWorkdirFiles, computeContentChanges, finalizeArtifacts, finalizeEditedArtifacts, initialContentChanges, keptSources, matchesBaselineContract, notesChangedSinceBaseline, needsInitialBaseline, userEditedSummaryLines, } from './consolidation/artifacts.js';
+import { buildSelectionInputs, computeInputDigest } from './consolidation/plan.js';
+import { readPublishedArtifacts, restoreArtifacts } from './consolidation/publication.js';
+import { carrySummaryRequestLines, listArtifactSourceIds, restoreEntriesBySource, } from './artifact-edit.js';
+import { ConsolidationCheckpoints, isResumableFailure, publishedDrift, } from './consolidation/checkpoint.js';
 /**
  * 整理模型窗口下限。整理 agent 要把整份选集、已有产物与 changes.md 一起读进上下文再逐文件
  * 编辑，窗口不足时模型会在写完产物前耗尽预算，产出半份结果。窗口取模型登记值
@@ -20,10 +12,25 @@ const CONSOLIDATION_INPUT_CONTRACT = 'file-agent-v1';
  * 空选集清理不需要模型，先于本门槛执行。
  */
 export const MIN_CONSOLIDATION_CONTEXT_WINDOW = 250_000;
+/** 一轮整理的执行时限；到期按环境故障处理，草稿留到下次续跑。 */
+const CONSOLIDATION_RUN_TIMEOUT_MS = 60 * 60 * 1000;
 export class MemoryConsolidationService {
     deps;
+    checkpoints;
     constructor(deps) {
         this.deps = deps;
+        this.checkpoints = new ConsolidationCheckpoints({
+            fileStore: deps.fileStore,
+            repository: deps.repository,
+            ...(deps.diagnostics ? { diagnostics: deps.diagnostics } : {}),
+            nowMs: () => this.now(),
+        });
+    }
+    dropStaleCheckpoints() {
+        return this.checkpoints.dropStale();
+    }
+    discardCheckpoints() {
+        return this.checkpoints.dropAll('write-disabled');
     }
     async inspect(scopeKey) {
         const config = this.deps.config();
@@ -71,11 +78,9 @@ export class MemoryConsolidationService {
         const scope = await this.deps.repository.getScope(scopeKey);
         if (!scope)
             return { status: 'unchanged' };
-        // 成功冷却：常规刷新且距上次成功不足冷却期时直接跳过，不读选集(§5.6)。
-        const reason = options?.reason ?? 'routine';
-        if (reason === 'routine' && inSuccessCooldown(scope, config, this.now())) {
-            return { status: 'cooldown' };
-        }
+        const early = await this.resumeOrCooldown(scope, options?.reason ?? 'routine');
+        if (early)
+            return early;
         const selection = await this.deps.repository.selectCurrentSessions({
             scopeKey,
             createdAfterMs: scope.resetAtMs,
@@ -101,6 +106,7 @@ export class MemoryConsolidationService {
             governanceRevision: scope.governanceRevision,
             contractId: contract.artifactContractId,
             config,
+            admitted: selection,
         });
         const baseline = await this.deps.repository.listBaselineFiles(scopeKey);
         if (await this.canReuseConsolidation(scope, inputDigest, baseline, contract.artifactContractId)) {
@@ -115,11 +121,11 @@ export class MemoryConsolidationService {
             contract,
             docs,
             selected,
+            admitted: selection,
             notes,
-        });
+        }, { inputDigest, governanceRevision: scope.governanceRevision });
         if ('status' in artifacts)
             return artifacts;
-        const { indexMarkdown, summaryMarkdown, manualSummaryLines } = artifacts;
         return this.deps.scopeMutation.withScopeMutation(scopeKey, async () => {
             const currentScope = await this.deps.repository.getScope(scopeKey);
             if (!currentScope ||
@@ -138,44 +144,132 @@ export class MemoryConsolidationService {
                 governanceRevision: currentScope.governanceRevision,
                 contractId: contract.artifactContractId,
                 config,
+                admitted: currentSelection,
             });
             if (currentInputDigest !== inputDigest) {
                 return { status: 'stale-input' };
             }
-            await this.deleteOrphanFiles(scopeKey, currentEligible);
-            const prior = await this.readPublishedArtifacts(scopeKey);
-            await this.deps.fileStore.writeMemoryIndex(scopeKey, indexMarkdown);
-            await this.deps.fileStore.writeMemorySummary(scopeKey, summaryMarkdown);
-            const rereadScope = await this.deps.repository.getScope(scopeKey);
-            if (!rereadScope || rereadScope.resetEpoch !== scope.resetEpoch) {
-                return { status: 'stale-input' };
-            }
-            // 基线快照与完成标记同事务整体替换(§5.6/§6.1)。
-            const commitResult = await this.deps.repository.commitConsolidation({
-                scopeKey,
-                expectedResetEpoch: scope.resetEpoch,
+            return this.writeAndCommit(scope, artifacts, currentEligible, {
                 expectedSelection: [...currentEligible, ...currentNotes].map((s) => ({
                     sessionId: s.sessionId,
                     outputDigest: s.outputDigest,
                 })),
                 inputDigest,
-                baselineFiles: buildBaselineFiles({ indexMarkdown, summaryMarkdown, manualSummaryLines }, currentEligible, currentNotes, contract.artifactContractId),
-                consolidatedAtMs: this.now(),
+                baselineFiles: buildBaselineFiles(artifacts, {
+                    selected: currentEligible,
+                    admitted: currentSelection,
+                    notes: currentNotes,
+                    baseline,
+                }, contract.artifactContractId),
             });
-            if (commitResult === 'stale-input') {
-                // 产物已写盘而基线未提交：回滚到与旧基线一致的内容，避免本轮模型写的摘要行在下一轮被当成手改。
-                await this.restoreArtifacts(scopeKey, prior);
-                return { status: 'stale-input' };
-            }
-            return {
-                status: 'published',
-                inputDigest,
-                sessionCount: currentEligible.length,
-            };
         });
     }
+    /**
+     * 读选集之前的两个出口。上一轮因模型服务故障中断时先接着它的草稿做完，它已经开始过，不受成功
+     * 冷却约束；否则常规刷新距上次成功不足冷却期时直接跳过，不读选集(§5.6)。
+     */
+    async resumeOrCooldown(scope, reason) {
+        const resumed = await this.resumeCheckpoint(scope);
+        if (resumed)
+            return resumed;
+        return reason === 'routine' && inSuccessCooldown(scope, this.deps.config(), this.now())
+            ? { status: 'cooldown' }
+            : undefined;
+    }
+    /**
+     * 有可以续跑的草稿时接着上次的进度整理，并按冻结的输入发布；没有草稿或草稿已作废时返回
+     * undefined，由调用方按常规整理。模型窗口不足时保留草稿，等窗口恢复。
+     */
+    async resumeCheckpoint(scope) {
+        if (!(await this.checkpoints.has(scope.scopeKey)))
+            return undefined;
+        const contract = await this.deps.model.resolveContract('consolidation');
+        if (contract.contextWindow < MIN_CONSOLIDATION_CONTEXT_WINDOW) {
+            return {
+                status: 'skipped',
+                reason: 'model-context-too-small',
+                contextWindow: contract.contextWindow,
+            };
+        }
+        const round = await this.checkpoints.load(scope, contract.contractId);
+        if (!round)
+            return undefined;
+        const workDir = await this.checkpoints.take(scope.scopeKey);
+        this.deps.diagnostics?.event('consolidation.checkpoint-resumed', {
+            scopeKey: scope.scopeKey,
+            resumeCount: round.resumeCount,
+            ageMs: this.now() - round.frozenAtMs,
+        });
+        const artifacts = await this.editInWorkdir(round, workDir, true);
+        if ('status' in artifacts)
+            return artifacts;
+        return this.publishFrozen(round, artifacts);
+    }
+    /**
+     * 按冻结的输入发布续跑结果：只要求纪元、治理版本与已发布产物没变，不核对选集当前状态；
+     * 冻结之后新增的「## 记忆请求」行补进摘要。基线与指纹都取冻结时的输入，新的变化由下一轮增量补上。
+     */
+    publishFrozen(round, artifacts) {
+        const { job } = round;
+        return this.deps.scopeMutation.withScopeMutation(job.scopeKey, async () => {
+            const scope = await this.deps.repository.getScope(job.scopeKey);
+            const stale = frozenScopeChange(round, scope);
+            if (stale) {
+                this.checkpoints.discarded(job.scopeKey, stale);
+                return { status: 'stale-input' };
+            }
+            const requestLines = publishedDrift(round, await this.checkpoints.published(job.scopeKey));
+            if (requestLines === undefined) {
+                this.checkpoints.discarded(job.scopeKey, 'artifacts-changed');
+                return { status: 'stale-input' };
+            }
+            const published = this.withRequestLines(job, artifacts, requestLines);
+            return this.writeAndCommit(job, published, job.selected, {
+                expectedSelection: [],
+                frozenGovernanceRevision: round.governanceRevision,
+                inputDigest: round.inputDigest,
+                baselineFiles: buildBaselineFiles(published, job, job.contract.artifactContractId),
+            });
+        });
+    }
+    /** 冻结之后保存 note 写进摘要的请求行补进草稿摘要；超出摘要预算的行不补，由下一轮整理归置。 */
+    withRequestLines(job, artifacts, requestLines) {
+        if (requestLines.length === 0)
+            return artifacts;
+        const carried = carrySummaryRequestLines(artifacts.summaryMarkdown, requestLines, job.config.maxSummaryInjectionTokens);
+        this.deps.diagnostics?.event('consolidation.request-lines-carried', {
+            scopeKey: job.scopeKey,
+            carried: carried.carried,
+            dropped: carried.dropped,
+        });
+        return { ...artifacts, summaryMarkdown: carried.markdown };
+    }
+    /** 写入两份产物，并把基线快照与完成标记同事务整体替换(§5.6/§6.1)；提交失败时写回原产物。 */
+    async writeAndCommit(scope, artifacts, eligible, commit) {
+        const { scopeKey } = scope;
+        await this.deleteOrphanFiles(scopeKey, eligible);
+        const prior = await readPublishedArtifacts(this.deps.fileStore, scopeKey);
+        await this.deps.fileStore.writeMemoryIndex(scopeKey, artifacts.indexMarkdown);
+        await this.deps.fileStore.writeMemorySummary(scopeKey, artifacts.summaryMarkdown);
+        const rereadScope = await this.deps.repository.getScope(scopeKey);
+        if (!rereadScope || rereadScope.resetEpoch !== scope.resetEpoch) {
+            return { status: 'stale-input' };
+        }
+        const commitResult = await this.deps.repository.commitConsolidation({
+            scopeKey,
+            expectedResetEpoch: scope.resetEpoch,
+            ...commit,
+            consolidatedAtMs: this.now(),
+        });
+        if (commitResult === 'stale-input') {
+            // 产物已写盘而基线未提交：回滚到与旧基线一致的内容，避免本轮模型写的摘要行在下一轮被当成手改。
+            await restoreArtifacts(this.deps.fileStore, scopeKey, prior);
+            return { status: 'stale-input' };
+        }
+        return { status: 'published', inputDigest: commit.inputDigest, sessionCount: eligible.length };
+    }
     /** 按产物与基线选择工作模式，两种模式共用文件编辑与发布协议。 */
-    async produceArtifacts(job) {
+    async produceArtifacts(job, identity) {
         const previousIndex = await this.deps.fileStore.readMemoryIndex(job.scopeKey);
         const previousSummary = await this.deps.fileStore.readMemorySummary(job.scopeKey);
         const previous = { previousIndex, previousSummary };
@@ -186,7 +280,7 @@ export class MemoryConsolidationService {
         const previousArtifacts = { indexMarkdown: index, summaryMarkdown: summary };
         const changes = init
             ? initialContentChanges(job, previousArtifacts)
-            : computeContentChanges(baseline, previousArtifacts, job.selected, job.notes);
+            : computeContentChanges(baseline, previousArtifacts, job);
         const mode = init ? 'INIT' : 'INCREMENTAL';
         const protectedLines = userEditedSummaryLines(baseline, summary);
         if (!changes) {
@@ -195,69 +289,123 @@ export class MemoryConsolidationService {
                 reason: 'model-invalid-output',
             });
         }
-        const files = buildConsolidationWorkdirFiles(previousArtifacts, changes, job, protectedLines);
-        return this.runConsolidationAgent(job, { files, changes, mode, protectedLines });
-    }
-    /** 编辑隔离副本；失败不发布，成功后由调用方校验并条件提交。 */
-    async runConsolidationAgent(job, { files, changes, mode, protectedLines }) {
+        const kept = keptSources(index, job);
+        const files = buildConsolidationWorkdirFiles(previousArtifacts, changes, { ...job, kept }, protectedLines);
+        const round = {
+            job,
+            ...identity,
+            mode,
+            changes,
+            protectedLines,
+            kept,
+            initialIndex: files.find((file) => file.fileName === 'MEMORY.md')?.markdown ?? '',
+            publishedIndex: previousIndex,
+            publishedSummary: previousSummary,
+            frozenAtMs: this.now(),
+            resumeCount: 0,
+        };
         let workDir;
         try {
             workDir = await this.deps.fileStore.createConsolidationWorkdir(job.scopeKey, files);
-            const result = await this.deps.model.consolidateInPlace({
-                contractId: job.contract.contractId,
-                workDir,
-                mode,
-                changes: {
-                    addedSessionIds: changes.addedSessionIds,
-                    updatedSessionIds: changes.updatedSessionIds,
-                    removedSessionIds: changes.removedSessionIds,
-                    artifactsModified: changes.artifactsModified,
-                    addedNotePaths: changes.addedNotePaths,
-                    updatedNotePaths: changes.updatedNotePaths,
-                    removedNotePaths: changes.removedNotePaths,
-                },
-                maxIndexBytes: job.config.maxMemoryMarkdownBytes,
-                maxSummaryTokens: job.config.maxSummaryInjectionTokens,
-                maxTurns: job.config.maxConsolidationAgentTurns,
-                signal: AbortSignal.timeout(60 * 60 * 1000),
-            });
-            if (result.status !== 'ok')
-                return {
-                    status: 'deferred',
-                    reason: result.status === 'failed' ? result.reason : 'model-unavailable',
-                };
-            const edited = await this.deps.fileStore.readConsolidationWorkdir(workDir);
-            return (finalizeEditedArtifacts(edited, job, protectedLines) ?? {
+        }
+        catch {
+            return { status: 'deferred', reason: 'store-unavailable' };
+        }
+        return this.editInWorkdir(round, workDir, false);
+    }
+    /**
+     * 在工作目录里运行整理 Agent，成功后读回并校验两份草稿，由调用方条件提交。模型服务故障时把
+     * 工作目录留作草稿，下次续跑；其余失败删除工作目录，不发布。
+     */
+    async editInWorkdir(round, workDir, resumed) {
+        let saved = false;
+        try {
+            const before = resumed
+                ? await this.deps.fileStore.readConsolidationWorkdir(workDir)
+                : undefined;
+            const timeout = AbortSignal.timeout(CONSOLIDATION_RUN_TIMEOUT_MS);
+            const result = await this.deps.model.consolidateInPlace(consolidationInput(round, workDir, resumed, timeout));
+            if (result.status === 'ok')
+                return await this.readDrafts(round, workDir);
+            saved =
+                isResumableFailure(result, timeout.aborted) &&
+                    (await this.saveCheckpoint(round, workDir, result, before));
+            return {
                 status: 'deferred',
-                reason: 'model-invalid-output',
-            });
+                reason: result.status === 'failed' ? result.reason : 'model-unavailable',
+            };
         }
         catch {
             return { status: 'deferred', reason: 'store-unavailable' };
         }
         finally {
-            if (workDir !== undefined) {
-                try {
-                    await this.deps.fileStore.deleteConsolidationWorkdir(workDir);
-                }
-                catch {
-                    // 残留由 tmp 清理兜底。
-                }
-            }
+            if (!saved)
+                await this.deleteWorkdir(workDir);
         }
     }
-    async readPublishedArtifacts(scopeKey) {
-        return {
-            index: await this.deps.fileStore.readMemoryIndex(scopeKey),
-            summary: await this.deps.fileStore.readMemorySummary(scopeKey),
-        };
+    /** 读回两份草稿并校验。 */
+    async readDrafts(round, workDir) {
+        const { job } = round;
+        const edited = await this.deps.fileStore.readConsolidationWorkdir(workDir);
+        // INIT 从本轮输入重建索引，可能漏掉本轮之外来源的条目，程序在校验前补回。note 相对上次发布
+        // 基线有新增、修改或删除时不补回：新的 note 可能要求遗忘这些来源的内容，交给模型判断。
+        // 带遗忘规则的来源同理。
+        const checked = round.mode === 'INIT' && !notesChangedSinceBaseline(job.baseline, job.notes)
+            ? this.restoreKeptSources(job, edited, round.initialIndex, round.kept)
+            : edited;
+        return (finalizeEditedArtifacts(checked, job, round.protectedLines) ?? {
+            status: 'deferred',
+            reason: 'model-invalid-output',
+        });
     }
-    async restoreArtifacts(scopeKey, prior) {
-        if (prior.index !== undefined)
-            await this.deps.fileStore.writeMemoryIndex(scopeKey, prior.index);
-        if (prior.summary !== undefined) {
-            await this.deps.fileStore.writeMemorySummary(scopeKey, prior.summary);
+    /**
+     * 留草稿续跑。续跑这次草稿有改动才计入续跑次数：额度还没恢复时续跑在第一次请求就失败，
+     * 不应耗掉次数。
+     */
+    async saveCheckpoint(round, workDir, result, before) {
+        const progressed = before !== undefined &&
+            JSON.stringify(before) !==
+                JSON.stringify(await this.deps.fileStore.readConsolidationWorkdir(workDir));
+        return this.checkpoints.save({ ...round, resumeCount: round.resumeCount + (progressed ? 1 : 0) }, workDir, result.status === 'failed'
+            ? { reason: result.reason, ...(result.errorKind ? { errorKind: result.errorKind } : {}) }
+            : { reason: result.status });
+    }
+    async deleteWorkdir(workDir) {
+        try {
+            await this.deps.fileStore.deleteConsolidationWorkdir(workDir);
         }
+        catch {
+            // 残留由 tmp 清理兜底。
+        }
+    }
+    /**
+     * 本轮之外的来源（不含带遗忘规则的）在新 MEMORY.md 里一条条目都没有时，从工作目录初始的
+     * MEMORY.md 取出它们的条目块整块放回；之后照常做日期、字节与准入校验。INIT 不做 removed
+     * 预处理，初始索引里仍有已退出准入集合的来源，所以只放回全部来源都在准入集合内、且都没有
+     * 遗忘规则的条目块。
+     */
+    restoreKeptSources(job, edited, initialIndex, kept) {
+        const index = edited.find((file) => file.fileName === 'MEMORY.md')?.markdown ?? '';
+        const present = listArtifactSourceIds(index);
+        const missing = new Set(kept
+            .filter(({ sessionId, forgetRules }) => forgetRules === undefined && !present.has(sessionId))
+            .map((state) => state.sessionId));
+        if (missing.size === 0)
+            return edited;
+        const previous = initialIndex;
+        const restorable = new Set(job.admitted.filter((state) => state.forgetRules === undefined).map((s) => s.sessionId));
+        const result = restoreEntriesBySource(previous, index, { missing, restorable });
+        this.deps.diagnostics?.event('consolidation.kept-sources-restored', {
+            sources: [...missing].map((sessionId) => ({
+                sessionId,
+                restored: result.restored.get(sessionId) ?? 0,
+                skipped: result.skipped.get(sessionId) ?? 0,
+            })),
+        });
+        return [
+            ...edited.filter((file) => file.fileName !== 'MEMORY.md'),
+            { fileName: 'MEMORY.md', markdown: result.markdown },
+        ];
     }
     async publishEmpty(scopeKey, resetEpoch, config) {
         return this.deps.scopeMutation.withScopeMutation(scopeKey, async () => {
@@ -321,290 +469,40 @@ export class MemoryConsolidationService {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+/** 整理 Agent 的输入；续跑时附上续跑标志，模型从草稿接着做。 */
+function consolidationInput(round, workDir, resumed, signal) {
+    const { job, changes } = round;
+    return {
+        contractId: job.contract.contractId,
+        workDir,
+        mode: round.mode,
+        changes: {
+            addedSessionIds: changes.addedSessionIds,
+            updatedSessionIds: changes.updatedSessionIds,
+            removedSessionIds: changes.removedSessionIds,
+            artifactsModified: changes.artifactsModified,
+            addedNotePaths: changes.addedNotePaths,
+            updatedNotePaths: changes.updatedNotePaths,
+            removedNotePaths: changes.removedNotePaths,
+            forgetRuleSourceIds: changes.forgetRuleSourceIds,
+        },
+        maxIndexBytes: job.config.maxMemoryMarkdownBytes,
+        maxSummaryTokens: job.config.maxSummaryInjectionTokens,
+        maxRequests: job.config.maxConsolidationAgentTurns,
+        ...(resumed ? { resumed: true } : {}),
+        signal,
+    };
+}
+/** 续跑发布前 scope 的变化：Reset 或治理变更都让冻结的草稿作废。 */
+function frozenScopeChange(round, scope) {
+    if (!scope || scope.resetEpoch !== round.job.resetEpoch)
+        return 'reset';
+    return scope.governanceRevision === round.governanceRevision ? undefined : 'governance';
+}
 /** 成功冷却期内的常规刷新直接跳过（§5.6）；治理原因不受冷却约束。 */
 function inSuccessCooldown(scope, config, nowMs) {
     return (scope.consolidatedDigest !== undefined &&
         scope.lastConsolidatedAtMs !== undefined &&
         nowMs - scope.lastConsolidatedAtMs < config.publicationCooldownMs);
-}
-function initialContentChanges(job, previous) {
-    const notes = diffNotes(new Map(), job.notes);
-    // INIT 的全量输入清单与真实产物修改是两件事，空基线不能证明用户手改。
-    const artifacts = diffArtifacts(new Map(job.baseline.map((file) => [file.fileName, file.content])), previous);
-    return {
-        addedSessionIds: job.selected.map((row) => row.sessionId),
-        updatedSessionIds: [],
-        removedSessionIds: [],
-        ...notes,
-        ...artifacts,
-        diffs: [...notes.diffs, ...artifacts.diffs],
-    };
-}
-/**
- * changes 合成(§5.6)：added/removed 用来源标注与选集的集合差，updated 与产物权威修改
- * 用基线比较。内容层没有任何变化时返回 undefined，复用校验后的产物并推进本轮基线。
- */
-function computeContentChanges(baseline, previous, selected, notes) {
-    const before = new Map(baseline.map((f) => [f.fileName, f.content]));
-    const sessions = sessionChanges(before, previous.indexMarkdown, selected);
-    const noteChanges = diffNotes(before, notes);
-    const artifacts = diffArtifacts(before, previous);
-    const groups = [
-        sessions.addedSessionIds,
-        sessions.removedSessionIds,
-        sessions.updatedSessionIds,
-        noteChanges.addedNotePaths,
-        noteChanges.updatedNotePaths,
-        noteChanges.removedNotePaths,
-    ];
-    if (!groups.some((paths) => paths.length > 0) && !artifacts.artifactsModified)
-        return undefined;
-    return {
-        ...sessions,
-        ...noteChanges,
-        ...artifacts,
-        diffs: [...sessions.diffs, ...noteChanges.diffs, ...artifacts.diffs],
-    };
-}
-function sessionChanges(before, index, selected) {
-    const selectionIds = new Set(selected.map((s) => s.sessionId));
-    const annotatedIds = new Set([...listArtifactSourceIds(index)].filter((id) => !id.startsWith('note-')));
-    const updatedSessionIds = [];
-    const diffs = [];
-    for (const state of selected) {
-        const old = before.get(`sessions/${state.sessionId}.md`);
-        const current = renderStateMirror(state);
-        if (old === undefined || old === current)
-            continue;
-        updatedSessionIds.push(state.sessionId);
-        diffs.push(`## diff: ${state.sessionId}\n${simpleLineDiff(old, current)}`);
-    }
-    return {
-        addedSessionIds: [...selectionIds].filter((id) => !annotatedIds.has(id)).sort(),
-        removedSessionIds: [...annotatedIds].filter((id) => !selectionIds.has(id)).sort(),
-        updatedSessionIds,
-        diffs,
-    };
-}
-function diffNotes(before, notes) {
-    const paths = new Set(notes.map((note) => noteFilePath(note.sessionId)));
-    const removedNotePaths = [...before.keys()].filter((path) => path.startsWith('extensions/ad_hoc/notes/') && !paths.has(path));
-    const diffs = removedNotePaths.map((path) => `## diff: ${path}\n${simpleLineDiff(before.get(path) ?? '', '')}`);
-    const addedNotePaths = [];
-    const updatedNotePaths = [];
-    for (const note of notes) {
-        const path = noteFilePath(note.sessionId);
-        const old = before.get(path);
-        const current = renderStateMirror(note);
-        if (old === current)
-            continue;
-        if (old === undefined)
-            addedNotePaths.push(path);
-        else
-            updatedNotePaths.push(path);
-        diffs.push(`## diff: ${path}\n${simpleLineDiff(old ?? '', current)}`);
-    }
-    return { addedNotePaths, updatedNotePaths, removedNotePaths, diffs };
-}
-function diffArtifacts(before, artifacts) {
-    const current = new Map([
-        ['MEMORY.md', artifacts.indexMarkdown],
-        [MEMORY_SUMMARY_FILE, artifacts.summaryMarkdown],
-    ]);
-    let artifactsModified = false;
-    const diffs = [];
-    for (const [path, content] of current) {
-        const old = before.get(path);
-        if (old === undefined || old === content)
-            continue;
-        artifactsModified = true;
-        diffs.push(`## diff: ${path}\n${simpleLineDiff(old, content)}`);
-    }
-    return { artifactsModified, diffs };
-}
-function needsInitialBaseline(job, baseline, previous) {
-    if (job.consolidatedDigest === undefined ||
-        !previous.previousIndex?.trim() ||
-        previous.previousSummary?.split('\n')[0]?.trim() !== 'v2' ||
-        Buffer.byteLength(previous.previousIndex, 'utf8') > job.config.maxMemoryMarkdownBytes ||
-        exceedsSummaryBudget(previous.previousSummary, job.config.maxSummaryInjectionTokens))
-        return true;
-    if (!baseline.length)
-        return true;
-    return !matchesBaselineContract(baseline, job.contract.artifactContractId);
-}
-function matchesBaselineContract(baseline, artifactContractId) {
-    const stored = baseline.find((file) => file.fileName === CONSOLIDATION_BASELINE_CONTRACT)?.content;
-    const prefix = `${CONSOLIDATION_INPUT_CONTRACT}:`;
-    if (!stored?.startsWith(prefix))
-        return false;
-    const storedContractId = stored.slice(prefix.length);
-    return (storedContractId === artifactContractId ||
-        isCompatibleLegacyArtifactContract(storedContractId, artifactContractId));
-}
-function finalizeEditedArtifacts(files, job, protectedLines) {
-    const byName = new Map(files.map((file) => [file.fileName, file.markdown]));
-    return finalizeArtifacts(byName.get('MEMORY.md') ?? '', byName.get(MEMORY_SUMMARY_FILE) ?? '', job, protectedLines);
-}
-/**
- * 受手改保护的摘要「用户偏好」区行（§5.6 规则 8）：本轮相对基线新增的行（用户手改与治理直编
- * 同貌），加上历次发布延续下来、仍在该区的保护记录。没有基线摘要时无从证明新增手改。
- * 比较按发布口径（统一换行并脱敏）进行，Windows 上以 CRLF 保存的手改行同样受保护。
- * 保护集只豁免门禁删除并逐轮写进 changes.md；保留与否由整理模型按规则 8 结合遗忘规则判断。
- */
-function userEditedSummaryLines(baseline, summary) {
-    const byName = new Map(baseline.map((file) => [file.fileName, file.content]));
-    const base = byName.get(MEMORY_SUMMARY_FILE);
-    const recorded = new Set(publishedForm(byName.get(SUMMARY_MANUAL_LINES) ?? '').split('\n'));
-    const baseLines = new Set(base === undefined ? [] : publishedForm(base).split('\n'));
-    return new Set(summaryPreferenceLines(publishedForm(summary)).filter((line) => line.trim() && (recorded.has(line) || (base !== undefined && !baseLines.has(line)))));
-}
-/** 与发布前同一口径：统一换行并脱敏，保护集与发布结果逐字可比，密钥不会经保护记录回流。 */
-function publishedForm(markdown) {
-    return redactMemorySecrets(markdown.replace(/\r\n?/gu, '\n')).content;
-}
-/** 工作目录初始文件：预处理后的产物副本、changes.md 与 added/updated 会话文档及规则。 */
-function buildConsolidationWorkdirFiles(previous, changes, { docs, notes }, protectedLines) {
-    // 程序确定性预处理：removed 会话的条目在 agent 启动前删除(§5.6)。
-    const preprocessed = removeEntriesBySource(previous.indexMarkdown, new Set(changes.removedSessionIds));
-    const files = [
-        { fileName: 'MEMORY.md', markdown: preprocessed.markdown },
-        { fileName: MEMORY_SUMMARY_FILE, markdown: previous.summaryMarkdown },
-        { fileName: 'changes.md', markdown: renderChangesMarkdown(changes, protectedLines) },
-    ];
-    const involved = new Set([...changes.addedSessionIds, ...changes.updatedSessionIds]);
-    for (const doc of docs) {
-        if (!involved.has(doc.sessionId))
-            continue;
-        files.push({ fileName: `${doc.sessionId}.md`, markdown: doc.markdown });
-        if (doc.forgetRules !== undefined) {
-            files.push({ fileName: `${doc.sessionId}.rules.md`, markdown: doc.forgetRules });
-        }
-    }
-    files.push(...notes.map((note) => ({
-        fileName: noteFilePath(note.sessionId),
-        markdown: renderStateMirror(note),
-    })));
-    return files;
-}
-function buildSelectionInputs(selection, maxTokens) {
-    const docs = [];
-    const selected = [];
-    let inputTokens = 0;
-    for (const state of selection) {
-        if (!state.content)
-            continue;
-        const markdown = renderStateMirror(state);
-        // 与 contractId 绑定的固定估算口径(§5.6)。
-        const tokens = Math.ceil(Buffer.byteLength(markdown, 'utf8') / 4);
-        if (inputTokens + tokens > maxTokens)
-            break;
-        inputTokens += tokens;
-        selected.push(state);
-        docs.push({ sessionId: state.sessionId, markdown, forgetRules: state.forgetRules });
-    }
-    return { docs, selected };
-}
-function buildBaselineFiles(artifacts, selection, notes, contractId) {
-    return [
-        { fileName: 'MEMORY.md', content: artifacts.indexMarkdown },
-        { fileName: MEMORY_SUMMARY_FILE, content: artifacts.summaryMarkdown },
-        ...selection.map((state) => ({
-            fileName: `sessions/${state.sessionId}.md`,
-            content: renderStateMirror(state),
-        })),
-        ...notes.map((state) => ({
-            fileName: noteFilePath(state.sessionId),
-            content: renderStateMirror(state),
-        })),
-        {
-            fileName: CONSOLIDATION_BASELINE_CONTRACT,
-            content: `${CONSOLIDATION_INPUT_CONTRACT}:${contractId}`,
-        },
-        ...(artifacts.manualSummaryLines.length > 0
-            ? [{ fileName: SUMMARY_MANUAL_LINES, content: artifacts.manualSummaryLines.join('\n') }]
-            : []),
-    ];
-}
-function renderChangesMarkdown(input, protectedLines) {
-    const lines = ['# 变更清单', ''];
-    const groups = [
-        ['added', input.addedSessionIds.map((id) => `${id}.md`)],
-        ['updated', input.updatedSessionIds.map((id) => `${id}.md`)],
-        ['removed（普通会话条目已移除）', input.removedSessionIds.map((id) => `${id}.md`)],
-        ['note added', input.addedNotePaths],
-        ['note updated', input.updatedNotePaths],
-        ['note removed', input.removedNotePaths],
-    ];
-    for (const [name, paths] of groups)
-        lines.push(`## ${name}`, ...paths.map((path) => `- ${path}`), '');
-    // 手改行一旦进入基线就不再出现在 diff 中；逐轮列出，由能看到遗忘规则的整理模型负责保留（规则 8）。
-    lines.push('## 受保护的摘要手改行', ...[...protectedLines].map((line) => `    ${line}`), '');
-    lines.push(`产物存在外部修改：${input.artifactsModified ? '是' : '否'}`, '');
-    let remaining = MAX_CHANGES_BYTES;
-    let diffBody = '';
-    for (const diff of input.diffs) {
-        const bytes = Buffer.from(`${diff}\n`, 'utf8');
-        if (bytes.length <= remaining) {
-            diffBody += `${diff}\n`;
-            remaining -= bytes.length;
-            continue;
-        }
-        let end = remaining;
-        while (end > 0 && (bytes[end] & 0xc0) === 0x80)
-            end--;
-        diffBody += bytes.subarray(0, end).toString('utf8');
-        lines.push('[diff truncated; read changed files by path]', '');
-        break;
-    }
-    return lines.join('\n') + diffBody;
-}
-function finalizeArtifacts(rawIndex, rawSummary, { config, selected, notes, docs }, protectedLines) {
-    const timestamps = new Map();
-    for (const source of [...selected, ...notes]) {
-        if (source.capturedAtMs !== undefined)
-            timestamps.set(source.sessionId, source.capturedAtMs);
-    }
-    const normalize = (raw) => redactMemorySecrets(formatArtifactSourceDates(raw.replace(/\r\n?/gu, '\n'), timestamps))
-        .content;
-    const indexMarkdown = normalize(rawIndex);
-    const summaryMarkdown = pruneUnverifiedSummaryPreferences({
-        summaryMarkdown: normalize(rawSummary),
-        indexMarkdown,
-        sessionDocs: new Map(docs.map((doc) => [doc.sessionId, doc.markdown])),
-        noteDocs: new Map(notes.map((note) => [note.sessionId, renderStateMirror(note)])),
-        protectedLines,
-    }).markdown;
-    if (indexMarkdown.trim().length === 0)
-        return undefined;
-    if (!isPublishedSummary(summaryMarkdown))
-        return undefined;
-    if (Buffer.byteLength(indexMarkdown, 'utf8') > config.maxMemoryMarkdownBytes)
-        return undefined;
-    if (exceedsSummaryBudget(summaryMarkdown, config.maxSummaryInjectionTokens))
-        return undefined;
-    const published = new Set(summaryPreferenceLines(summaryMarkdown));
-    const manualSummaryLines = [...protectedLines].filter((line) => published.has(line));
-    return { indexMarkdown, summaryMarkdown, manualSummaryLines };
-}
-function computeInputDigest(scopeKey, resetEpoch, selection, options) {
-    const hash = createHash('sha256');
-    const config = options?.config;
-    hash.update(JSON.stringify([
-        options?.contractId ?? 'empty',
-        options?.governanceRevision ?? 0,
-        SUMMARY_TOKENIZER_CONTRACT,
-        CONSOLIDATION_INPUT_CONTRACT,
-        config?.maxSelectedSessions,
-        config?.maxConsolidationInputTokens,
-        config?.maxMemoryMarkdownBytes,
-        config?.maxSummaryInjectionTokens,
-    ]));
-    hash.update(scopeKey);
-    hash.update(`\0${resetEpoch}\0`);
-    for (const s of selection) {
-        hash.update(JSON.stringify([s.sessionId, s.outputDigest, s.forgetRules ?? null]));
-    }
-    return hash.digest('base64url');
 }
 //# sourceMappingURL=consolidation-service.js.map

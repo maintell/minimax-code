@@ -1,5 +1,5 @@
 import { formatModelKey, formatRuntimeModelIdentity, } from '../../service/model-system/index.js';
-import { buildLocalRequestPayloadTransform, isModelOutputReviewed, readSessionAgentExecutionSnapshot, } from '../../service/turn-system/index.js';
+import { buildLocalRequestPayloadTransform, readSessionAgentExecutionSnapshot, } from '../../service/turn-system/index.js';
 import { AdvisorCaptureStore, createAdvisorExtension } from './advisor-capture.js';
 import { createAdvisorTool, shortReason } from './advisor-tool.js';
 /**
@@ -29,11 +29,6 @@ export function withAdvisorAgentProduct(product, dependencies) {
         }),
         // A Goal charges the advisor's tokens like its compaction: counted, never admitted.
         usageRecorder: (turn) => product.turnUsageRecorder?.(turn),
-        reviewInput: async ({ llm, text }) => isModelOutputReviewed(llm.managedProvider === true, dependencies.contentReview.policy)
-            ? dependencies.contentReview.reviewInput(text)
-            : { kind: 'proceed' },
-        withholdsAdvice: async ({ llm, text }) => isModelOutputReviewed(llm.managedProvider === true, dependencies.contentReview.policy) &&
-            (await dependencies.contentReview.blocksAdvice(text)),
         ...(dependencies.nowMs ? { nowMs: dependencies.nowMs } : {}),
     });
     return {

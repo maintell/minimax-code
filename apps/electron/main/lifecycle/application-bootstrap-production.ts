@@ -1,3 +1,4 @@
+import { CAPTURE_SHUTDOWN_TIMEOUT_MS } from "../modules/screenshot/capture-contract";
 import { disposePptPreviewRenderHost } from "../modules/document-preview/generation-preview/render-host";
 import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { readdir, lstat, unlink } from "node:fs/promises";
@@ -13,6 +14,7 @@ import { flushBrowserTelemetryOnQuit } from "../modules/browser/browser-telemetr
 import { browserBackendPolicy } from "../modules/browser/browser-backend-policy";
 import { getTokens, clearTokens, getDesktopConfig, replaceSharedUserInfo } from "../ipc/storage.ipc";
 import { createDesktopAccountIdentitySource } from "../modules/auth/account-identity";
+import { notifyConfigIssuesWithRetry } from "../modules/config-issues";
 import { flushDockFileQueue, setupDockFileOpenHandler } from "../modules/dock";
 import { setupDeepLink } from "../modules/deeplink";
 import { clearGpuSentinel } from "../modules/gpu-guard";
@@ -34,7 +36,7 @@ import { recordElectronStartupMainMilestone } from "../modules/observability/sta
 import { stopMainMemoryLogging, startMainMemoryLogging } from "../modules/observability/main-memory-logger";
 import { stopPowerSaveBlocker } from "../modules/power";
 import { registerProtocolScheme, setupDocumentPreviewProtocolHandler, setupProtocolHandler } from "../modules/protocol";
-import { initScreenshots } from "../modules/screenshot";
+import { disposeCaptureSession } from "../modules/screenshot/capture-session";
 import { getTerminalManager } from "../modules/terminal";
 import { resolveNormalUpdatePlan, resolveExplicitInstallPlan } from "../ipc/updater.ipc";
 import { bringToFront } from "../utils";
@@ -268,6 +270,7 @@ function createProductionComposition(options = {}) {
                     }
                 },
             },
+            prepareWindowClose: { run: disposeCaptureSession, timeoutMs: CAPTURE_SHUTDOWN_TIMEOUT_MS },
             beforeQuit: () => {
                 stopMainMemoryLogging();
                 clearGpuSentinel();
@@ -427,7 +430,7 @@ function createProductionComposition(options = {}) {
                 watchSharedRuntimeAuthProjection: () => watchSharedRuntimeProjection(sharedAuthSession),
                 prepareLocalRuntime: prepareLocalRuntime,
                 onLocalRuntimeWarmupFailed: () => logger_1.default.warn('[LocalRuntime] Warmup after logged-in startup failed'),
-                initScreenshots: initScreenshots,
+                disposeScreenshots: disposeCaptureSession,
                 initRuntimeFetchDevTools: createRuntimeFetchDevToolsInitializer(session, {
                     warn: logLifecycleWarning,
                 }),
@@ -438,6 +441,8 @@ function createProductionComposition(options = {}) {
                 flushDockFileQueue: () => {
                     flushDockFileQueue();
                 },
+                notifyConfigIssues: () => notifyConfigIssuesWithRetry(),
+                onConfigIssuesNoticeFailed: (error) => logger_1.default.warn('[ConfigIssues] Notice failed', error),
                 registerActivateHandler,
                 initDesktopSettings: () => initDesktopSettings({ requestQuit: (intent) => quitCoordinator.requestQuit(intent) }),
                 cleanupDesktopSettings: cleanupDesktopSettings,

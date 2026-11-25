@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { streamSimple } from '@earendil-works/pi-ai';
+import { withContentReviewErrorShield } from './content-review.js';
 import { LLM_REQUEST_TIMEOUT_MS } from './defaults.js';
 import { resolveLLMStreamTimeouts, withLLMStreamTimeouts, } from './llm-stream-timeout.js';
 import { isBackgroundTaskUserMessage } from '../protocol/user-message-origin.js';
@@ -9,7 +10,10 @@ export function composeStreamFn(resolved, resume) {
     // ceiling is the exception and therefore the innermost link: it has to see
     // the fully accumulated options in order to shrink them.
     const callerHeaders = resolved.headers && Object.keys(resolved.headers).length > 0 ? resolved.headers : undefined;
-    const hostClamped = withHostMaxOutputTokens(resolved.streamFn, resolved);
+    // 网关 content_error 的引导词只给模型看：紧贴 provider 换成中性文案，外层的重试、
+    // 指标、超时、事件和历史都看不到它。
+    const shielded = withContentReviewErrorShield(resolved.streamFn);
+    const hostClamped = withHostMaxOutputTokens(shielded, resolved);
     const cacheWrapped = withCacheRetention(hostClamped, resolved.cacheRetention);
     const maxTokensWrapped = typeof resolved.maxTokens === 'number' && resolved.maxTokens > 0
         ? withMaxTokens(cacheWrapped, resolved.maxTokens)

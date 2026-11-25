@@ -1,14 +1,23 @@
 import { buildLocalCronTools } from './local-cron-tools.js';
 import { buildLocalAssignmentTools } from './local-assignment-tools.js';
 import { buildLocalSessionCreateTool } from './local-session-create-tool.js';
+import { buildLocalSidebarSectionTools } from './local-section-tools.js';
+import { buildLocalSidebarTools } from './local-sidebar-tools.js';
+import { buildLocalSidebarManageTools, buildLocalSidebarUiTools, } from './local-sidebar-manage-tools.js';
+import { buildLocalSessionManageTools, buildLocalSessionOpenTool, } from './local-session-manage-tools.js';
+import { buildLocalAppUiTools, buildLocalPluginTools } from './local-app-manage-tools.js';
+import { buildLocalPanelTools } from './local-panel-tools.js';
 import { toRuntimeTool } from '@mavis/agent-core/tools';
-import { LocalAskUserTool } from './local-ask-user.js';
-import { LocalFeatureEnableTool } from './local-feature-enable.js';
+import { LocalAskUserTool } from '../ask-user/local-ask-user.js';
+import { LocalFeatureEnableTool } from '../ask-user/local-feature-enable.js';
 import { LocalBashTool, LocalEditTool, LocalReadTool, LocalWriteTool, } from './local-pi-tools.js';
 import { LocalGlobTool } from './local-glob.js';
 import { LocalGrepTool } from './local-grep.js';
 import { LocalSkillTool } from './local-skill.js';
 import { LocalMavisTool } from './local-mavis.js';
+import { buildLocalMavisNamespacedTools } from './local-mavis-namespaced-tools.js';
+import { withCoordinatorToolGuard } from './local-coordinator-tool-guard.js';
+import { buildLocalBunnySpaceTools } from './local-bunny-space-tools.js';
 import { LocalMemoryTool } from './local-memory.js';
 import { LocalCodeReviewTool } from './local-code-review.js';
 import { LocalTaskOutputTool, LocalTaskQueryTool, LocalTaskStopTool, } from './local-task-control.js';
@@ -19,12 +28,16 @@ import { LocalWebFetchTool } from './local-webfetch.js';
 import { LocalWebSearchTool } from './local-web-search.js';
 import { LocalWebsiteDeployTool } from './local-website-deploy.js';
 import { LocalWorkspaceSemanticSearchTool } from './local-workspace-semantic-search.js';
+import { buildSpaceTools, sharedSpaceSkillGate, trackSpaceSkillLoads, } from '../space/index.js';
+import { resolveDesktopSpaceLocalPath } from './space-drive-backend.js';
 export * from './builtin-defs.js';
 export * from './canonical-tool-policy.js';
-export * from './local-ask-user.js';
-export * from './local-feature-enable.js';
+export * from '../ask-user/local-ask-user.js';
+export * from '../ask-user/local-feature-enable.js';
 export * from './local-browser.js';
+export * from './local-browser-program.js';
 export * from './local-pi-tools.js';
+export * from './desktop-tool-result.js';
 export * from './ptc-result-projection.js';
 export * from './local-bash-result.js';
 export * from './local-bash-timing.js';
@@ -42,6 +55,8 @@ export { PLAIN_TEXT_ENDING_FOLLOW_UP, emptyEndingFollowUp, plainTextEndingFollow
 export * from './local-mavis-commands.js';
 export * from './local-mavis-coordinator.js';
 export * from './local-mavis-ptc.js';
+export * from './local-mavis-namespaced-tools.js';
+export * from './local-bunny-space-tools.js';
 export * from './local-mavis-cron-adapter.js';
 export * from './local-memory.js';
 export * from './local-code-review.js';
@@ -65,6 +80,7 @@ export * from './matrix-env.js';
 export * from './matrix-media-client.js';
 export * from './matrix-mcp-server.js';
 export * from './matrix-tools.js';
+export * from './space-drive-backend.js';
 export * from './types.js';
 export * from './subagent-roles.js';
 export * from '../shared/web-search.js';
@@ -81,7 +97,7 @@ export function buildLocalToolRegistry(deps) {
         toRuntimeTool(new LocalTodoWriteTool(deps.todoEventSink)),
     ];
     if (deps.skillReader) {
-        tools.push(toRuntimeTool(new LocalSkillTool(deps.skillReader)));
+        tools.push(trackSpaceSkillLoads(toRuntimeTool(new LocalSkillTool(deps.skillReader))));
     }
     if (deps.memoryAdapter) {
         tools.push(toRuntimeTool(new LocalMemoryTool(deps.memoryAdapter)));
@@ -90,15 +106,43 @@ export function buildLocalToolRegistry(deps) {
         tools.push(toRuntimeTool(new LocalCodeReviewTool(deps.codeReviewAdapter)));
     }
     if (deps.mavisAgentAdapter) {
-        tools.push(toRuntimeTool(new LocalMavisTool(deps.mavisAgentAdapter, deps.mavisCronAdapter, deps.mavisSessionAdapter, deps.mavisMcpAdapter)));
+        // One executor, two shapes: the namespaced tools are what the model calls,
+        // and the composite `mavis` tool stays only as the execution identity those
+        // calls run as, never as something a catalog lists.
+        const mavis = toRuntimeTool(new LocalMavisTool(deps.mavisAgentAdapter, deps.mavisCronAdapter, deps.mavisSessionAdapter, deps.mavisMcpAdapter));
+        tools.push(...buildLocalMavisNamespacedTools(mavis), mavis);
+        if (deps.mavisSessionAdapter)
+            tools.push(...buildLocalBunnySpaceTools(deps.mavisAgentAdapter, deps.mavisSessionAdapter));
     }
     if (deps.mavisSessionAdapter)
-        tools.push(...buildLocalAssignmentTools({ sessionAdapter: deps.mavisSessionAdapter }));
+        tools.push(...buildLocalAssignmentTools({
+            sessionAdapter: deps.mavisSessionAdapter,
+            ...(deps.bunnyVerdictGate === true ? { verdictGate: true } : {}),
+        }));
     if (deps.mavisAgentAdapter && deps.mavisSessionAdapter) {
         tools.push(buildLocalSessionCreateTool({
             agentAdapter: deps.mavisAgentAdapter,
             sessionAdapter: deps.mavisSessionAdapter,
         }));
+    }
+    if (deps.mavisAgentAdapter && deps.sidebarToolsAdapter) {
+        tools.push(...buildLocalSidebarTools(deps.sidebarToolsAdapter));
+        tools.push(...buildLocalSidebarSectionTools(deps.sidebarToolsAdapter));
+    }
+    if (deps.mavisAgentAdapter && deps.sidebarManageAdapter) {
+        tools.push(...buildLocalSidebarManageTools(deps.sidebarManageAdapter));
+    }
+    if (deps.mavisAgentAdapter && deps.sessionManageAdapter) {
+        tools.push(...buildLocalSessionManageTools(deps.sessionManageAdapter));
+    }
+    if (deps.mavisAgentAdapter && deps.appManageAdapter) {
+        tools.push(...buildLocalPluginTools(deps.appManageAdapter));
+    }
+    if (deps.mavisAgentAdapter && deps.uiRequestAdapter) {
+        tools.push(buildLocalSessionOpenTool(deps.uiRequestAdapter));
+        tools.push(...buildLocalSidebarUiTools(deps.uiRequestAdapter));
+        tools.push(...buildLocalAppUiTools(deps.uiRequestAdapter));
+        tools.push(...buildLocalPanelTools(deps.uiRequestAdapter));
     }
     if (deps.mavisAgentAdapter && deps.mavisCronAdapter) {
         tools.push(...buildLocalCronTools({
@@ -130,6 +174,16 @@ export function buildLocalToolRegistry(deps) {
     if (deps.websiteDeployAdapter) {
         tools.push(toRuntimeTool(new LocalWebsiteDeployTool(deps.websiteDeployAdapter, deps.workspaceRoot)));
     }
+    if (deps.space) {
+        tools.push(...buildSpaceTools({
+            backend: deps.space.backend,
+            ...(deps.space.fetchImpl ? { fetchImpl: deps.space.fetchImpl } : {}),
+            resolveLocalPath: (input) => resolveDesktopSpaceLocalPath(input, deps.workspaceRoot),
+            // Only with a `skill` tool registered: a gated tool the model cannot ungate would be
+            // blocked forever.
+            ...(deps.skillReader ? { skillGate: sharedSpaceSkillGate } : {}),
+        }));
+    }
     if (deps.workspaceSemanticSearchAdapter) {
         tools.push(toRuntimeTool(new LocalWorkspaceSemanticSearchTool(deps.workspaceSemanticSearchAdapter)));
     }
@@ -138,13 +192,17 @@ export function buildLocalToolRegistry(deps) {
         if (map.has(tool.def.name)) {
             throw new Error(`buildLocalToolRegistry: duplicate tool name '${tool.def.name}'`);
         }
-        map.set(tool.def.name, tool);
+        // One entry for every namespaced tool: a trusted coordinator calling one
+        // outside its allowlist is refused here, whichever adapter backs it.
+        map.set(tool.def.name, withCoordinatorToolGuard(tool));
     }
     return map;
 }
 export { CloudSessionReader, CloudSessionReadError, readRemoteMessageResult, remoteMessageBody, } from './cloud-session-reader.js';
 export { RcSessionReader } from './rc-session-reader.js';
 export { buildLocalCronTools } from './local-cron-tools.js';
+export { buildLocalSidebarSectionTools, sidebarSectionToolDefinitions, } from './local-section-tools.js';
+export { buildLocalSidebarManageTools, buildLocalSidebarUiTools, } from './local-sidebar-manage-tools.js';
 export { CRON_TOOL_NAMES, MAVIS_CAPABILITY_TOOL_NAMES, LocalSelfReminderToolDef, LocalSelfReminderToolDef as SelfReminderToolDef, cronToolDefinitions, selfReminderIntervalMinutes, } from '../cron/tool-defs.js';
 export { DESKTOP_BASH_PREVIEW_BYTES, DESKTOP_BASH_MAX_OUTPUT_BYTES, DESKTOP_BASH_MAX_PENDING_OUTPUT_BYTES, PTC_CHILD_FULL_OUTPUT_MAX_BYTES, } from './output-limit.js';
 export * from './background-task-runtime.js';

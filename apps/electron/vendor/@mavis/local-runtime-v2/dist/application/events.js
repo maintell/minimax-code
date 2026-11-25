@@ -1,3 +1,7 @@
+import { publishBestEffort, } from '@mavis/shared/global-events';
+// Both live in `@mavis/shared` because a Service publishes events too, and a
+// Service may not depend on the Application layer.
+export { publishBestEffort };
 const greetingNotificationObservations = new WeakSet();
 export function createRuntimeGlobalEventWriter(options) {
     return (event) => {
@@ -61,20 +65,6 @@ function terminalGreetingStatus(event) {
             return { turnId: event.payload.turnId, status: 'cancelled' };
         default:
             return undefined;
-    }
-}
-/** A committed business result remains primary when event publication or reporting fails. */
-export function publishBestEffort(publisher, event, onFailure) {
-    try {
-        publisher(event);
-    }
-    catch (error) {
-        try {
-            onFailure?.(event, error);
-        }
-        catch {
-            // A committed business result remains primary.
-        }
     }
 }
 /** Adapts the process EventBus to a cancellation-owned async iterator. */

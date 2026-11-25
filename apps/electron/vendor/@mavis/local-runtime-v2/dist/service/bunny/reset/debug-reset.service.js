@@ -19,7 +19,6 @@ export class BunnyDebugError extends Error {
         this.details = details;
     }
 }
-const DEFAULT_SPACE_ID = 'default';
 /**
  * Files Bunny generates inside a space directory; everything else, artifacts/ among it,
  * is user or task output.
@@ -61,7 +60,7 @@ export class BunnyDebugResetService {
         });
         return {
             spaces,
-            spaceCount: spaces.filter((space) => space.id !== DEFAULT_SPACE_ID).length,
+            spaceCount: spaces.length,
             taskCount: tasks.length,
             eventCount: this.tasks.eventCount(),
             markedSessionCount: this.markedSessionIds().length,
@@ -102,7 +101,7 @@ export class BunnyDebugResetService {
             const questionnaires = this.questionnaires.clear(tx, [...bunnySessionIds(tx), ...tasks]);
             return {
                 ...bunnyRemoved,
-                spaces: spaceIds.filter((id) => id !== DEFAULT_SPACE_ID).length,
+                spaces: spaceIds.length,
                 markedSessions: markedSessions.length,
                 questionnaires,
             };
@@ -111,7 +110,6 @@ export class BunnyDebugResetService {
         for (const directories of scanSpaceDirectories(this.options.dataDir).values())
             for (const directory of directories)
                 await cleanSpaceDirectory(directory, trash);
-        await this.options.ensureDefaultSpace();
         if (scope.clearMemory)
             await this.trashMemory(trash);
         const routines = await this.routines.delete(routineIds);
@@ -123,8 +121,6 @@ export class BunnyDebugResetService {
     }
     /** Deletes one space and every Bunny fact bound to it; its Sessions stay as ordinary ones. */
     async deleteSpace(spaceId) {
-        if (spaceId === DEFAULT_SPACE_ID)
-            throw new BunnyDebugError('Bunny 的空间不能删除', 400);
         try {
             assertSpaceId(spaceId);
         }

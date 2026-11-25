@@ -34,6 +34,7 @@ export function createWorkspaceBrowserAssetAdapter(delegate, options) {
             version: 1,
             actions: DEFAULT_BROWSER_ACTIONS,
         },
+        notifyLifecycle: (event) => delegate.notifyLifecycle?.(event),
         async execute(ctx, action, input, signal) {
             throwIfAborted(signal);
             if (action === 'run_script' && typeof input.path === 'string') {

@@ -50,8 +50,14 @@ export function planMcpDisclosure(input) {
             throw new Error(`Duplicate on-demand tool: ${tool.def.name}`);
         names.add(tool.def.name);
     }
-    const explicitlyDeferred = (tool) => tool.def.loading === 'on_demand' ||
-        (tool.def.loading !== 'default' && input.retainedDeferredTools?.has(tool) === true);
+    // A promoted tool keeps its `on_demand` declaration and stops being deferred
+    // for this Turn only, so it is also no longer a Tool Search candidate: the
+    // window never freezes it, and its declarations change with the Turn's rules
+    // rather than being pinned for a compaction.
+    const inlineOnDemand = new Set(input.inlineOnDemandToolNames ?? []);
+    const explicitlyDeferred = (tool) => !inlineOnDemand.has(tool.def.name) &&
+        (tool.def.loading === 'on_demand' ||
+            (tool.def.loading !== 'default' && input.retainedDeferredTools?.has(tool) === true));
     // Tool Search candidates: everything a plan may defer.
     const isCandidate = ({ tool, source }) => explicitlyDeferred(tool) || (source === 'configured' && tool.def.loading !== 'default');
     const estimate = options?.estimateTokens ?? estimateToolDefinitionTokens;

@@ -81,17 +81,15 @@ export class TerminalManager {
             throw new Error('TerminalManager.create: cwd is required');
         }
         const runtimeId = params.runtimeId ?? LOCAL_DESKTOP_RUNTIME_ID;
-        const pending = { sessionId, runtimeId, cancelled: false };
-        this.pendingCreations.add(pending);
+        const reservation = this.reserveCreation(sessionId, runtimeId);
         let resolved;
         try {
             resolved = await resolveTerminalCwd(requestedCwd);
         }
         finally {
-            this.pendingCreations.delete(pending);
+            reservation.release();
         }
-        if (pending.cancelled)
-            throw new Error('Terminal creation cancelled during cleanup');
+        reservation.assertActive();
         const { cwd, cwdFallbackFrom } = resolved;
         const shellInfo = detectShell();
         const shellPath = shellOverride && shellOverride.length > 0 ? shellOverride : shellInfo.path;
@@ -100,7 +98,7 @@ export class TerminalManager {
         // PowerShell we suppress the profile to keep startup deterministic.
         const args = computeShellArgs(shellInfo.isWindows, shellType);
         // A reassignment while the cwd resolves moves this terminal along with the others.
-        const result = await this.createProgram(pending.sessionId, {
+        const result = await this.createProgram(reservation.sessionId, {
             command: shellPath,
             args,
             cwd,
@@ -110,7 +108,24 @@ export class TerminalManager {
         });
         return { ...result, ...(cwdFallbackFrom ? { cwdFallbackFrom } : {}) };
     }
-    /** Spawn a Main-authorized program, used by SSH terminals after project resolution. */
+    /** Keep async preparation within session/runtime cleanup ownership. */
+    reserveCreation(sessionId, runtimeId) {
+        const pending = { sessionId, runtimeId, cancelled: false };
+        this.pendingCreations.add(pending);
+        return {
+            get sessionId() {
+                return pending.sessionId;
+            },
+            assertActive: () => {
+                if (pending.cancelled)
+                    throw new Error('Terminal creation cancelled during cleanup');
+            },
+            release: () => {
+                this.pendingCreations.delete(pending);
+            },
+        };
+    }
+    /** Spawn a Main-authorized program, used by SSH and inline terminals. */
     async createProgram(sessionId, spec) {
         if (!sessionId)
             throw new Error('TerminalManager.createProgram: sessionId is required');
@@ -157,6 +172,10 @@ export class TerminalManager {
             exited: false,
             exitCode: null,
             disposers: spec.onDispose ? [spec.onDispose] : [],
+            preserveCwd: spec.preserveCwd,
+            inline: spec.inline,
+            outputFilter: spec.outputFilter,
+            onExit: spec.onExit,
             pendingTitle: null,
             titleBroadcastTimer: null,
         };
@@ -189,12 +208,12 @@ export class TerminalManager {
             cwd: spawnCwd,
         };
     }
-    /** Return metadata for every terminal owned by `sessionId`. */
+    /** Return sidebar terminal metadata; inline PTYs retain their message owner. */
     list(params) {
         const { sessionId, runtimeId = LOCAL_DESKTOP_RUNTIME_ID } = params;
         const out = [];
         for (const t of this.terminals.values()) {
-            if (t.sessionId === sessionId && t.runtimeId === runtimeId) {
+            if (t.sessionId === sessionId && t.runtimeId === runtimeId && !t.inline) {
                 out.push({
                     id: t.id,
                     title: t.title,
@@ -219,6 +238,7 @@ export class TerminalManager {
         }
         if (record.runtimeId === LOCAL_DESKTOP_RUNTIME_ID &&
             !record.exited &&
+            !record.preserveCwd &&
             !record.directoryRecoveryCompleted) {
             const resolved = await resolveTerminalCwd(record.cwd);
             if (this.terminals.get(terminalId) !== record)
@@ -429,6 +449,9 @@ export class TerminalManager {
     handleData(record, data) {
         if (this.terminals.get(record.id) !== record || record.exited)
             return;
+        data = record.outputFilter ? record.outputFilter(data) : data;
+        if (!data)
+            return;
         record.scrollback.append(data);
         // Title extraction — emit only on change so renderers don't churn.
         const newTitles = record.oscParser.feed(data);
@@ -461,8 +484,15 @@ export class TerminalManager {
     handleExit(record, exitCode) {
         if (this.terminals.get(record.id) !== record || record.exited)
             return;
+        if (record.outputFilter) {
+            const final = record.outputFilter('', true);
+            record.outputFilter = undefined;
+            if (final)
+                this.handleData(record, final);
+        }
         record.exited = true;
         record.exitCode = exitCode;
+        record.onExit?.(exitCode);
         this.broadcast(record, IPC_CHANNELS.TERMINAL_EXIT, {
             terminalId: record.id,
             exitCode,

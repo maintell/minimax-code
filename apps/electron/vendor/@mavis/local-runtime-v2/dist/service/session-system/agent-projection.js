@@ -6,24 +6,26 @@ import { streamMessageOrigin } from './messages/source.js';
 import { mergePtcDisplayToolCalls, ptcToolCallDisplayMessage, } from './messages/ptc/display-tool-calls.js';
 import { projectPtcSafetyDisplay } from './messages/ptc/safety-reconcile.js';
 import { describeRetractedInput } from './messages/retracted-input.js';
-import { stopSourceOf } from './sessions/recovery/capabilities.js';
-import { refreshToolCallModeAfterCompaction, } from './sessions/support/tool-call-mode.js';
-import { compactionTokenUsageMetadata, readCompactionMethod, recordCompletedCompactionMetrics, recordTerminalCompactionMetrics, terminalCompactionTokenUsageMetadata, } from './sessions/support/compaction-metrics.js';
+import { stopSourceOf, } from './sessions/recovery/capabilities.js';
+import { isCommittedCompactionMethod, refreshToolCallModeAfterCompaction, } from './sessions/support/tool-call-mode.js';
+import { logger } from '../../infra/logging/logger.js';
 export function createSessionSystemAgentProjection(options) {
     const compactionLane = createCompactionProjectionLane();
     const assistantBoundaries = new CanonicalAssistantBoundaryLinker(options);
-    const startedCompactions = new Map();
+    const startedCompactions = new Set();
     // Attempts without display records (started quietly, or committed/failed as a hidden
     // rebuild), until their terminal observation publishes the fact.
     const hiddenCompactions = new Set();
     const shown = (input) => !hiddenCompactions.has(input.attemptId) && !isHiddenCompaction(input.metadata);
     return {
         preparation: {
+            // The origin only feeds the display-only Subagent execution facts.
             projectStarted: async (input) => {
-                // Preparation owns an accepted Turn but has no AgentHost runtime sequence yet.
-                // Use the same fenced Session state writer without inventing a Runtime event.
-                const result = await options.state.markStarted(input);
+                // No AgentHost runtime sequence yet: reuse the fenced writer, invent no Runtime event.
+                const { provenance, ...stateInput } = input;
+                const result = await options.state.markStarted(stateInput);
                 assertStateWrite(result.status);
+                await projectSubagentStarted(options, { ...stateInput, provenance }, result.status);
             },
         },
         session: {
@@ -113,6 +115,7 @@ export function createSessionSystemAgentProjection(options) {
                 const errorMessage = describePublicError(input.error, publicFailure);
                 if (status === 'failed' && publicFailure)
                     await persistPreparationFailure(options, input, publicFailure);
+                await projectSubagentExecution(options, input, status);
                 const result = await options.state.markTerminal({
                     sessionId: input.sessionId,
                     turnId: input.turnId,
@@ -151,7 +154,6 @@ export function createSessionSystemAgentProjection(options) {
                 if (!isBackgroundCompaction(input.metadata) && shown(input)) {
                     await writeCompactionFact(options, input, 'compaction');
                 }
-                recordCompletedCompactionMetrics(options, input, startedCompactions.get(input.attemptId));
                 // Reached only after AgentHost durably committed the replacement history (automatic
                 // and manual alike); failed, skipped or deferred compactions never get here. The mode
                 // follows the switch only when the method is a summary (`llm_checkpoint`).
@@ -202,11 +204,13 @@ async function recallAssistantAttempt(options, input) {
     const userMessageIds = new Set(displayMessages.flatMap((message) => message.role === Role.User && typeof message.msg_id === 'string' && message.msg_id.length > 0
         ? [message.msg_id]
         : []));
-    const durableAssistantIds = displayMessages.flatMap((message) => message.role === Role.Assistant &&
-        typeof message.msg_id === 'string' &&
-        message.msg_id.length > 0
-        ? [message.msg_id]
-        : []);
+    const durableAssistantIds = input.messagesOnly
+        ? []
+        : displayMessages.flatMap((message) => message.role === Role.Assistant &&
+            typeof message.msg_id === 'string' &&
+            message.msg_id.length > 0
+            ? [message.msg_id]
+            : []);
     const messageIds = [
         ...new Set([
             ...durableAssistantIds,
@@ -221,7 +225,8 @@ async function recallAssistantAttempt(options, input) {
         sessionId: input.sessionId,
         turnId: input.turnId,
         kind: 'messages-rewound',
-        data: { messageIds },
+        // 只撤单条时带 messagesOnly：本轮还会接着跑，客户端不能把它当成整轮被撤回。
+        data: { messageIds, ...(input.messagesOnly ? { messagesOnly: true } : {}) },
     });
     await options.conversationFacts.handle({
         kind: 'attempt-recalled',
@@ -233,6 +238,15 @@ async function recallAssistantAttempt(options, input) {
 async function projectCommittedConversation(options, input) {
     if (input.change.operation.kind === 'safety-reconcile') {
         await projectPtcSafetyDisplay(options.messages, options.stream, input.context);
+        return;
+    }
+    if (input.change.operation.kind === 'reply-reconcile') {
+        // 被拦那条已经在运行中单条撤回，其余展示行不动，只通知界面提示。
+        await options.conversationFacts.handle({
+            kind: 'reply-withdrawn',
+            sessionId: input.context.sessionId,
+            turnId: input.context.turnId,
+        });
         return;
     }
     const slowNetworkRead = input.change.operation.slowNetworkRead
@@ -281,7 +295,6 @@ async function projectCommittedConversation(options, input) {
     });
 }
 async function projectCompactionObservation(options, attempts, input) {
-    const nowMs = options.nowMs ?? Date.now;
     const startedCompactions = attempts.started;
     if (input.status === 'started') {
         await projectCompactionStart(options, attempts, input);
@@ -306,9 +319,7 @@ async function projectCompactionObservation(options, attempts, input) {
         });
         return;
     }
-    const started = startedCompactions.get(input.attemptId);
-    startedCompactions.delete(input.attemptId);
-    recordTerminalCompactionMetrics(options, input, started, nowMs());
+    const started = startedCompactions.delete(input.attemptId);
     if (input.status === 'unchanged') {
         if (!started || hidden)
             return;
@@ -329,10 +340,7 @@ async function projectCompactionObservation(options, attempts, input) {
 async function projectCompactionStart(options, attempts, input) {
     if (attempts.started.has(input.attemptId))
         return;
-    attempts.started.set(input.attemptId, {
-        startedAtMs: (options.nowMs ?? Date.now)(),
-        trigger: input.reason === 'automatic' ? 'auto' : 'manual',
-    });
+    attempts.started.add(input.attemptId);
     if (input.display === false)
         attempts.hidden.add(input.attemptId);
     else
@@ -344,10 +352,29 @@ async function projectCompactionStart(options, attempts, input) {
         ...(input.display === false ? { display: false } : {}),
     });
 }
+function readCompactionMethod(value) {
+    if (!isRecord(value))
+        return undefined;
+    return isCommittedCompactionMethod(value.method) ? value.method : undefined;
+}
+function compactionTokenUsageMetadata(tokenUsage) {
+    if (tokenUsage === undefined)
+        return {};
+    return { tokenUsage };
+}
+function terminalCompactionTokenUsage(input) {
+    if (input.status === 'unchanged')
+        return undefined;
+    return input.tokenUsage;
+}
+function terminalCompactionTokenUsageMetadata(input) {
+    return compactionTokenUsageMetadata(terminalCompactionTokenUsage(input));
+}
 async function projectSessionRuntime(options, input) {
     const identity = eventIdentity(input);
     const terminal = terminalOutcome(input.event);
     if (terminal) {
+        await projectSubagentExecution(options, input.context, terminal);
         const error = terminalError(input.event);
         const result = await options.state.markTerminal({
             ...identity,
@@ -364,6 +391,7 @@ async function projectSessionRuntime(options, input) {
     if (isSessionStatus(input.event, RuntimeEventStatus.RUNNING)) {
         const result = await options.state.markStarted(identity);
         assertStateWrite(result.status);
+        await projectSubagentStarted(options, { ...identity, provenance: input.context.provenance }, result.status);
     }
     else if (isSessionStatus(input.event, RuntimeEventStatus.IDLE)) {
         const result = await options.state.markIdle(identity);
@@ -420,6 +448,34 @@ function isSessionStatus(event, status) {
     return ((event.type === RuntimeEventType.SESSION_STATUS ||
         event.type === RuntimeEventType.TURN_TERMINAL) &&
         event.payload.status === status);
+}
+/**
+ * A child Turn fact follows its own Session state projection. Like the query-collapse
+ * sidecar it is display-only: a failed write is logged and never blocks Session/Turn state.
+ */
+async function projectSubagentExecution(options, identity, status) {
+    try {
+        await options.subagentExecutions?.project({
+            sessionId: identity.sessionId,
+            turnId: identity.turnId,
+            status,
+            ...(identity.provenance ? { origin: { source: identity.provenance.source } } : {}),
+        });
+    }
+    catch (error) {
+        logger.warn({
+            error: error instanceof Error ? error.message : String(error),
+            sessionId: identity.sessionId,
+            turnId: identity.turnId,
+            status,
+        }, 'Subagent execution projection failed; Session state continues');
+    }
+}
+/** Only an applied or replayed start write projects a started child Turn. */
+async function projectSubagentStarted(options, identity, writeStatus) {
+    if (writeStatus !== 'applied' && writeStatus !== 'duplicate')
+        return;
+    await projectSubagentExecution(options, identity, 'started');
 }
 function assertStateWrite(status) {
     if (status !== 'applied' && status !== 'duplicate') {

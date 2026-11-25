@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { MINIAPP_AGENT_FAILURE_CODES, readMiniAppAgentObservedEvent, readMiniAppAgentRunEvent, readMiniAppAgentRunResult, toMiniAppAgentFailureCode, isMiniAppAgentBusyReason, parseMiniAppPermissionId, readMiniAppAgentModelSelection, MINIAPP_AGENT_MAX_TEXT_LENGTH, isMiniAppAgentWhenBusy, isMiniAppAgentPermissionDecision, readMiniAppAgentAnswers, readMiniAppAgentObserveTarget, readMiniAppAgentSessionList, readMiniAppAgentSessionDetail, readMiniAppAgentModels, readMiniAppAgentAgents, readMiniAppAgentCreateResponse, isMiniAppMemoryProtection, validateMiniAppSurfaceWindow, parseMiniAppPermissionList } from "@mavis/shared/miniapp-surface";
+import { MINIAPP_AGENT_FAILURE_CODES, readMiniAppAgentObservedEvent, readMiniAppAgentRunEvent, readMiniAppAgentRunResult, toMiniAppAgentFailureCode, isMiniAppAgentBusyReason, parseMiniAppPermissionId, readMiniAppAgentModelSelection, MINIAPP_AGENT_MAX_TEXT_LENGTH, isMiniAppAgentWhenBusy, isMiniAppAgentPermissionDecision, readMiniAppAgentAnswers, readMiniAppAgentObserveTarget, readMiniAppAgentSessionList, readMiniAppAgentSessionDetail, readMiniAppAgentModels, readMiniAppAgentAgents, readMiniAppAgentCreateResponse, validateMiniAppFileHandlers, isMiniAppMemoryProtection, validateMiniAppSurfaceWindow, parseMiniAppPermissionList } from "@mavis/shared/miniapp-surface";
 import { MINIAPP_ATTENTION_MAX_TABS } from "../../browser/miniapp-attention";
 import { parseMiniAppLoopbackOrigin } from "../../browser/miniapp-loopback-origin";
 import { isSafeBrokerRequestId } from "./control";
@@ -1387,11 +1387,15 @@ function isMiniAppSurfaceSummary(value) {
         'widget',
         'update',
         'memory',
+        'fileHandlers',
     ])) {
         return false;
     }
     if (value.memory !== undefined && !isMiniAppSurfaceMemory(value.memory))
         return false;
+    if (value.fileHandlers !== undefined && !validateMiniAppFileHandlers(value.fileHandlers).ok) {
+        return false;
+    }
     if (!isSafePluginId(value.pluginId))
         return false;
     if (value.widget !== undefined &&

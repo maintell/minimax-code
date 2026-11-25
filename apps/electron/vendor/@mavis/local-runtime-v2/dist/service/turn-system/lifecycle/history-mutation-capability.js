@@ -1,21 +1,10 @@
 import { createHash } from 'node:crypto';
 import { canonicalActiveHistoryRevision, inspectCanonicalHistorySequence, createSideChatModeMessage, isSideChatModeMessage, } from '../../session-system/index.js';
-import { readBackgroundTaskOriginMetadata } from '../agent-host/history/background/host-metadata.js';
-import { BACKGROUND_CADENCE_REMINDER_CUSTOM_TYPE } from '../agent-host/history/background/reminder-protocol.js';
-import { isBackgroundTaskReadSettlement } from '../agent-host/history/background/task-read-settlement.js';
-import { forgetToolSearchAnnouncements } from '../agent-host/tools/tool-search.js';
-import { isRecallPointersMessage, isStateDeltaMessage } from '../agent-host/contracts.js';
-import { WAKE_LINE_CUSTOM_TYPE } from '../agent-host/preparation/turn-wake-reasons.js';
-import { appendCompactionState, readCompactionCompatibility } from '../compaction/compat.js';
+import { forgetToolSearchAnnouncements } from '@mavis/agent-tools/mcp-disclosure';
+import { forgetSkillCatalogAnnouncements } from '@mavis/agent-tools/skill-catalog-window';
+import { BACKGROUND_CADENCE_REMINDER_CUSTOM_TYPE, createHiddenContextBoundaryRecord, historyMutationErrorOf, HistoryMutationError, isRecallPointersMessage, isStateDeltaMessage, WAKE_LINE_CUSTOM_TYPE, withoutSourceBackgroundReminders, } from '@mavis/harness';
+export { HistoryMutationError };
 const DEFAULT_BOUNDARY_WAIT_TIMEOUT_MS = 5_000;
-export class HistoryMutationError extends Error {
-    code;
-    constructor(code, message, options) {
-        super(message, options);
-        this.code = code;
-        this.name = 'HistoryMutationError';
-    }
-}
 export function createHistoryMutationCapability(options) {
     return {
         prepareSideChat: (input) => prepareSideChat(options, input),
@@ -47,23 +36,15 @@ async function prepareSideChat(options, input) {
         };
     }, input.signal);
     input.signal?.throwIfAborted();
-    const rewriteMessage = frozen.replacements?.size
-        ? assetReferenceRewriter(frozen.replacements)
-        : undefined;
-    const copied = {
-        active: rewriteMessage
-            ? frozen.active.map((record) => ({ ...record, message: rewriteMessage(record.message) }))
-            : frozen.active,
-    };
-    const boundary = createHiddenContextBoundaryEnvelope(`sidechat:${input.target.sessionId}`, {
+    const boundary = createHiddenContextBoundaryRecord(`sidechat:${input.target.sessionId}`, {
         kind: 'sidechat_context_boundary',
         content: '<system-reminder>Messages above this boundary are a frozen copy from another conversation and are reference context only. Do not resume its unfinished tasks or treat its approvals as authorization. Answer the current user request under the current session settings. This historical boundary does not constrain the current session mode or available tools.</system-reminder>',
     });
     const mode = createSideChatModeMessage(0);
     const active = [
-        ...copied.active.filter(({ message }) => !isSideChatModeMessage(message)),
+        ...frozen.active.filter(({ message }) => !isSideChatModeMessage(message)),
         boundary,
-        createHiddenContextBoundaryEnvelope(`sidechat:${input.target.sessionId}`, {
+        createHiddenContextBoundaryRecord(`sidechat:${input.target.sessionId}`, {
             kind: mode.customType,
             content: mode.content,
         }),
@@ -73,7 +54,7 @@ async function prepareSideChat(options, input) {
         generation: frozen.generation,
         active,
         snapshots: frozen.snapshots,
-        source: { sessionId: input.sourceSessionId, ...(rewriteMessage ? { rewriteMessage } : {}) },
+        source: { sessionId: input.sourceSessionId },
     });
     try {
         input.signal?.throwIfAborted();
@@ -90,18 +71,8 @@ async function prepareSideChat(options, input) {
         display: frozen.display,
     };
 }
-/**
- * Copied history points at the SideChat's own assets: every string value equal to a source
- * reference is replaced. Snapshot records get the same rewrite while they are copied.
- */
-function assetReferenceRewriter(replacements) {
-    return (message) => JSON.parse(JSON.stringify(message, (_key, value) => typeof value === 'string' ? (replacements.get(value) ?? value) : value));
-}
 async function fork(options, input) {
-    const { source, sourceArtifact, boundary, prefix } = await selectForkPrefix(options, input);
-    if (boundary && !isSettledPrefix(prefix)) {
-        throw new HistoryMutationError('boundary-invalid', 'History fork target prefix is not settled');
-    }
+    const { source, sourceArtifact, prefix } = await selectForkPrefix(options, input);
     const active = createForkActiveHistory(prefix, input);
     // Ancestor snapshots are immutable, revision-linked archives, not live context; they are
     // copied as files. Filter only the selected active prefix above, including forks into an archive.
@@ -129,10 +100,13 @@ async function fork(options, input) {
         historyRevision: canonicalActiveHistoryRevision(active),
     };
 }
-/** Read-only preflight: reports whether `fork()` would accept this boundary, without staging. */
+/**
+ * Read-only preflight: reports whether `fork()` would accept this boundary, without staging.
+ * The prefix drops unpaired tool calls, so it is always settled.
+ */
 async function inspectForkBoundary(options, input) {
-    const { boundary, prefix } = await selectForkPrefix(options, input);
-    return { settled: !boundary || isSettledPrefix(prefix) };
+    await selectForkPrefix(options, input);
+    return { settled: true };
 }
 /** Single source of the Fork prefix rule shared by `fork()` and its preflight. */
 async function selectForkPrefix(options, input) {
@@ -149,7 +123,7 @@ async function selectForkPrefix(options, input) {
     if (index < 0)
         boundaryNotFound(boundary);
     const prefixEnd = forkPrefixEnd(sourceArtifact.records, index, input);
-    const prefix = withoutSourceBackgroundReminders(sourceArtifact.records.slice(0, prefixEnd));
+    const prefix = withoutUnpairedToolCalls(withoutSourceBackgroundReminders(sourceArtifact.records.slice(0, prefixEnd)));
     return { source, sourceArtifact, boundary, prefix };
 }
 function forkPrefixEnd(records, index, input) {
@@ -194,6 +168,48 @@ function toolResultCallId(message) {
     const callId = Reflect.get(message, 'toolCallId');
     return typeof callId === 'string' && callId ? callId : undefined;
 }
+/**
+ * Pairs each Assistant tool call with the contiguous results right after it, the rule of
+ * `isSettledPrefix`. Drops calls without a result, Assistant messages left empty by that, and
+ * results without a call; the output is settled and depends only on the input. Mirrors the
+ * harness Fork/Rewind prefix rule, which this store cannot reach across the package boundary.
+ */
+function withoutUnpairedToolCalls(records) {
+    const retained = [];
+    let start = 0;
+    while (start < records.length) {
+        let end = start + 1;
+        while (records[end]?.message.role === 'toolResult')
+            end += 1;
+        retained.push(...pairedToolGroup(records[start], records.slice(start + 1, end)));
+        start = end;
+    }
+    return retained;
+}
+/** `results` are the toolResult records directly after `head`. */
+function pairedToolGroup(head, results) {
+    if (!head || head.message.role === 'toolResult')
+        return [];
+    const unanswered = new Set(assistantToolCallIds(head.message));
+    const paired = results.filter((result) => {
+        const callId = toolResultCallId(result.message);
+        return callId !== undefined && unanswered.delete(callId);
+    });
+    const kept = withoutToolCalls(head, unanswered);
+    return kept ? [kept, ...paired] : [];
+}
+function withoutToolCalls(record, callIds) {
+    const content = Reflect.get(record.message, 'content');
+    if (callIds.size === 0 || !Array.isArray(content))
+        return record;
+    const kept = content.filter((block) => !isRecord(block) ||
+        block.type !== 'toolCall' ||
+        typeof block.id !== 'string' ||
+        !callIds.has(block.id));
+    if (kept.length === 0)
+        return undefined;
+    return { ...record, message: { ...record.message, content: kept } };
+}
 function createForkActiveHistory(prefix, input) {
     return [
         ...prefix,
@@ -201,7 +217,7 @@ function createForkActiveHistory(prefix, input) {
             ? [createContinuationEnvelope(input.operationId, input.continuation)]
             : []),
         ...(input.hiddenContextBoundary
-            ? [createHiddenContextBoundaryEnvelope(input.operationId, input.hiddenContextBoundary)]
+            ? [createHiddenContextBoundaryRecord(input.operationId, input.hiddenContextBoundary)]
             : []),
     ];
 }
@@ -242,8 +258,9 @@ async function resumeRewind(options, input, staged) {
     }, turnDiffRewind);
 }
 async function finishRewind(options, input, plan, turnDiffRewind) {
-    // The rewound user messages may have carried Tool Search announcements.
+    // The rewound user messages may have carried Tool Search or skill availability updates.
     forgetToolSearchAnnouncements(input.sessionId);
+    forgetSkillCatalogAnnouncements(input.sessionId);
     try {
         await options.rewindProjections.deleteTurns({
             sessionId: input.sessionId,
@@ -362,7 +379,7 @@ async function findRewindSlice(options, sessionId, source, boundary) {
     if (!target || target.message.role !== 'user' || !target.message_id.startsWith('msg-user-v1-')) {
         throw new HistoryMutationError('boundary-invalid', 'History rewind target is not an external user envelope');
     }
-    const active = artifact.records.slice(0, leadingHostMessagesStart(artifact.records, index));
+    const active = withoutUnpairedToolCalls(artifact.records.slice(0, leadingHostMessagesStart(artifact.records, index)));
     assertSettledRewindPrefix(active);
     return {
         generation: artifact.generation,
@@ -404,9 +421,11 @@ async function findDisplayOnlyRewindSlice(options, sessionId, source, input) {
             throw new HistoryMutationError('boundary-invalid', 'Display-only rewind target Turn is partially present in Canonical History');
         }
         const index = source.active.findIndex((envelope) => envelope.turn_id === boundary.turnId);
-        const active = source.active.slice(0, index);
-        assertSettledRewindPrefix(active);
-        return { generation: source.activeGeneration, active, snapshots: source.snapshots };
+        return {
+            generation: source.activeGeneration,
+            active: withoutUnpairedToolCalls(source.active.slice(0, index)),
+            snapshots: source.snapshots,
+        };
     }
     const laterBoundary = boundary.subsequentUserMessageIds.find((messageId) => findBoundaryArtifact(source, messageId) !== undefined);
     if (laterBoundary) {
@@ -414,10 +433,9 @@ async function findDisplayOnlyRewindSlice(options, sessionId, source, input) {
         if (later)
             return later;
     }
-    assertSettledRewindPrefix(source.active);
     return {
         generation: source.activeGeneration,
-        active: source.active,
+        active: withoutUnpairedToolCalls(source.active),
         snapshots: source.snapshots,
     };
 }
@@ -538,17 +556,11 @@ function findBoundaryArtifact(source, boundary, preferLatest = false) {
 }
 /** The records of one located generation; only a snapshot target is read from disk. */
 async function loadArtifact(options, sessionId, source, artifact) {
-    if (!artifact.snapshot)
+    const snapshot = artifact.snapshot;
+    if (!snapshot)
         return { generation: artifact.generation, records: source.active };
-    try {
-        return {
-            generation: artifact.generation,
-            records: await options.sessions.readSnapshotRecords(sessionId, artifact.snapshot),
-        };
-    }
-    catch (error) {
-        throw classifySessionHistoryError(error);
-    }
+    const records = await classified(() => options.sessions.readSnapshotRecords(sessionId, snapshot));
+    return { generation: artifact.generation, records };
 }
 function lineageEntries(snapshots, active) {
     return [
@@ -568,71 +580,10 @@ function createContinuationEnvelope(operationId, continuation) {
         },
     };
 }
-function createHiddenContextBoundaryEnvelope(operationId, boundary) {
-    const identity = createHash('sha256')
-        .update(`${operationId}:${boundary.kind}:${boundary.content}`)
-        .digest('hex')
-        .slice(0, 24);
-    return {
-        message_id: `msg-hidden-context-boundary-${identity}`,
-        turn_id: `control:${operationId}`,
-        message: {
-            role: 'custom',
-            timestamp: 0,
-            customType: boundary.kind,
-            display: false,
-            content: boundary.content,
-        },
-    };
-}
-function withoutSourceBackgroundReminders(records) {
-    const retained = [];
-    const suppressedTurnIds = new Set();
-    for (const envelope of records) {
-        if (suppressedTurnIds.has(envelope.turn_id))
-            continue;
-        // A copy is not Bunny's main conversation: it carries none of its delta blocks (spec 9.4).
-        if (isTypedBackgroundReminder(envelope.message) ||
-            isBackgroundTaskReadSettlement(envelope.message) ||
-            isStateDeltaMessage(envelope.message)) {
-            continue;
-        }
-        if (!isAutomaticBackgroundReminder(envelope.message)) {
-            retained.push(withoutSourceBackgroundCheckpoint(envelope));
-            continue;
-        }
-        while (retained.at(-1)?.turn_id === envelope.turn_id && !isSettledPrefix(retained)) {
-            retained.pop();
-        }
-        suppressedTurnIds.add(envelope.turn_id);
-    }
-    return retained;
-}
 function isTypedBackgroundReminder(message) {
     return (Reflect.get(message, 'role') === 'custom' &&
         Reflect.get(message, 'customType') === BACKGROUND_CADENCE_REMINDER_CUSTOM_TYPE &&
         Reflect.get(message, 'display') === false);
-}
-function withoutSourceBackgroundCheckpoint(envelope) {
-    if (Reflect.get(envelope.message, 'role') !== 'compactionSummary')
-        return envelope;
-    const compatibility = readCompactionCompatibility(envelope.message);
-    if (!compatibility?.backgroundCadence)
-        return envelope;
-    const retainedCompatibility = { ...compatibility };
-    Reflect.deleteProperty(retainedCompatibility, 'backgroundCadence');
-    const { summary, ...retained } = retainedCompatibility;
-    return {
-        ...envelope,
-        message: {
-            ...envelope.message,
-            summary: appendCompactionState(summary, retained),
-        },
-    };
-}
-function isAutomaticBackgroundReminder(message) {
-    return (Reflect.get(message, 'role') === 'user' &&
-        readBackgroundTaskOriginMetadata(message) !== undefined);
 }
 function isSettledPrefix(records) {
     return inspectCanonicalHistorySequence(records).status === 'settled';
@@ -646,52 +597,27 @@ async function readBoundarySource(options, sessionId, boundary, waitForUserMessa
         !options.sessions.readForUserMessage) {
         return initial;
     }
-    try {
-        return await options.sessions.readForUserMessage({
-            sessionId,
-            userMessageId: waitForUserMessageId,
-            timeoutMs: options.boundaryWaitTimeoutMs ?? DEFAULT_BOUNDARY_WAIT_TIMEOUT_MS,
-        });
-    }
-    catch (error) {
-        throw classifySessionHistoryError(error);
-    }
+    // A missing user boundary may still be persisted by the running Turn.
+    const waited = await classified(async () => options.sessions.readForUserMessage?.({
+        sessionId,
+        userMessageId: waitForUserMessageId,
+        timeoutMs: options.boundaryWaitTimeoutMs ?? DEFAULT_BOUNDARY_WAIT_TIMEOUT_MS,
+    }));
+    return waited ?? initial;
 }
 async function readSessionHistory(options, sessionId) {
+    return classified(() => options.sessions.read(sessionId));
+}
+async function classified(read) {
     try {
-        return await options.sessions.read(sessionId);
+        return await read();
     }
     catch (error) {
-        throw classifySessionHistoryError(error);
+        throw historyMutationErrorOf(error);
     }
-}
-function classifySessionHistoryError(error) {
-    if (error instanceof HistoryMutationError)
-        return error;
-    const code = readErrorCode(error);
-    if (code === 'duplicate-external-user-id' || code === 'external-user-lineage-conflict') {
-        return new HistoryMutationError('identity-conflict', 'Canonical history contains a duplicate external user identity', { cause: error });
-    }
-    if ([
-        'artifact-revision-mismatch',
-        'parent-mismatch',
-        'parent-snapshot-missing',
-        'invalid-generation-marker',
-        'malformed-jsonl',
-        'sequence-corruption',
-        'unsafe-artifact',
-    ].includes(String(code))) {
-        return new HistoryMutationError('chain-corrupt', 'Canonical history chain is corrupt', {
-            cause: error,
-        });
-    }
-    return error;
 }
 function boundaryNotFound(boundary) {
     throw new HistoryMutationError('boundary-not-found', `History mutation target not found: ${boundary}`);
-}
-function readErrorCode(error) {
-    return typeof error === 'object' && error !== null ? Reflect.get(error, 'code') : undefined;
 }
 function containsBoundary(source, boundary) {
     return (source.active.some((envelope) => envelope.message_id === boundary) ||

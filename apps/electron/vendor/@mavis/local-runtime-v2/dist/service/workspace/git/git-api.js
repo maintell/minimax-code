@@ -1,23 +1,22 @@
-import { mkdir, realpath, rm } from 'node:fs/promises';
-import { basename, extname, isAbsolute, join, resolve } from 'node:path';
-import { getDataDir } from '@mavis/config';
-import { LocalReviewLinkStore } from '../../../infra/legacy-db/review-link.js';
-import { generateDefaultWorktreeBranch } from '../worktree-branch.js';
-import { git as runGitProcess, gitRoot } from '../operations/git-process.js';
+import { rm } from 'node:fs/promises';
+import { extname, join, resolve } from 'node:path';
+import { git as runGitProcess } from '../operations/git-process.js';
 import { resolvePath } from '../files/path-utils.js';
-import { listWorkspaceGitWorktrees } from '../operations/worktrees.js';
+import { createWorkspaceGitWorktree, listWorkspaceGitWorktrees } from '../operations/worktrees.js';
 import { WorkspaceGitChangesCoordinator, } from './workspace-git-changes-coordinator.js';
-import { requiredQuery, json, readJsonBody, readString, notFound, BINARY_EXTENSIONS, TEXT_EXTENSIONS, normalizeGitActionPath, gitDiffScopes, isPathInside, resolveInside, } from '../files/file-api-shared.js';
+import { requiredQuery, json, readJsonBody, readString, notFound, BINARY_EXTENSIONS, TEXT_EXTENSIONS, normalizeGitActionPath, gitDiffScopes, isPathInside, } from '../files/file-api-shared.js';
 import { readWorkspaceFile, readWorkspaceTextLines } from '../files/file-content.js';
 /** Read-only process-local Git metadata facade; mutation remains outside this seam. */
-export function createLocalWorkspaceGitFacade(reviewLinkStore = new LocalReviewLinkStore(getDataDir)) {
+export function createLocalWorkspaceGitFacade(reviewLinks) {
     return {
         getMetadata: (workspace) => getGitMetadata(workspace),
         getReviewLink: async (workspace, branch) => {
-            const entry = reviewLinkStore.read(workspace, branch);
+            const found = await reviewLinks.peekBranch(workspace, branch);
             // Widened to the facade's untyped shape; the consumer re-validates it
             // rather than trusting a structural cast across the seam.
-            return entry ? { ...entry } : undefined;
+            return found
+                ? { vendor: found.platform, url: found.webUrl, number: found.number, status: found.status }
+                : undefined;
         },
     };
 }
@@ -49,7 +48,6 @@ export async function routeGitApi(request, tail, url, gitChangesCoordinator) {
         ],
         ['GET worktrees', () => routeGitWorktrees(url)],
         ['POST worktrees', () => routeGitCreateWorktree(request)],
-        ['POST worktrees/remove', () => routeGitRemoveWorktree(request)],
     ]);
     const handler = routes.get(`${request.method.toUpperCase()} ${tail}`);
     return handler ? handler() : notFound(`/file/git/${tail}`);
@@ -143,41 +141,23 @@ async function routeGitWorktrees(url) {
         return workspace;
     return json(await listWorkspaceGitWorktrees(workspace));
 }
+/** Parses the request only; creation rules live in createWorkspaceGitWorktree. */
 async function routeGitCreateWorktree(request) {
     const body = await readJsonBody(request);
     const workspace = readString(body, 'workspace');
     if (!workspace)
         return json({ success: false, error: 'workspace is required' }, { status: 400 });
     const options = readRecord(body, 'options') ?? {};
-    const branch = readString(options, 'branch') ?? generateDefaultWorktreeBranch();
-    const invalidBranch = await validateGitBranch(workspace, branch);
-    if (invalidBranch)
-        return invalidBranch;
-    const dirName = readString(options, 'dirName') ?? branch.replace(/[^a-zA-Z0-9._-]+/g, '-');
-    const base = readString(options, 'base') ?? 'HEAD';
-    const workspaceRoot = await gitRoot(workspace);
-    if (!workspaceRoot)
-        return json({ success: false, error: 'Not a git repository' }, { status: 400 });
-    const worktreeDir = await resolveWorktreeTarget(workspaceRoot, dirName);
-    if (!worktreeDir)
-        return json({ success: false, error: 'Invalid worktree dirName' }, { status: 400 });
-    return createGitWorktree(workspaceRoot, { branch, worktreeDir, base });
+    const { status, ...result } = await createWorkspaceGitWorktree(workspace, {
+        ...optionalString(options, 'branch'),
+        ...optionalString(options, 'dirName'),
+        ...optionalString(options, 'base'),
+    });
+    return json(result, status ? { status } : undefined);
 }
-async function createGitWorktree(workspaceRoot, { branch, worktreeDir, base }) {
-    const result = await git(['worktree', 'add', '-b', branch, worktreeDir, base], workspaceRoot);
-    return json(result.code === 0
-        ? { success: true, worktreeDir, branch, resolvedBase: base }
-        : { success: false, error: result.stderr || result.stdout });
-}
-async function routeGitRemoveWorktree(request) {
-    const body = await readJsonBody(request);
-    const workspace = readString(body, 'workspace');
-    const worktreeDir = readString(body, 'worktreeDir');
-    if (!workspace)
-        return json({ success: false, error: 'workspace is required' }, { status: 400 });
-    if (!worktreeDir)
-        return json({ success: false, error: 'worktreeDir is required' }, { status: 400 });
-    return json(toMutationResult(await git(['worktree', 'remove', worktreeDir], workspace)));
+function optionalString(data, key) {
+    const value = readString(data, key);
+    return value ? { [key]: value } : {};
 }
 export async function readWorkspaceFileForDiffScope(workspace, filePath, scope) {
     if (scope !== 'staged')
@@ -618,30 +598,6 @@ function toMutationResult(result) {
     return result.code === 0
         ? { success: true, output: result.stdout || result.stderr }
         : { success: false, error: result.stderr || result.stdout };
-}
-async function resolveWorktreeTarget(workspaceRoot, dirName) {
-    if (isAbsolute(dirName))
-        return undefined;
-    if (dirName !== basename(dirName) || dirName.includes('\\'))
-        return undefined;
-    const worktreeParent = join(workspaceRoot, '.worktrees');
-    const lexicalTarget = resolveInside(worktreeParent, dirName);
-    if (!lexicalTarget)
-        return undefined;
-    try {
-        await mkdir(worktreeParent, { recursive: true });
-        const [realRoot, realParent] = await Promise.all([
-            realpath(workspaceRoot),
-            realpath(worktreeParent),
-        ]);
-        if (!isPathInside(realRoot, realParent))
-            return undefined;
-        const target = resolve(realParent, dirName);
-        return isPathInside(realParent, target) ? target : undefined;
-    }
-    catch {
-        return undefined;
-    }
 }
 function readStringArray(data, key) {
     const value = data[key];

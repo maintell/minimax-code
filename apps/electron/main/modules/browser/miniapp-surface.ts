@@ -1,6 +1,8 @@
+import { miniAppFileExtension } from "@mavis/shared/miniapp-surface";
 import { getConfig } from "@mavis/config";
 import { requestUtilityMiniApp, isUtilityRuntimeReady } from "../local-runtime/utility";
 import { destroyManagedMiniAppTabs, sleepManagedMiniAppTabs, getEmbeddedBrowserManager, miniAppTabClosedDuringRestoreError } from "./embedded-browser-manager";
+import { getMiniAppFileOpenBroker } from "./miniapp-file-open";
 import { parseMiniAppLoopbackOrigin } from "./miniapp-loopback-origin";
 // The surface request serially includes a Utility round trip; keep this well under the
 // broker's overall request deadline so a slow credential read never blocks an open or refresh.
@@ -165,6 +167,44 @@ export async function readRunningMiniAppCredential(pluginId, dependencies = { re
         return undefined;
     }
 }
+/** Validates a renderer file open against the summary Utility just returned; never trusts renderer-derived names. */
+export function resolveMiniAppFileOpen(summary, input) {
+    const handler = summary.fileHandlers?.find((candidate) => candidate.id === input.handlerId);
+    if (!handler)
+        return null;
+    const files = [];
+    for (const filePath of input.paths) {
+        const extension = miniAppFileExtension(filePath);
+        if (!extension || !handler.extensions.includes(extension))
+            return null;
+        const name = filePath.split(/[\\/]/u).pop() ?? filePath;
+        files.push({ path: filePath, name, extension });
+    }
+    return { handler, open: { handlerId: handler.id, files } };
+}
+function fileOpenMismatchError() {
+    return Object.assign(new Error('Mini App file open does not match a declared handler'), {
+        code: 'invalid_request',
+    });
+}
+/**
+ * Checks a file open against the Mini App's current summary without starting anything, so a stale
+ * renderer catalogue or a forged handler leaves no backend running without a page. `list` derives
+ * `fileHandlers` from the same package `open` will serve.
+ */
+async function checkFileOpenBeforeLaunch(pluginId, fileOpen, requestLaunch, signal) {
+    const result = await requestLaunch('list', undefined, signal);
+    signal.throwIfAborted();
+    if (!('miniApps' in result)) {
+        throw Object.assign(new Error('Mini App list was not returned'), { code: 'start_failed' });
+    }
+    const summary = result.miniApps.find((candidate) => candidate.pluginId === pluginId);
+    if (!summary) {
+        throw Object.assign(new Error('Mini App was not found'), { code: 'not_found' });
+    }
+    if (!resolveMiniAppFileOpen(summary, fileOpen))
+        throw fileOpenMismatchError();
+}
 /** Resolves private launch coordinates in Main and commits the managed native Browser tab. */
 export async function openManagedMiniAppSurface(input, dependencies = {
     isEnabled: () => getConfig().beta.filePanelBrowser === true,
@@ -172,6 +212,7 @@ export async function openManagedMiniAppSurface(input, dependencies = {
     openTab: (openInput) => getEmbeddedBrowserManager().openMiniAppTab(openInput),
     sleepingTab: (sessionId, pluginId) => getEmbeddedBrowserManager().sleepingMiniAppTab(sessionId, pluginId),
     isUtilityReady: isUtilityRuntimeReady,
+    deliverFileOpen: (tabId, open) => getMiniAppFileOpenBroker().deliver(tabId, open),
 }) {
     if (!dependencies.isEnabled()) {
         throw Object.assign(new Error('Mini App surface is unavailable'), {
@@ -200,6 +241,10 @@ export async function openManagedMiniAppSurface(input, dependencies = {
         ? AbortSignal.any([input.signal, bound.signal])
         : (bound?.signal ?? input.signal);
     return runManagedMiniAppLaunch(input.pluginId, async (signal) => {
+        if (input.fileOpen) {
+            await checkFileOpenBeforeLaunch(input.pluginId, input.fileOpen, dependencies.requestLaunch, signal);
+            assertGenerationCurrent(input.isGenerationCurrent);
+        }
         const attemptOpen = async () => {
             const result = await dependencies.requestLaunch(input.initiator === 'agent' ? 'openForAgent' : 'open', input.pluginId, signal);
             signal.throwIfAborted();
@@ -209,18 +254,26 @@ export async function openManagedMiniAppSurface(input, dependencies = {
                     code: 'start_failed',
                 });
             }
+            const fileOpen = input.fileOpen
+                ? resolveMiniAppFileOpen(result.miniApp, input.fileOpen)
+                : null;
+            if (input.fileOpen && !fileOpen) {
+                // The handlers changed between the check and the launch.
+                throw fileOpenMismatchError();
+            }
             // An @ of a sleeping App only needed its backend up: the tab stays asleep until the user
             // opens it. Decided on the record read above, not on whatever is left after the launch.
             if (input.keepSleepingTab && sleeping)
                 return sleeping.summary;
             // Opening the native tab is the commit point. Once it succeeds the visible
             // side effect is authoritative even if cancellation races with completion.
-            return dependencies.openTab({
+            const tab = await dependencies.openTab({
                 sessionId: input.sessionId,
                 miniApp: result.miniApp,
-                url: resolveMiniAppUrl(result.launch.origin, input.path ?? result.launch.surfacePath),
+                url: resolveMiniAppUrl(result.launch.origin, input.path ?? fileOpen?.handler.path ?? result.launch.surfacePath),
                 preserveCurrentUrl: input.path === undefined,
                 ...(input.restoreTabId !== undefined ? { restoreTabId: input.restoreTabId } : {}),
+                ...(input.present === false ? { present: false } : {}),
                 runId: result.launch.runId,
                 loopbackToken: result.launch.loopbackToken,
                 ...(result.launch.window ? { window: result.launch.window } : {}),
@@ -228,6 +281,10 @@ export async function openManagedMiniAppSurface(input, dependencies = {
                 ...(input.isGenerationCurrent ? { isGenerationCurrent: input.isGenerationCurrent } : {}),
                 readCredential: () => readRunningMiniAppCredential(input.pluginId, dependencies),
             });
+            if (fileOpen && tab.sleeping !== true) {
+                dependencies.deliverFileOpen?.(tab.tabId, fileOpen.open);
+            }
+            return tab;
         };
         // Every caller of this shared entry — manual IPC and Agent open alike — is protected against
         // dequeuing behind a plugin restart: the Browser manager rejects a stale launch instead of

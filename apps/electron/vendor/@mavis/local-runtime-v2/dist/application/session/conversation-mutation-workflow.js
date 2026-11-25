@@ -330,7 +330,7 @@ function forkBoundaryAvailability(boundary, sourceStatus, planActive = false) {
 function isCanonicalForkBoundaryMissing(boundary) {
     return !boundary.canonicalBoundaryReachable;
 }
-/** Downgrades an available boundary that `history.fork` would reject, e.g. a split tool call. */
+/** Downgrades an available boundary that `history.fork` would reject. */
 async function confirmForkHistoryBoundary(availability, sessionId, boundary, historyPreflight) {
     if (!availability.canFork || !boundary)
         return availability;
@@ -609,18 +609,38 @@ function isRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 function toAttachmentInput(attachment) {
+    const drive = editedDriveAssetFields(attachment);
     return {
         meta: {
-            attachmentType: attachment.type === 'image' ? 'image' : 'file',
+            attachmentType: editedAttachmentType(attachment),
             ...(attachment.fileName ? { fileName: attachment.fileName } : {}),
             ...(attachment.mimeType ? { mimeType: attachment.mimeType } : {}),
+            ...drive.meta,
         },
         local: {
             ...(attachment.filePath ? { filePath: attachment.filePath } : {}),
             ...(attachment.dataUrl ? { dataUrl: attachment.dataUrl } : {}),
             ...(attachment.assetId ? { assetId: attachment.assetId } : {}),
+            ...drive.local,
         },
     };
+}
+function editedDriveAssetFields(attachment) {
+    const driveNodeId = attachment.driveNodeId;
+    if (!driveNodeId)
+        return { meta: {}, local: {} };
+    return {
+        meta: attachment.sizeBytes !== undefined ? { sizeBytes: attachment.sizeBytes } : {},
+        local: {
+            driveNodeId,
+            ...(attachment.drivePath ? { drivePath: attachment.drivePath } : {}),
+        },
+    };
+}
+function editedAttachmentType(attachment) {
+    if (attachment.type === 'folder' && attachment.driveNodeId)
+        return 'folder';
+    return attachment.type === 'image' ? 'image' : 'file';
 }
 function toAgentHostAttachment(attachment) {
     const meta = attachment.meta ?? {};
@@ -631,6 +651,16 @@ function toAgentHostAttachment(attachment) {
         ...(attachment.local?.filePath ? { filePath: attachment.local.filePath } : {}),
         ...(attachment.local?.dataUrl ? { dataUrl: attachment.local.dataUrl } : {}),
         ...(attachment.local?.assetId ? { assetId: attachment.local.assetId } : {}),
+        ...agentHostDriveAssetFields(attachment.local, meta.sizeBytes),
+    };
+}
+function agentHostDriveAssetFields(local, sizeBytes) {
+    if (!local?.driveNodeId)
+        return {};
+    return {
+        driveNodeId: local.driveNodeId,
+        ...(local.drivePath ? { drivePath: local.drivePath } : {}),
+        ...(sizeBytes !== undefined ? { sizeBytes } : {}),
     };
 }
 function mapMutationError(error) {

@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { ConversationTurnRejectedError, } from '@mavis/conversation-contract';
 import { backgroundTaskNotificationReceiptId, } from '@mavis/agent-tools/desktop';
 export async function startConversationBackgroundTaskDeliveryTurn(input) {
-    const { host, conversation, ownerSessionId, tasks, batchTaskIds, observedTerminalCount, holdAtAdmission, } = input;
+    const { host, conversation, ownerSessionId, tasks, batchTaskIds, observedTerminalCount, replyChannel, holdAtAdmission, } = input;
     let held;
     try {
         const requestedTurnId = `turn_task_delivery_${randomUUID()}`;
@@ -15,6 +15,7 @@ export async function startConversationBackgroundTaskDeliveryTurn(input) {
                 batchTaskIds,
                 observedTerminalCount,
                 requestedTurnId,
+                ...(replyChannel ? { replyChannel } : {}),
             }),
             ...(holdAtAdmission
                 ? {
@@ -96,6 +97,8 @@ export function buildBackgroundTaskDeliveryInput(input) {
                 taskIds: input.tasks.map((task) => task.taskId),
                 observedTerminalCount: input.observedTerminalCount,
                 ...(displayTasks.length ? { tasks: displayTasks } : {}),
+                // Read back by the final-reply observer from the Turn's source; AgentHost drops it.
+                ...(input.replyChannel ? { replyChannel: input.replyChannel } : {}),
             },
         },
     };

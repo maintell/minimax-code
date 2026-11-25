@@ -25,6 +25,7 @@ export var SafetyAction;
     SafetyAction[SafetyAction["Block"] = 2] = "Block";
     SafetyAction[SafetyAction["Replace"] = 3] = "Replace";
     SafetyAction[SafetyAction["Guide"] = 4] = "Guide";
+    SafetyAction[SafetyAction["Unavailable"] = 5] = "Unavailable";
 })(SafetyAction || (SafetyAction = {}));
 export var ProtocolErrorCode;
 (function (ProtocolErrorCode) {
@@ -36,6 +37,10 @@ export var ProtocolErrorCode;
     ProtocolErrorCode[ProtocolErrorCode["ABORTED"] = 6] = "ABORTED";
     ProtocolErrorCode[ProtocolErrorCode["RUNTIME_UNAVAILABLE"] = 7] = "RUNTIME_UNAVAILABLE";
     ProtocolErrorCode[ProtocolErrorCode["INTERNAL"] = 8] = "INTERNAL";
+    ProtocolErrorCode[ProtocolErrorCode["RUN_TOKEN_INVALID"] = 40101] = "RUN_TOKEN_INVALID";
+    ProtocolErrorCode[ProtocolErrorCode["RUN_NOT_FOUND"] = 40401] = "RUN_NOT_FOUND";
+    ProtocolErrorCode[ProtocolErrorCode["LEASE_STALE"] = 40901] = "LEASE_STALE";
+    ProtocolErrorCode[ProtocolErrorCode["NOT_CONTINUABLE"] = 40903] = "NOT_CONTINUABLE";
     ProtocolErrorCode[ProtocolErrorCode["USAGE_LIMIT_EXCEEDED"] = 42212] = "USAGE_LIMIT_EXCEEDED";
     ProtocolErrorCode[ProtocolErrorCode["INTERNAL_ERROR"] = 50001] = "INTERNAL_ERROR";
     ProtocolErrorCode[ProtocolErrorCode["LLM_CREDITS_EXHAUSTED"] = 50110] = "LLM_CREDITS_EXHAUSTED";
@@ -45,6 +50,8 @@ export var ProtocolErrorCode;
     ProtocolErrorCode[ProtocolErrorCode["LLM_MIGRATION_ERROR"] = 50114] = "LLM_MIGRATION_ERROR";
     ProtocolErrorCode[ProtocolErrorCode["SAFETY_UNAVAILABLE"] = 50200] = "SAFETY_UNAVAILABLE";
     ProtocolErrorCode[ProtocolErrorCode["SAFETY_SENSITIVE"] = 50201] = "SAFETY_SENSITIVE";
+    ProtocolErrorCode[ProtocolErrorCode["HARNESS_SATURATED"] = 50301] = "HARNESS_SATURATED";
+    ProtocolErrorCode[ProtocolErrorCode["HARNESS_DRAINING"] = 50302] = "HARNESS_DRAINING";
     ProtocolErrorCode[ProtocolErrorCode["CORRUPTED_THINKING"] = 60001] = "CORRUPTED_THINKING";
 })(ProtocolErrorCode || (ProtocolErrorCode = {}));
 export var PermissionPolicyType;
@@ -106,6 +113,7 @@ export var AttachmentKind;
     AttachmentKind[AttachmentKind["IMAGE"] = 1] = "IMAGE";
     AttachmentKind[AttachmentKind["VIDEO"] = 2] = "VIDEO";
     AttachmentKind[AttachmentKind["AUDIO"] = 3] = "AUDIO";
+    AttachmentKind[AttachmentKind["FOLDER"] = 4] = "FOLDER";
 })(AttachmentKind || (AttachmentKind = {}));
 export var RuntimeActionType;
 (function (RuntimeActionType) {
@@ -185,6 +193,14 @@ export var SystemReminderFrequencyType;
     SystemReminderFrequencyType[SystemReminderFrequencyType["COOLDOWN"] = 4] = "COOLDOWN";
     SystemReminderFrequencyType[SystemReminderFrequencyType["ONE_SHOT"] = 5] = "ONE_SHOT";
 })(SystemReminderFrequencyType || (SystemReminderFrequencyType = {}));
+export var SafetyStage;
+(function (SafetyStage) {
+    SafetyStage[SafetyStage["INPUT"] = 1] = "INPUT";
+    SafetyStage[SafetyStage["OUTPUT"] = 2] = "OUTPUT";
+    SafetyStage[SafetyStage["THINKING"] = 3] = "THINKING";
+    SafetyStage[SafetyStage["TOOL_ARGS"] = 4] = "TOOL_ARGS";
+    SafetyStage[SafetyStage["TOOL_RESULT"] = 5] = "TOOL_RESULT";
+})(SafetyStage || (SafetyStage = {}));
 export var CommunicateSource;
 (function (CommunicateSource) {
     CommunicateSource[CommunicateSource["ToolCall"] = 1] = "ToolCall";
@@ -201,6 +217,40 @@ export var SafetyCheckVersion;
     SafetyCheckVersion[SafetyCheckVersion["V1"] = 1] = "V1";
     SafetyCheckVersion[SafetyCheckVersion["V2"] = 2] = "V2";
 })(SafetyCheckVersion || (SafetyCheckVersion = {}));
+export var HarnessBusyReason;
+(function (HarnessBusyReason) {
+    HarnessBusyReason[HarnessBusyReason["TURN"] = 1] = "TURN";
+    HarnessBusyReason[HarnessBusyReason["COMPACTION"] = 2] = "COMPACTION";
+    HarnessBusyReason[HarnessBusyReason["MATERIALIZE"] = 3] = "MATERIALIZE";
+    HarnessBusyReason[HarnessBusyReason["MUTATION"] = 4] = "MUTATION";
+})(HarnessBusyReason || (HarnessBusyReason = {}));
+export var HarnessResumeFrom;
+(function (HarnessResumeFrom) {
+    HarnessResumeFrom[HarnessResumeFrom["TAIL"] = 1] = "TAIL";
+    HarnessResumeFrom[HarnessResumeFrom["PENDING_TOOL_CALLS"] = 2] = "PENDING_TOOL_CALLS";
+})(HarnessResumeFrom || (HarnessResumeFrom = {}));
+export var HarnessContinuationState;
+(function (HarnessContinuationState) {
+    HarnessContinuationState[HarnessContinuationState["UNAVAILABLE"] = 0] = "UNAVAILABLE";
+    HarnessContinuationState[HarnessContinuationState["AVAILABLE"] = 1] = "AVAILABLE";
+    HarnessContinuationState[HarnessContinuationState["WAITING_FOR_USER"] = 3] = "WAITING_FOR_USER";
+})(HarnessContinuationState || (HarnessContinuationState = {}));
+export var HarnessYieldReason;
+(function (HarnessYieldReason) {
+    HarnessYieldReason[HarnessYieldReason["APPROVAL_HOLD"] = 3] = "APPROVAL_HOLD";
+    HarnessYieldReason[HarnessYieldReason["USER_INPUT_HOLD"] = 4] = "USER_INPUT_HOLD";
+})(HarnessYieldReason || (HarnessYieldReason = {}));
+export var HarnessAbortResult;
+(function (HarnessAbortResult) {
+    HarnessAbortResult[HarnessAbortResult["ABORTED"] = 1] = "ABORTED";
+    HarnessAbortResult[HarnessAbortResult["ALREADY_TERMINAL"] = 2] = "ALREADY_TERMINAL";
+    HarnessAbortResult[HarnessAbortResult["TIMEOUT"] = 3] = "TIMEOUT";
+})(HarnessAbortResult || (HarnessAbortResult = {}));
+export var HarnessMaterializeMode;
+(function (HarnessMaterializeMode) {
+    HarnessMaterializeMode[HarnessMaterializeMode["DISPATCH"] = 1] = "DISPATCH";
+    HarnessMaterializeMode[HarnessMaterializeMode["SUPPLEMENTAL"] = 2] = "SUPPLEMENTAL";
+})(HarnessMaterializeMode || (HarnessMaterializeMode = {}));
 export var RespDataType;
 (function (RespDataType) {
     RespDataType[RespDataType["AGENT_MESSAGE"] = 2] = "AGENT_MESSAGE";

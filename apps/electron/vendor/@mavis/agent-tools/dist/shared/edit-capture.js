@@ -1,4 +1,4 @@
-import { access, readFile, realpath, writeFile } from './physical-fs.js';
+import { physicalToolFs } from './physical-fs.js';
 /**
  * Captures the exact pre-edit file inside Pi's mutation-queue critical section.
  * The helper is created per execute, so concurrent agents cannot exchange
@@ -8,23 +8,29 @@ import { access, readFile, realpath, writeFile } from './physical-fs.js';
  * matched the file before Pi read it; otherwise the record stays stale (or
  * absent) and a later overwrite asks for a fresh read. Edit itself never
  * requires a read.
+ *
+ * Core tools pass their host fs port, on which the desktop host also carries
+ * `tracking`; without a port the physical filesystem is used.
  */
-export function createCapturingEditOperations(tracking) {
+export function createCapturingEditOperations(options = {}) {
+    const { tracking } = options;
+    const fs = 'writeFile' in options ? options : physicalToolFs;
     const pendingReads = new Map();
     const recordCurrent = new Map();
     const captures = new Map();
     const operations = {
-        realpath,
-        access,
+        realpath: (path) => fs.realpath(path),
+        access: (path) => fs.access(path),
         async readFile(path) {
             if (tracking)
                 recordCurrent.set(path, await tracking.isRecordCurrent(path));
-            const buffer = await readFile(path);
+            const buffer = await fs.readFile(path);
             pendingReads.set(path, buffer);
             return buffer;
         },
         async writeFile(path, content) {
-            await writeFile(path, content, 'utf8');
+            tracking?.beforeWrite?.(path);
+            await fs.writeFile(path, content);
             if (tracking && recordCurrent.get(path) === true)
                 await tracking.refresh(path);
             const original = pendingReads.get(path);

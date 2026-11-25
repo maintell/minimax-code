@@ -1,5 +1,6 @@
 import { getConfig } from '@mavis/config';
 import { mkdir } from 'node:fs/promises';
+import { canonicalProjectWorkspaceDir } from '../../shared/workspace.js';
 import { SessionServiceError } from '../errors.js';
 import { SessionRecordService, } from '../lifecycle/record-service.js';
 import { SessionUniqueViolation } from '../repo/contract.js';
@@ -18,8 +19,12 @@ import { CURRENT_SESSION_DATA_VERSION } from './version.js';
  */
 async function resolveSessionProject(projects, input, nowMs) {
     const named = input.projectWorkspaceDir;
-    if (!named)
-        return projects.ensureByWorkspaceDir(input.workspaceDir, nowMs());
+    if (!named) {
+        // The same directory the session row stores, so a worktree outside the
+        // repository resolves to the repository's Project.
+        const workspaceDir = canonicalProjectWorkspaceDir(input.workspaceDir, input.runLocation) ?? input.workspaceDir;
+        return projects.ensureByWorkspaceDir(workspaceDir, nowMs());
+    }
     return (await projects.getByWorkspaceDir(named)) ?? projects.ensureByWorkspaceDir(named, nowMs());
 }
 export function createNativeSessionRecordService(options) {
@@ -66,11 +71,12 @@ export function createNativeSessionRecordService(options) {
             },
         },
         runLocation: options.runLocation ?? {
-            resolve: async (value, workspaceDir) => {
+            resolve: async (value, workspaceDir, resolveOptions) => {
                 const input = readLocalRunLocationInput(value);
                 return input
                     ? applyLocalRunLocation(input, workspaceDir, nowMs, {
                         refreshBeforeCreate: getConfig().worktreeRefreshBeforeCreate,
+                        workspaceDirImplicit: resolveOptions?.workspaceDirImplicit === true,
                         ...(options.worktreeProgress ? { onWorktreeProgress: options.worktreeProgress } : {}),
                     })
                     : undefined;

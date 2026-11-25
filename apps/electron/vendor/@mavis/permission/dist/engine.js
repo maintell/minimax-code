@@ -20,6 +20,7 @@ import { hasWholeToolRule, isBypassMode, isInteractiveTool } from './context.js'
 import { decideUnknownToolPathCapabilities } from './tools/path-capability.js';
 import { reducePermissionDecision } from './permission-core.js';
 import { extractToolInputContent, matchesContentAskRule } from './content-ask-rule.js';
+import { decideMcpAllow, findMcpSubjectRule } from './mcp-rule-subject.js';
 // ---------------------------------------------------------------------------
 // Rule matching helpers (content-specific rules)
 // ---------------------------------------------------------------------------
@@ -129,6 +130,7 @@ export class PermissionEngine {
             checkerRegistered: Boolean(checker),
             ...(checkerResult ? { checkerResult } : {}),
             ...(checkerError !== undefined ? { checkerError } : {}),
+            ...(options.mcpRuleSubject ? { mcpRuleSubject: options.mcpRuleSubject } : {}),
         });
     }
     checkPermissionWithEngine(toolName, 
@@ -146,7 +148,8 @@ export class PermissionEngine {
             return { behavior: 'deny', reason: { type: 'rule', rule: denyRule } };
         }
         // Also check MCP server-level deny rules
-        const mcpDenyRule = this.findMcpServerRule(toolName, context, 'deny');
+        const mcpDenyRule = this.findMcpServerRule(toolName, context, 'deny') ??
+            findMcpSubjectRule(options.mcpRuleSubject, context, 'deny');
         if (mcpDenyRule) {
             logger.debug(ctx, `Step 1a: Tool denied by MCP server deny rule: toolName=${toolName}`);
             return { behavior: 'deny', reason: { type: 'rule', rule: mcpDenyRule } };
@@ -193,7 +196,8 @@ export class PermissionEngine {
             }
         }
         // Also check MCP server-level ask rules
-        const mcpAskRule = this.findMcpServerRule(toolName, context, 'ask');
+        const mcpAskRule = this.findMcpServerRule(toolName, context, 'ask') ??
+            findMcpSubjectRule(options.mcpRuleSubject, context, 'ask');
         if (mcpAskRule) {
             logger.debug(ctx, `Step 1b: Tool requires ask by MCP server ask rule: toolName=${toolName}`);
             return {
@@ -298,25 +302,14 @@ export class PermissionEngine {
                 rewrittenInput: toolCheckResult?.rewrittenInput,
             };
         }
-        // 2b. Whole tool in allow rules? → ALLOW
-        const allowRule = hasWholeToolRule(context, toolName, 'allow');
-        if (allowRule) {
-            logger.debug(ctx, `Step 2b: Tool allowed by whole-tool allow rule: toolName=${toolName}`);
-            return {
-                behavior: 'allow',
-                reason: { type: 'rule', rule: allowRule },
-                rewrittenInput: toolCheckResult?.rewrittenInput,
-            };
-        }
-        // Also check MCP server-level allow rules
-        const mcpAllowRule = this.findMcpServerRule(toolName, context, 'allow');
-        if (mcpAllowRule) {
-            logger.debug(ctx, `Step 2b: Tool allowed by MCP server allow rule: toolName=${toolName}`);
-            return {
-                behavior: 'allow',
-                reason: { type: 'rule', rule: mcpAllowRule },
-                rewrittenInput: toolCheckResult?.rewrittenInput,
-            };
+        // 2b. Whole tool or MCP server / identity allow rule? → ALLOW (a preview may degrade to ASK)
+        const allowDecision = decideMcpAllow(options.mcpRuleSubject, context, (scope) => hasWholeToolRule(scope, toolName, 'allow') ??
+            this.findMcpServerRule(toolName, scope, 'allow'));
+        if (allowDecision) {
+            logger.debug(ctx, `Step 2b: allow rule decided: toolName=${toolName}`);
+            return allowDecision.behavior === 'allow'
+                ? { ...allowDecision, rewrittenInput: toolCheckResult?.rewrittenInput }
+                : { ...allowDecision, ruleContents: this.resolveRuleContents(toolName, input) };
         }
         // If the tool checker returned allow, use it
         if (toolCheckResult && toolCheckResult.behavior === 'allow') {

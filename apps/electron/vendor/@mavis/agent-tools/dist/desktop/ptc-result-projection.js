@@ -108,6 +108,7 @@ export function sanitizePtcChildExecutionDetailsForSafety(details) {
     };
 }
 function safeEvidenceRecord(record) {
+    // A stored record already passed the projection; applying it again only narrows it.
     const input = projectDesktopPtcEvidenceInput({
         childToolCallId: record.child_tool_call_id,
         parentToolCallId: record.parent_tool_call_id,
@@ -231,6 +232,56 @@ function safeEvidenceText(value) {
 }
 const TRUNCATED = { state: 'truncated' };
 const COMPLETE = { state: 'complete' };
+/**
+ * Namespaced desktop tools whose results come from `desktopToolOk`
+ * (desktop/desktop-tool-result.ts). Keep in step with that helper's callers:
+ * an unregistered name keeps `r.status` at `unverified` inside run_code.
+ */
+const NAMESPACED_DESKTOP_TOOLS = [
+    'project_list',
+    'project_archive_sessions',
+    'project_create',
+    'project_rename',
+    'project_remove',
+    'sidebar_read',
+    'sidebar_pin',
+    'section_list',
+    'section_create',
+    'section_rename',
+    'section_delete',
+    'section_move_session',
+    'section_move_project',
+    'section_reorder',
+    'agent_list',
+    'agent_get',
+    'agent_create',
+    'agent_update',
+    'agent_delete',
+    'session_list',
+    'session_get',
+    'session_update',
+    'session_messages',
+    'session_send',
+    'session_interrupt',
+    'mcp_server_list',
+    'mcp_server_get',
+    'mcp_server_create',
+    'mcp_server_update',
+    'mcp_server_delete',
+    'pinned_reorder',
+    'session_mark_read',
+    'sidebar_preferences_update',
+    'session_open',
+    'session_fork',
+    'session_wait',
+    'usage_get',
+    'app_update_check',
+    'plugin_list',
+    'plugin_set_enabled',
+    'plugin_uninstall',
+    'panel_open_file',
+    'panel_open_review',
+];
 /** Native Computer Use tools, registered by local-runtime-v2 service/computer-use/tools.ts. */
 const COMPUTER_USE_TOOLS = [
     'computer_app_list',
@@ -311,6 +362,12 @@ const VERIFIED_TOOL_MARKERS = new Map([
     // their text except by omitting a large application menu from
     // computer_app_state, which the tool reports itself as truncated.
     ...COMPUTER_USE_TOOLS.map((name) => [name, () => []]),
+    // Namespaced desktop tools (desktop/local-sidebar-tools.ts and the tools that
+    // follow it) build every result with desktopToolOk, which writes no
+    // tool-specific cut marker: a paged list reports the next page through
+    // `programmatic.completeness.hasMore`, and any real cut comes from the shared
+    // Desktop output limit, which writes the generic marker.
+    ...NAMESPACED_DESKTOP_TOOLS.map((name) => [name, () => []]),
 ]);
 /**
  * The single completeness decision shared by the guest `truncation` field,

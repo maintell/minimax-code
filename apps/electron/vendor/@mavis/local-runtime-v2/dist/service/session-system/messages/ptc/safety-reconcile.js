@@ -1,56 +1,16 @@
 import { readPtcChildExecutionDetails, readPtcExecutionDetails, } from '@mavis/agent-core/tools';
 import { sanitizePtcChildExecutionDetailsForSafety, sanitizePtcExecutionDetailsForSafety, } from '@mavis/agent-tools/desktop';
 import { logger } from '@mavis/shared/local-runtime-logging';
-import { renderPtcExecutionEvidence } from './crash-recovery.js';
+import { renderPtcExecutionEvidence } from '@mavis/harness';
 const WITHHELD_PROGRAM = {
     code: '/* Program source withheld after safety review. */',
     description: 'PTC execution evidence retained after safety review',
 };
-export function sanitizePtcSafetyHistoryMessage(message) {
-    if (typeof message.timestamp !== 'number') {
-        if (message.role === 'compactionSummary')
-            return message;
-        throw new TypeError('Canonical safety message timestamp is invalid.');
-    }
-    if (message.role === 'assistant')
-        return safeAssistantMessage(message, message.timestamp);
-    return safeToolResultMessage(message, message.timestamp);
-}
-function safeAssistantMessage(message, timestamp) {
-    const calls = Array.isArray(message.content) ? message.content.filter(isToolCall) : [];
-    if (calls.length === 0)
-        return undefined;
-    return {
-        ...pickFields(message, ['api', 'provider', 'model', 'usage', 'stopReason']),
-        role: 'assistant',
-        timestamp,
-        content: calls.map((call) => ({
-            type: 'toolCall',
-            id: call.id,
-            name: call.name,
-            arguments: call.name === 'run_code' ? { ...WITHHELD_PROGRAM } : call.arguments,
-        })),
-    };
-}
-function safeToolResultMessage(message, timestamp) {
-    const details = readPtcExecutionDetails(message);
-    if (!details && !(message.role === 'toolResult' && message.toolName === 'run_code'))
-        return message;
-    const safe = details ? safeOuterDetails(details) : undefined;
-    return {
-        ...pickFields(message, ['toolCallId', 'toolName', 'isError', 'timestamp']),
-        role: 'toolResult',
-        timestamp,
-        content: [
-            {
-                type: 'text',
-                text: safe?.host_forced_content ??
-                    'PTC output was withheld after safety review. Execution facts are unavailable; verify effects before retrying.',
-            },
-        ],
-        ...(safe ? { details: { ptc: safe } } : {}),
-    };
-}
+/**
+ * The canonical-history half of the fold now lives in `@mavis/harness`, shared
+ * with cloud-harness-server; the display projection below stays desktop-only.
+ */
+export { sanitizePtcSafetyHistoryMessage } from '@mavis/harness';
 /**
  * Old display metadata must not reintroduce rejected text on a later restart.
  * @internal Exported for focused tests.
@@ -189,12 +149,6 @@ function safeOuterDetails(details) {
 }
 function pickFields(value, fields) {
     return Object.fromEntries(fields.flatMap((field) => (value[field] === undefined ? [] : [[field, value[field]]])));
-}
-function isToolCall(value) {
-    return (isRecord(value) &&
-        value.type === 'toolCall' &&
-        typeof value.id === 'string' &&
-        typeof value.name === 'string');
 }
 function isRecord(value) {
     return value !== null && typeof value === 'object' && !Array.isArray(value);

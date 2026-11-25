@@ -15,6 +15,7 @@ import { LocalFeishuChannelStore, feishuClientId, } from '../transport/feishu/fe
 import { LocalFeishuChannelApi } from '../delivery/legacy-http/platform-api/feishu-api.js';
 import { LocalFeishuChannelClient } from '../transport/feishu/outbound/feishu-outbound-client.js';
 import { FeishuPlatformAdapter } from '../transport/feishu/feishu-adapter.js';
+import { FeishuPendingThinkingStore } from '../transport/feishu/outbound/feishu-pending-thinking.js';
 import { LocalTelegramChannelStore, telegramClientId, } from '../transport/telegram/telegram-store.js';
 import { LocalTelegramChannelApi } from '../delivery/legacy-http/platform-api/telegram-api.js';
 import { TelegramPlatformAdapter } from '../transport/telegram/telegram-adapter.js';
@@ -86,9 +87,10 @@ function buildFeishuArm(input) {
     const feishuWsClientsEnabled = feishuWsEnabled && input.adapterRegistry !== undefined;
     const feishuPendingQuestionnaires = new Map();
     const feishuPendingPermissions = new Map();
-    // Shared per-chat map of "🤔 思考中…" cards the WS dispatcher renders so
-    // the outbound client can PATCH them into the final green reply card.
-    const feishuPendingThinkingCards = new Map();
+    // Shared per-inbound-message map of "🤔 思考中…" cards the WS dispatcher
+    // renders, so an outbound send only ever PATCHes the card of the message it
+    // answers — never a sibling that is still waiting in the queue.
+    const feishuPendingThinkingCards = new FeishuPendingThinkingStore();
     // Shared per-inbound-message map of 👀 `OnIt` ack reactions the WS
     // dispatcher posts so the outbound side can revoke them once the final
     // reply has been delivered.

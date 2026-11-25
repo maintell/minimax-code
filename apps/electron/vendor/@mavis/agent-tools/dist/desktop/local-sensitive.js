@@ -23,11 +23,11 @@ export function isSensitiveSearchPath(path) {
         : matcher.match(normalized) ||
             matcher.match(`${normalized}/__mavis_sensitive_root_probe__`));
 }
-export async function isSensitiveSearchRoot(path) {
+export async function isSensitiveSearchRoot(path, realpathFn = realpath) {
     if (isSensitiveSearchPath(path))
         return true;
     try {
-        return isSensitiveSearchPath(await realpath(path));
+        return isSensitiveSearchPath(await realpathFn(path));
     }
     catch {
         return false;

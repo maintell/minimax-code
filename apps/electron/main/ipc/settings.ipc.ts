@@ -3,6 +3,7 @@
  * 处理托盘、开机自启动、全局快捷键、通知等设置
  *
  */
+import { resolveShortcutBindings } from "@mavis/shared/keyboard-shortcuts";
 import os from "os";
 import path from "path";
 import { execFile } from "node:child_process";
@@ -21,6 +22,16 @@ import { clearDataDirEnv, getLocalRuntimeDataDirInfo, relocateLocalRuntimeDataDi
 import { queueFileOpenWithRegistration } from "../modules/file-open-with";
 import { takeDataDirRollbackNotice, setDataDirRelocationGuardRelaunch } from "../modules/local-runtime/data-dir-relocation-guard";
 import { getIsEn } from "../utils/tool";
+import { getArchonMiniChatWindow } from "../windows/archonMiniChatWindow";
+import { registerCaptureShortcut, unregisterCaptureShortcut } from "../modules/screenshot/shortcut";
+function screenshotBindings(overrides = {}) {
+    return resolveShortcutBindings('composer.screenshot', overrides, process.platform === 'darwin' ? 'mac' : 'windows');
+}
+function registerScreenshotShortcut(bindings) {
+    if (windowManager.getWindowType() !== 'archon')
+        return true;
+    return registerCaptureShortcut(() => [windowManager.getWindowByType('archon'), getArchonMiniChatWindow()], bindings);
+}
 let localRuntimeDataDirRelocationInProgress = false;
 /** Only installed Windows builds own the registry entries this setting changes. */
 function supportsFileOpenWithEnhanced() {
@@ -76,7 +87,10 @@ export function registerGlobalShortcuts() {
             logger.info(`[Desktop Settings] Registered MiniChat shortcut: ${miniChatShortcut} (${windowType} mode)`);
         }
     }
-    // 如果需要注册更多快捷键，可以在这里添加
+    if (!registerScreenshotShortcut(screenshotBindings(config.shortcutOverrides))) {
+        logger.warn('[Desktop Settings] Screenshot shortcut is unavailable');
+        allSuccess = false;
+    }
     return allSuccess;
 }
 /**
@@ -87,6 +101,7 @@ export function registerGlobalShortcuts() {
  * 行为未定义,显式跳过更稳。
  */
 export function unregisterGlobalShortcuts() {
+    unregisterCaptureShortcut();
     const globalAccessShortcut = getDesktopConfig().globalAccessShortcut || {};
     // 遍历所有配置的快捷键值并取消注册
     Object.values(globalAccessShortcut).forEach((shortcutKey) => {
@@ -164,6 +179,21 @@ export function applyShortcutOverrides(overrides, enabled) {
                 overrides: previousOverrides,
             };
         }
+    }
+    const nextBindings = screenshotBindings(overrides);
+    const previousBindings = screenshotBindings(previousOverrides);
+    const captureChanged = currentConfig.shortcutsEnabled === false ||
+        nextBindings.length !== previousBindings.length ||
+        nextBindings.some((key, i) => key !== previousBindings[i]);
+    if (!nextEnabled) {
+        unregisterCaptureShortcut();
+    }
+    else if (captureChanged && !registerScreenshotShortcut(nextBindings)) {
+        if (previousMiniChat !== nextMiniChat) {
+            unregisterShortcut(nextMiniChat);
+            registerMiniChatShortcut(previousMiniChat);
+        }
+        return { success: false, error: 'global_registration_failed', overrides: previousOverrides };
     }
     const nextGlobalAccess = { ...previousGlobalAccess };
     if (nextMiniChat) {

@@ -24,6 +24,7 @@ import { UtilityPptPreviewRenderClient } from "./ppt-preview-render-broker";
  */
 import dns from "dns";
 import { getHeapStatistics } from "node:v8";
+import { setConfigIssueReporter, getBunnyMissingPolicy } from "@mavis/config";
 import { DEFAULT_COLLECTION_POLICY } from "@mavis/shared/collection-policy";
 import { resolveProductBuildIdentity } from "@mavis/shared/product-build-identity";
 import { resolveLocalRuntimeV2DirectoryContract } from "../v2-paths";
@@ -65,6 +66,13 @@ function reportBootstrapProgress(stage) {
 // First executable statement of the child: proves the fork produced a running
 // Node context before any heavy module work begins.
 reportBootstrapProgress('node-entry');
+// This process has no UI: leave a trace in main's log (via stderr) when
+// config.yaml fell back to defaults. Kinds and sections only, never values.
+setConfigIssueReporter((issues) => {
+    console.warn(`[config] config.yaml fell back to defaults: ${issues
+        .map((issue) => (issue.section ? `${issue.kind}:${issue.section}` : issue.kind))
+        .join(', ')}`);
+});
 const useVitestImport = process.env.VITEST === 'true';
 const EVAL_REPORTER_REQUEST_TIMEOUT_MS = 3500;
 const EVAL_REPORTER_FLUSH_TIMEOUT_MS = 4000;
@@ -141,13 +149,27 @@ let networkServiceAwareFetch = null;
 function createUtilityFetchAdapter() {
     const electronFetch = resolveElectronNetFetch(reportElectronNetFetchDiagnostic);
     if (electronFetch) {
-        networkServiceAwareFetch = createNetworkServiceAwareFetch(electronFetch, () => createUtilityProxyFetch(process.env, warn));
+        networkServiceAwareFetch = createNetworkServiceAwareFetch(electronFetch, () => createUtilityProxyFetch(process.env, warn), { onFallbackUnhealthy: reportNetworkFallbackUnhealthy });
         if (networkServiceGone && networkServiceAwareFetch.fallbackToNodeFetch()) {
             warn('network service gone before prepare; runtime fetch switched to Node fetch');
         }
         return networkServiceAwareFetch;
     }
     return createUtilityProxyFetch(process.env, warn);
+}
+/** Asks Main to refork onto Electron `net` once Node fetch keeps failing. */
+function reportNetworkFallbackUnhealthy(origin) {
+    warn('runtime fetch keeps failing on Node fetch after network service restart');
+    try {
+        const message = {
+            type: 'runtime-network-fallback-unhealthy',
+            origin,
+        };
+        process.parentPort?.postMessage(message);
+    }
+    catch {
+        // Recovery is best-effort; the request outcome is already decided.
+    }
 }
 /**
  * The Network Service restarted under this utility; Electron `net` here may be
@@ -220,7 +242,8 @@ async function prepareRuntimeWithProxyFetch(init, brokers, proxyFetch, transferr
     let contextWindowUsageEnabled = init.contextWindowUsageEnabled !== false;
     let runawayGuardConfig = init.runawayGuardConfig ?? {};
     let promptSuggestionPolicy = init.promptSuggestionPolicy ?? {};
-    let bunnyPolicy = init.bunnyPolicy ?? {};
+    // No policy from main (an older main, or none yet): inside/prod packages fail closed.
+    let bunnyPolicy = init.bunnyPolicy ?? getBunnyMissingPolicy();
     let toolResultCompactionConfig = init.toolResultCompactionConfig ?? {};
     let bunnyContextConfig = init.bunnyContextConfig ?? {};
     // Main only ever sends a complete, validated policy. An older main that sends

@@ -115,7 +115,6 @@ bindLate) {
                 bunnyDb: input.options.bunnyDb,
                 dataDir: input.options.dataDir,
                 activeTurnId: (sessionId) => input.owners.turnSystem.inspection?.activeTurnId(sessionId),
-                ensureDefaultSpace: () => input.sessionSystem.artifactCatalog.library.ensureDefault(),
                 // Absent on the embedded CLI, which has no Cron owner; the reset then reports 0 routines.
                 deleteRoutine: cron
                     ? async (cronId) => {

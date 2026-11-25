@@ -460,6 +460,18 @@ class DrizzleMessageRepository {
             .get();
         return row ? decodeMessageSource(row) : undefined;
     }
+    async findFirstUserMessage(sessionId, options = {}) {
+        this.ensureReady(sessionId);
+        const afterId = this.visibleBoundaryId(sessionId, options.afterMessageId);
+        const row = this.options.db
+            .select()
+            .from(messageRows)
+            .where(and(eq(messageRows.sessionId, sessionId), eq(messageRows.role, 'user'), sql `coalesce(json_extract(${messageRows.dataJson}, '$.kind'), '') NOT IN (${INPUT_REJECTED_DISPLAY_KIND}, ${UNDELIVERED_USER_MESSAGE_KIND})`, afterId === undefined ? undefined : gt(messageRows.id, afterId)))
+            .orderBy(asc(messageRows.id))
+            .limit(1)
+            .get();
+        return row ? decodeDisplayMessage(row) : undefined;
+    }
     async latestDisplayRowId(sessionId) {
         this.ensureReady(sessionId);
         return (this.options.db
@@ -708,9 +720,9 @@ function normalizedFromRow(row) {
 function unconsumedSteeringTransfer(stored, intended, input) {
     if (stored.role !== 'user')
         return undefined;
-    const oldData = parseJsonRecord(stored.dataJson);
-    if (!canTransferUnconsumedDisplay(stored, oldData, input))
+    if (!canTransferUnconsumedDisplay(stored, input))
         return undefined;
+    const oldData = parseJsonRecord(stored.dataJson);
     const newData = parseJsonRecord(intended.dataJson);
     const samePayload = { ...newData };
     for (const field of ['kind', 'query_key', 'turnId']) {
@@ -735,10 +747,16 @@ function unconsumedSteeringTransfer(stored, intended, input) {
         }),
     };
 }
-function canTransferUnconsumedDisplay(stored, data, input) {
+/**
+ * The requeue names the Turns that never consumed this message, so their row
+ * may move to the Turn that finally runs it. How the row was displayed does not
+ * matter: a teardown that could not finish leaves a peer message's row in its
+ * own display kind, not `steered_user`, and refusing it would conflict forever.
+ */
+function canTransferUnconsumedDisplay(stored, input) {
     const turnId = stored.turnId ?? '';
     return (input.unstartedFromTurnIds?.includes(turnId) === true ||
-        (data.kind === 'steered_user' && input.unconsumedFromTurnIds?.includes(turnId) === true));
+        input.unconsumedFromTurnIds?.includes(turnId) === true);
 }
 function sameUserMessageCommit(stored, intended) {
     return JSON.stringify(commitIdentity(stored)) === JSON.stringify(commitIdentity(intended));

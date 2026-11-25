@@ -278,6 +278,8 @@ export class LocalRuntimeUtilityProcessManager {
         this.lastRuntimeHealthSequence = -1;
         this.consecutiveMemoryPressureSamples = 0;
         this.proactiveRecoveryAttempts = 0;
+        /** Child whose Node fetch fallback is being checked against Main's `net`. */
+        this.networkProbeChild = null;
         this.pendingAuthRotations = new Map();
         this.pendingLogFlushes = new Map();
         this.pendingRuntimeReports = new Map();
@@ -1309,6 +1311,10 @@ export class LocalRuntimeUtilityProcessManager {
         this.state = { phase: 'stopped' };
         if (quarantine.afterExit !== 'restart' || !quarantine.recoveryReasonCode)
             return;
+        if (quarantine.recoveryReasonCode === 'network_service_lost') {
+            this.scheduleRestart(false);
+            return;
+        }
         this.scheduleProactiveRestart(quarantine.startupToken, quarantine.recoveryReasonCode);
     }
     /**
@@ -1676,6 +1682,10 @@ export class LocalRuntimeUtilityProcessManager {
             }
             if (raw.type === 'runtime-workspace-indexing-observation') {
                 this.notifyHost('onWorkspaceIndexingObservation', () => this.options.onWorkspaceIndexingObservation?.(raw));
+                return;
+            }
+            if (raw.type === 'runtime-network-fallback-unhealthy') {
+                this.handleNetworkFallbackUnhealthy(child, startupToken, raw.origin);
                 return;
             }
             if (raw.type === 'runtime-power-demand') {
@@ -2084,6 +2094,38 @@ export class LocalRuntimeUtilityProcessManager {
             return;
         this.requestRuntimeRecovery(child, startupToken, 'memory_pressure', `heap usage ${Math.round(ratio * 100)}% exceeded ${Math.round(threshold * 100)}% threshold`);
     }
+    /**
+     * The utility's Node fetch fallback keeps failing after a Network Service
+     * restart. Refork onto Electron `net` once Main's own `net` can reach the
+     * origin; while Main cannot either the machine is offline and a refork
+     * would only interrupt work, so wait for the utility's next report.
+     */
+    handleNetworkFallbackUnhealthy(child, startupToken, origin) {
+        const state = this.state;
+        if (state.phase !== 'ready' || state.child !== child)
+            return;
+        if (this.networkProbeChild === child)
+            return;
+        const logger = this.options.logger ?? noopLogger;
+        const probe = this.options.probeNetworkReachable;
+        if (!probe) {
+            this.requestRuntimeRecovery(child, startupToken, 'network_service_lost', 'runtime fetch fallback keeps failing after network service restart');
+            return;
+        }
+        this.networkProbeChild = child;
+        void Promise.resolve()
+            .then(() => probe(origin))
+            .catch(() => false)
+            .then((reachable) => {
+            if (this.networkProbeChild === child)
+                this.networkProbeChild = null;
+            if (!reachable) {
+                logger.warn('[UtilityRuntime] runtime fetch fallback failing but Main net cannot reach the origin either; keeping utility');
+                return;
+            }
+            this.requestRuntimeRecovery(child, startupToken, 'network_service_lost', 'runtime fetch fallback keeps failing while Main net reaches the origin');
+        });
+    }
     requestRuntimeRecovery(child, startupToken, reasonCode, detail) {
         const state = this.state;
         if (state.phase !== 'ready' || state.child !== child)
@@ -2106,7 +2148,11 @@ export class LocalRuntimeUtilityProcessManager {
             this.restartAttempts = 0;
             this.crashLoopReforks = 0;
         }
-        this.proactiveRecoveryAttempts += 1;
+        // A Network Service restart is external and one refork fixes it, so it
+        // neither spends nor waits for the budget that guards self-inflicted
+        // recycles (memory pressure, unresponsive, OOM).
+        if (reasonCode !== 'network_service_lost')
+            this.proactiveRecoveryAttempts += 1;
         this.quarantineChild(child, startupToken, {
             afterExit: 'restart',
             terminalFailure: null,

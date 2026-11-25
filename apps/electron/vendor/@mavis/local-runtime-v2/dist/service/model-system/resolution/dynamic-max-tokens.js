@@ -1,6 +1,6 @@
 import { streamSimple } from '@earendil-works/pi-ai';
 import { LLM_RETRY_CALL_IDENTITY } from '@mavis/agent-core/pi-turn-runner';
-import { createDefaultTokenEstimator, resolveCompactionTokenBudget, resolveDynamicMaxTokens, } from '@mavis/context-manager';
+import { countMessagesWithVisualPricing, createDefaultTokenEstimator, resolveCompactionTokenBudget, resolveDynamicMaxTokens, } from '@mavis/context-manager';
 const MIN_OUTPUT_TOKENS = 1_024;
 const EMERGENCY_OUTPUT_TOKENS = 1;
 const PI_DEFAULT_THINKING_BUDGETS = {
@@ -9,7 +9,29 @@ const PI_DEFAULT_THINKING_BUDGETS = {
     medium: 8_192,
     high: 16_384,
 };
-function estimatePiContextTokens(context) {
+/**
+ * Estimates the input the Provider will bill for this request.
+ *
+ * Message tokens go through {@link countMessagesWithVisualPricing}, the same
+ * function the compaction trigger, checkpoint candidate selection and the
+ * context-usage donut use. The shared estimator alone charges every visual
+ * block a flat 4_800-token stand-in; a 640x480 screenshot really costs 414, so
+ * the flat value ran ~11.6x high and clamped `maxTokens` to the 16_384 floor on
+ * image-heavy sessions whose real context was under 10% of the window.
+ *
+ * No extra projection happens here: `context.messages` is already the outbound
+ * message list pi built for this call, so the trigger's
+ * `projectAgentMessagesForModel` step has already run. What had to become the
+ * same source is the pricing, not a second projection pass.
+ *
+ * The Provider usage anchor the compaction trigger prefers is deliberately
+ * absent. `withLocalDynamicMaxTokens` is a synchronous `StreamFn` wrapper whose
+ * only inputs are (model, context, options) - there is no session, history
+ * epoch or anchor channel to read a measured prompt from - so the anchored half
+ * of the trigger's identity is architecturally unreachable here and this stays
+ * a local estimate.
+ */
+function estimatePiContextTokens(context, model) {
     const estimator = createDefaultTokenEstimator();
     const messages = [...(context.messages ?? [])];
     const systemTokens = context.systemPrompt
@@ -17,7 +39,7 @@ function estimatePiContextTokens(context) {
         : 0;
     const toolTokens = (context.tools ?? []).reduce((tokens, tool) => tokens +
         estimator.estimateTextTokens([tool.name ?? '', tool.description ?? '', safeJson(tool.parameters)].join('\n')), 0);
-    return estimator.estimateMessages(messages) + systemTokens + toolTokens;
+    return countMessagesWithVisualPricing(messages, model) + systemTokens + toolTokens;
 }
 /**
  * Hard input admission limit of a model window, the same value automatic
@@ -60,7 +82,7 @@ function resolveCallBudget(input) {
         const desired = resolveDynamicMaxTokens({
             contextWindow: input.contextWindow,
             configuredMaxTokens: input.configured,
-            estimatedContextTokens: estimatePiContextTokens(input.context),
+            estimatedContextTokens: estimatePiContextTokens(input.context, input.model),
         });
         if (desired >= input.configured) {
             return { maxTokens: input.configured, disableReasoning: false };

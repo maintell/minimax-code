@@ -1,6 +1,6 @@
 import { currentBetaResolutionContext, resolveBetaFeature } from '@mavis/config';
+import { PtcSessionStore, } from '@mavis/harness';
 import { createPtcStoreTempFiles } from '../../sandbox/index.js';
-import { PtcSessionStore, } from '../agent-host/execution/ptc/session-store/index.js';
 /**
  * Whether this build ships PTC `store` / `load` (`beta.ptcStore`). A product config
  * carries the value it resolved for its package; one without it (a bare runtime config)
@@ -165,6 +165,11 @@ function withPtcSessionStoreLifecycle(lifecycle, store, files, logger) {
             }
         },
         close: async () => {
+            // Chain first: the wrapped lifecycle's own close drains in-flight runs and
+            // disposes its Plugin Hook coordinator, and a run still holding the store
+            // must finish before its temp tree goes away. Only this store's own cleanup
+            // is best-effort; the Host's close is not, so its failure propagates.
+            await lifecycle.close();
             try {
                 await files.close();
             }

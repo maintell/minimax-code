@@ -12,7 +12,7 @@ import { isVersionLower } from "../utils";
 import { getCategoryLogger } from "../utils/logger";
 import { windowManager } from "../windows/manager";
 import { isNativeUpdateReady, hasUpdateReady, isAutoUpdateEnabled, getDownloadedFilePath, resetUpdateCache, setUpdateStatus, getUpdateStatus, getCachedUpdateInfo, setUserTriggeredCheck, getCachedProgress, setAutoUpdateEnabled, initUpdater, ensurePublicReleaseFeed } from "../modules/updater";
-import { isPendingUpdateCheck, checkPendingUpdate } from "../modules/updater/pending-check";
+import { checkPendingUpdate, isPendingUpdateCheck, waitForPendingUpdateCheck } from "../modules/updater/pending-check";
 import { triggerNativeUpdaterFetch, isNativeUpdaterFetchInFlight } from "../modules/updater/native-fetch";
 import { isTestBranchUpdateBuild, readTestBuild, isNewerTestBuild } from "../modules/updater/test-branch";
 import { isSwitchingTestBranch, getTestBranchInfo, queryTestBranch, testBranchErrorCode, switchTestBranch } from "../modules/updater/test-branch-switch";
@@ -130,6 +130,71 @@ function setupUpdaterIPCHandlers(options) {
         if (isDev) {
             return { success: true, status: 'not-available' };
         }
+        // Metadata-only: report whether a newer build exists and stop there.
+        // `checkPendingUpdate` reads the remote feed with autoDownload off and
+        // restores it afterwards, so nothing is fetched or installed and the
+        // updater's own state machine is left exactly as it was.
+        if (options?.metadataOnly === true) {
+            // A probe must not race whatever already owns the updater: the test
+            // branch switch, a check in progress, or a download. Report what the
+            // updater already knows instead of starting a second `checkForUpdates`,
+            // which would drop that path's events and, with autoDownload off, never
+            // download anything.
+            const busyStatus = getUpdateStatus();
+            if (isSwitchingTestBranch() || busyStatus === 'checking' || busyStatus === 'downloading') {
+                logger.info(`[Updater] 元数据检查跳过，更新器占用中 (status: ${busyStatus})`);
+                return {
+                    success: true,
+                    status: busyStatus,
+                    updateInfo: getCachedUpdateInfo() || undefined,
+                };
+            }
+            try {
+                const result = await checkPendingUpdate();
+                const remoteVersion = result?.updateInfo?.version;
+                logger.info(`[Updater] 元数据检查完成: remote=${remoteVersion}`);
+                return {
+                    success: true,
+                    status: result?.isUpdateAvailable === true ? 'available' : 'not-available',
+                    ...(remoteVersion ? { updateInfo: { version: remoteVersion } } : {}),
+                };
+            }
+            catch (error) {
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                logger.error(`[Updater] 元数据检查失败: ${errorMessage}`);
+                return { success: false, status: 'error', error: errorMessage };
+            }
+        }
+        // 切换测试分支期间由切换流程独占更新器。
+        if (isSwitchingTestBranch()) {
+            return {
+                success: true,
+                status: getUpdateStatus(),
+                updateInfo: getCachedUpdateInfo() || undefined,
+            };
+        }
+        const userTriggered = options?.userTriggered ?? true;
+        logger.info(`[Updater] 收到检查更新请求 (userTriggered: ${userTriggered}, ` +
+            `status: ${getUpdateStatus()}, cachedVersion: ${getCachedUpdateInfo()?.version})`);
+        // 统一设置用户触发标记
+        setUserTriggeredCheck(userTriggered);
+        // 元数据检查不发布临时状态，所以并发请求不能靠它判断有没有包；只有真的
+        // 下载好了才直接返回待安装版本，否则照常走下面的状态机。
+        if (isPendingUpdateCheck() && hasUpdateReady()) {
+            return {
+                success: true,
+                status: 'downloaded',
+                updateInfo: getCachedUpdateInfo() || undefined,
+            };
+        }
+        // 探测进行中时 electron-updater 会把并发的 checkForUpdates 合并成同一个
+        // promise，而探测期间发出的结果事件又会被事件层丢掉，于是这次检查读到的状态
+        // 会永远停在 checking，之后所有检查都直接返回 checking。先等探测结束，再照常
+        // 走下面的状态机，发起一次属于自己的检查。
+        if (isPendingUpdateCheck()) {
+            logger.info('[Updater] 元数据探测进行中，等待其结束后再检查更新');
+            await waitForPendingUpdateCheck();
+        }
         // 公开包先定位本仓库最新的 release，再交给 electron-updater。检查入口
         // 必须先等 feed 解析完成，不能让检查落到安装包内 app-update.yml 的
         // 回退地址（那是上游 CDN，会提示安装官方构建）。
@@ -146,25 +211,8 @@ function setupUpdaterIPCHandlers(options) {
                 error: message,
             };
         }
-        // 切换测试分支期间由切换流程独占更新器。
-        if (isSwitchingTestBranch()) {
-            return {
-                success: true,
-                status: getUpdateStatus(),
-                updateInfo: getCachedUpdateInfo() || undefined,
-            };
-        }
-        const userTriggered = options?.userTriggered ?? true;
         const currentStatus = getUpdateStatus();
         const cachedInfo = getCachedUpdateInfo();
-        logger.info(`[Updater] 收到检查更新请求 (userTriggered: ${userTriggered}, ` +
-            `status: ${currentStatus}, cachedVersion: ${cachedInfo?.version})`);
-        // 统一设置用户触发标记
-        setUserTriggeredCheck(userTriggered);
-        // 元数据检查不发布临时状态；并发请求直接返回仍可安装的版本。
-        if (isPendingUpdateCheck()) {
-            return { success: true, status: 'downloaded', updateInfo: cachedInfo || undefined };
-        }
         // 1. 如果正在检查中，直接返回（避免重复检查）
         if (currentStatus === 'checking') {
             logger.info('[Updater] 已有检查更新任务在进行中');

@@ -1,6 +1,6 @@
 import { hasTaskReport, readTaskReport, REPORT_DIGEST_UNKNOWN_TASK, reportDigestLine, TASK_REPORT_DONE_STATUS, taskReportBodies, } from '../../../../coordinator-text/index.js';
-import { isStateDeltaMessage } from '../../../agent-host/contracts.js';
-import { readGenuineUserQueryText } from '../../algorithm/genuine-user-query.js';
+import { isStateDeltaMessage } from '@mavis/harness';
+import { readGenuineUserQueryText } from '@mavis/harness/compaction';
 /** Bunny's reply tool; its content is what Bunny said to the user (3.11). */
 const SEND_TO_USER_TOOL_NAME = 'send_to_user';
 /** Same test as the shared questionnaire helper: the text is an answer, not typing. */

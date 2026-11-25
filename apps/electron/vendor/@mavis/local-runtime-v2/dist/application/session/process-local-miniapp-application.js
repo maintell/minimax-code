@@ -164,6 +164,11 @@ async function permissionCall(operation) {
         throw code ? applicationError(code, { cause: error }) : error;
     }
 }
+/** The summary carries handlers only when the serving package declares some. */
+function declaredFileHandlersField(projection) {
+    const fileHandlers = declaredFileHandlers(projection);
+    return fileHandlers?.length ? { fileHandlers } : {};
+}
 /** `memory` is given only while the backend runs; a stopped Mini App has nothing to protect. */
 function summary(projection, status, memory) {
     const { available } = projection;
@@ -176,6 +181,7 @@ function summary(projection, status, memory) {
         ...(available.displayName ? { displayName: available.displayName } : {}),
         ...(available.description ? { description: available.description } : {}),
         ...(available.iconPath ? { iconUrl: localIconUrl(available.iconPath) } : {}),
+        ...declaredFileHandlersField(projection),
         runtime: {
             kind: 'process',
             status: runtimeStatus,
@@ -186,6 +192,16 @@ function summary(projection, status, memory) {
         ...(update ? { update } : {}),
         ...(surfaceMemory ? { memory: surfaceMemory } : {}),
     };
+}
+/**
+ * A running process serves the accepted package until it restarts, so files route to the pages
+ * that process can show; a restart-class update's new handlers apply once it is applied.
+ */
+function declaredFileHandlers(projection) {
+    const declaring = projection.running
+        ? (projection.accepted ?? projection.available)
+        : projection.available;
+    return declaring.fileHandlers;
 }
 function summaryMemory(memory) {
     if (!memory)

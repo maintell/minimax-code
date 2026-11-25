@@ -14,7 +14,7 @@ import { PERMISSION_RUNTIME_DIRECTORY, PERMISSION_SPACE_CONTEXT_ARCHIVE, PERMISS
  *   mirror, `data/` and `.db/`. Every other Session only reads them; the
  *   coordinator writes them through its space tools.
  * - No Session writes a space's `context.md` directly, the coordinator
- *   included: only `mavis space context write` checks the revision a user edit
+ *   included: only `bunny_task_space_context_write` checks the revision a user edit
  *   moved. No Session writes `context-archive.md` either: only the runtime's
  *   tidy appends the summaries it replaced.
  */

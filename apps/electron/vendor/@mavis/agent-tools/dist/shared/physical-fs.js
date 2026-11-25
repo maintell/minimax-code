@@ -17,4 +17,14 @@ const physicalFs = process.versions.electron
 const physicalPromises = process.versions.electron ? physicalFs.promises : fsPromises;
 export const { existsSync, statSync } = physicalFs;
 export const { access, mkdir, open, readFile, realpath, stat, writeFile } = physicalPromises;
+/** The core tool fs port backed by the physical filesystem (desktop and v1 cloud default). */
+export const physicalToolFs = {
+    access,
+    open,
+    readFile,
+    realpath,
+    stat,
+    writeFile,
+    mkdir,
+};
 //# sourceMappingURL=physical-fs.js.map

@@ -10,6 +10,10 @@ import { verdictIdempotencyKey, } from '../../session-system/index.js';
  */
 export function verdictStatus(assignment) {
     const verdict = assignment?.verdict;
+    // A closed task is over: a review link or an unclaimed verdict it still carries says
+    // nothing about it any more, and reporting either would contradict its closure.
+    if (assignment?.completion)
+        return verdict ? { verdict } : {};
     if (!verdictGated(assignment))
         return verdict ? { verdict } : {};
     if (!verdict)
@@ -24,13 +28,32 @@ export function verdictStatus(assignment) {
 function verdictGated(assignment) {
     return assignment?.reviewTask !== undefined;
 }
+/** Whether this task's conclusion is gated on a review verdict, for callers outside this module. */
+export function isVerdictGated(assignment) {
+    return verdictGated(assignment) && assignment?.completion === undefined;
+}
+/**
+ * The tool a coordinator turn calls to take a stored verdict into itself.
+ *
+ * A local literal rather than an import: the tool is registered in `@mavis/agent-tools`,
+ * which local-runtime-v2 depends on and which must never depend on local-runtime-v2.
+ * `local-assignment-tools.ts` exports the same name for its own registration, and each side
+ * pins the literal in a test, so renaming one without the other fails a suite.
+ */
+export const VERDICT_CLAIM_TOOL = 'assignment_claim_verdict';
 /**
  * Why a gated task may not be concluded yet, or undefined when it may.
  *
  * The gate is deliberately two-step: a verdict has to be stored (the review reported)
  * and then claimed by a coordinator turn (Bunny read it). That keeps "closing a task
  * takes Bunny's confirmation" true for the new path as well — a verdict alone never
- * closes anything.
+ * closes anything. The claim is an explicit call rather than a side effect of the wake or
+ * of concluding: the point of the mechanism is that reading the verdict is provable, and
+ * an implicit claim would make "Bunny read it" unverifiable.
+ *
+ * Pure: it reads the task, never the switch. A gate that is switched off stops holding
+ * anything, and the one caller that decides that is
+ * {@link AssignmentVerdictWiring.conclusionBlock}.
  */
 export function verdictGateBlock(assignment) {
     if (!verdictGated(assignment))
@@ -39,7 +62,8 @@ export function verdictGateBlock(assignment) {
         return 'This task is being reviewed: wait for the review verdict before concluding it.';
     const claim = assignment.verdictClaim;
     if (!claim || claim.revision !== assignment.verdict.revision)
-        return 'The review verdict has not been read yet: read it before concluding this task.';
+        return (`The review verdict has not been read yet: call ${VERDICT_CLAIM_TOOL} with this task's ` +
+            'session_id to read it, then conclude the task.');
     return undefined;
 }
 /**

@@ -43,13 +43,16 @@ export function providerCompletionUrl(api, baseUrl, modelId) {
         return `${base}/v1/messages`;
     if (api === 'openai-responses')
         return `${base}/responses`;
-    if (api === 'google-generative-ai')
-        return `${base}/${geminiModelPath(modelId)}:generateContent`;
+    if (api === 'google-generative-ai') {
+        return `${base}/${geminiModelPath(modelId)}:streamGenerateContent?alt=sse`;
+    }
     return `${base}/chat/completions`;
 }
-/** Same resource naming as `@google/genai`: bare ids live under `models/`. */
+/** Same non-Vertex resource naming as `@google/genai` (`tModel`), passing user model IDs downstream without local format restrictions. */
 function geminiModelPath(modelId) {
-    return modelId.includes('/') ? modelId : `models/${modelId}`;
+    return modelId.startsWith('models/') || modelId.startsWith('tunedModels/')
+        ? modelId
+        : `models/${modelId}`;
 }
 /**
  * 模型列表候选地址，按尝试顺序排列，首项是该协议的原生端点。Anthropic Messages
@@ -100,7 +103,8 @@ export function normalizeProviderBaseUrl(api, baseUrl) {
  * cut back to the version, and a bare origin gets Gemini's default version.
  */
 function normalizeGeminiBaseUrl(baseUrl) {
-    const base = baseUrl.replace(/\/models(?:\/[^/]+)?$/u, '');
+    const withoutQuery = (baseUrl.split('?')[0] ?? baseUrl).replace(/\/+$/u, '');
+    const base = withoutQuery.replace(/\/models(?:\/[^/]+)?$/u, '');
     return URL.canParse(base) && new URL(base).pathname === '/'
         ? `${base}/${GEMINI_DEFAULT_API_VERSION}`
         : base;

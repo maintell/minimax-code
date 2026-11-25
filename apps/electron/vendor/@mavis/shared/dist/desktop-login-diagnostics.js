@@ -28,6 +28,7 @@ const LOCAL_ERROR_CODES = new Set([
     'cancelled',
     'network_error',
     'timeout',
+    'unexpected_redirect',
     'auth_session_changed',
 ]);
 const NATIVE_ERROR_CODES = new Set([
@@ -50,10 +51,19 @@ const NATIVE_ERROR_CODES = new Set([
     'ERR_CONNECTION_REFUSED',
     'ERR_CONNECTION_RESET',
     'ERR_CONNECTION_TIMED_OUT',
+    'ERR_CONNECTION_CLOSED',
+    'ERR_CONNECTION_ABORTED',
+    'ERR_CONNECTION_FAILED',
+    'ERR_EMPTY_RESPONSE',
+    'ERR_ADDRESS_UNREACHABLE',
+    'ERR_NETWORK_CHANGED',
+    'ERR_NETWORK_ACCESS_DENIED',
+    'ERR_SSL_PROTOCOL_ERROR',
     'ERR_TIMED_OUT',
     'ERR_INTERNET_DISCONNECTED',
     'ERR_PROXY_CONNECTION_FAILED',
     'ERR_TUNNEL_CONNECTION_FAILED',
+    'ERR_PROXY_CERTIFICATE_INVALID',
     'ERR_CERT_AUTHORITY_INVALID',
     'ERR_CERT_DATE_INVALID',
     'CERT_HAS_EXPIRED',
@@ -107,6 +117,7 @@ export function classifyDesktopLoginError(error, fallback, platform) {
     const original = typeof error === 'string' ? { message: error } : record(error);
     let errorCode = fallback;
     let nativeErrorCode;
+    let redirected = false;
     let current = original;
     for (let depth = 0; depth < 3; depth += 1) {
         if (typeof current.code === 'string') {
@@ -120,6 +131,9 @@ export function classifyDesktopLoginError(error, fallback, platform) {
             message.match(/\((0x[0-9a-f]+)\)\s*\.?$/i)?.[1]?.toLowerCase();
         if (nativeMatch && NATIVE_ERROR_CODES.has(nativeMatch))
             nativeErrorCode = nativeMatch;
+        // fetch(redirect: 'error') 遇到 3xx：通常是代理或网关把 API 请求重定向到了别处。
+        if (/redirect (?:policy was|mode is set to) ['"]?error/i.test(message))
+            redirected = true;
         current = record(current.cause);
     }
     if (platform === 'win32' &&
@@ -132,6 +146,9 @@ export function classifyDesktopLoginError(error, fallback, platform) {
     }
     else if (original.name === 'AuthSessionChangedError') {
         errorCode = 'auth_session_changed';
+    }
+    else if (redirected && fallback === 'login_failed' && errorCode === fallback) {
+        errorCode = 'unexpected_redirect';
     }
     else if (original.name === 'TimeoutError' ||
         nativeErrorCode?.includes('TIMED_OUT') ||

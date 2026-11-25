@@ -10,12 +10,12 @@ import { isLocalChildWorkerSession } from '../../service/session-system/index.js
  * so the bound also caps the per-poll load one status query puts on the runtime.
  */
 const SESSION_ACTIVITY_MAX_SESSIONS = 64;
-const ACTIVE_TASK_STATUSES = [
+export const ACTIVE_TASK_STATUSES = [
     'queued',
     'running',
     'stopping',
 ];
-const TERMINAL_TASK_STATUSES = [
+export const TERMINAL_TASK_STATUSES = [
     'succeeded',
     'failed',
     'canceled',
@@ -33,7 +33,7 @@ const TASK_PAGE_FULL_REF = 'page_full';
  * Thread Goal states that still schedule continuation Turns. `budget_limited` is terminal:
  * the budget wraps up inside the Goal Turn that hit it and no summary Turn follows.
  */
-const CONTINUING_GOAL_STATUSES = { active: true };
+export const CONTINUING_GOAL_STATUSES = { active: true };
 /** Composes the activity reader from ready runtime owners; empty keeps the route fail-closed. */
 export function sessionActivityFor(input) {
     const turns = input.owners.turnSystem.inspection;

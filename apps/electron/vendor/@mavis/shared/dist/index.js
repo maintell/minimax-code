@@ -12,9 +12,9 @@ export { buildToolCallCitationId, compactToolCallCitationKey, findUniqueSingleSu
 export { KeyedOperationLane } from './keyed-operation-lane.js';
 export { isSensitiveHandoffPath } from './session-handoff-sensitive-path.js';
 export { OPENROUTER_ATTRIBUTION_HEADERS, isOpenRouterApiUrl, withOpenRouterAttributionHeaders, } from './openrouter-attribution.js';
-export { retryWindowsFileSystemOperation, } from './windows-file-system.js';
+export { isRetryableWindowsFileError, retryWindowsFileSystemOperation, } from './windows-file-system.js';
+export { isPidAlive } from './process-alive.js';
 export { SESSION_LLM_RETRY_EVENT_TYPE } from './llm-retry-event.js';
-export { MAVIS_BROWSER_EXTENSION_ID, getHostName, generateManifest, serializeManifest, getNativeHostDirs, getManifestFileName, getManifestPath, generateHostWrapper, getWindowsRegistryEntries, } from './browser-manifest.js';
 // Owner `<mavis-thinking>` and `<mavis-progress>` block helpers — single
 // source of truth for daemon, IM forwarders, and UI. Keep both packages on
 // the same regex/strip semantics; do not redefine the regex elsewhere.

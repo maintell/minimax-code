@@ -60,6 +60,8 @@ function responseSnapshot(apiId, state) {
         isResponsesAssembly(state)) {
         return state.response;
     }
+    if (isGoogleApi(apiId) && isGoogleAssembly(state))
+        return finalizeGoogleResponse(state);
     return state;
 }
 function finalizeCompletionResponse(response) {
@@ -89,6 +91,9 @@ function responseFolder(apiId) {
         case 'openai-responses':
         case 'openai-codex-responses':
             return foldOpenAIResponseEvent;
+        case 'google-generative-ai':
+        case 'google-vertex':
+            return foldGoogleChunk;
         default:
             return undefined;
     }
@@ -523,6 +528,92 @@ function responseContentPart(state, event, type) {
     content[index] = part;
     item.content = content;
     return part;
+}
+/** SDK-side additions to a chunk that are not part of the provider response. */
+const GOOGLE_SDK_ONLY_KEYS = new Set(['sdkHttpResponse']);
+const GOOGLE_TEXT_PART_KEYS = new Set(['text', 'thought', 'thoughtSignature']);
+function isGoogleApi(apiId) {
+    return apiId === 'google-generative-ai' || apiId === 'google-vertex';
+}
+function foldGoogleChunk(rawState, rawEvent) {
+    if (!isObject(rawEvent))
+        return rawState;
+    const state = asGoogleAssembly(rawState);
+    for (const [key, value] of Object.entries(rawEvent)) {
+        if (key !== 'candidates' && !GOOGLE_SDK_ONLY_KEYS.has(key))
+            state.response[key] = value;
+    }
+    const candidates = Array.isArray(rawEvent.candidates) ? rawEvent.candidates : [];
+    for (const [position, rawCandidate] of candidates.entries()) {
+        foldGoogleCandidate(state, rawCandidate, position);
+    }
+    return state;
+}
+function foldGoogleCandidate(state, rawCandidate, position) {
+    if (!isObject(rawCandidate))
+        return;
+    const index = integer(rawCandidate.index) ?? position;
+    const candidate = state.candidates.get(index) ?? {};
+    assignExcept(candidate, rawCandidate, 'content');
+    candidate.content = foldGoogleContent(candidate.content, rawCandidate.content);
+    state.candidates.set(index, candidate);
+}
+function foldGoogleContent(current, rawContent) {
+    const content = isObject(current) ? current : {};
+    const incoming = isObject(rawContent) ? rawContent : {};
+    assignExcept(content, incoming, 'parts');
+    const parts = Array.isArray(content.parts) ? content.parts : [];
+    for (const rawPart of Array.isArray(incoming.parts) ? incoming.parts : []) {
+        appendGooglePart(parts, rawPart);
+    }
+    content.parts = parts;
+    return content;
+}
+function assignExcept(target, source, skippedKey) {
+    for (const [key, value] of Object.entries(source)) {
+        if (key !== skippedKey)
+            target[key] = value;
+    }
+}
+function appendGooglePart(parts, rawPart) {
+    if (!isObject(rawPart))
+        return;
+    const last = parts.at(-1);
+    if (!isObject(last) || !continuesGoogleTextPart(last, rawPart)) {
+        parts.push({ ...rawPart });
+        return;
+    }
+    appendString(last, 'text', rawPart.text);
+    if (rawPart.thoughtSignature !== undefined)
+        last.thoughtSignature = rawPart.thoughtSignature;
+}
+/** A text delta continues the previous part unless its kind or signature differs. */
+function continuesGoogleTextPart(last, next) {
+    if (!isGoogleTextPart(last) || !isGoogleTextPart(next))
+        return false;
+    if ((last.thought === true) !== (next.thought === true))
+        return false;
+    return (last.thoughtSignature === undefined ||
+        next.thoughtSignature === undefined ||
+        last.thoughtSignature === next.thoughtSignature);
+}
+function isGoogleTextPart(part) {
+    return (typeof part.text === 'string' &&
+        Object.keys(part).every((key) => GOOGLE_TEXT_PART_KEYS.has(key)));
+}
+function finalizeGoogleResponse(state) {
+    const candidates = [...state.candidates.entries()]
+        .sort(([left], [right]) => left - right)
+        .map(([, candidate]) => candidate);
+    return candidates.length > 0 ? { ...state.response, candidates } : { ...state.response };
+}
+function asGoogleAssembly(value) {
+    if (isGoogleAssembly(value))
+        return value;
+    return { response: {}, candidates: new Map() };
+}
+function isGoogleAssembly(value) {
+    return isObject(value) && value.response instanceof Object && value.candidates instanceof Map;
 }
 function appendString(target, key, value) {
     if (typeof value === 'string')

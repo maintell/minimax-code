@@ -17,7 +17,7 @@ export function createHostedSkillReads(reads) {
     };
     return {
         listHostedRuntimeSkills: (scope, context) => reads.listRuntimeSkills(resolveScope(scope, context)),
-        renderHostedCatalog: (scope, context) => reads.renderCatalog(resolveScope(scope, context)),
+        listHostedCatalogEntries: (scope, context) => reads.listCatalogEntries(resolveScope(scope, context)),
     };
 }
 function resolveHostedCatalogScope(scope, context) {
@@ -43,7 +43,6 @@ function resolveHostedCatalogScope(scope, context) {
     return {
         ...base,
         ...selection,
-        ...catalogOptions(scope),
     };
 }
 function resolveHostedSelection(scope, context) {
@@ -61,22 +60,15 @@ function resolveHostedSelection(scope, context) {
             ...(scope.pluginRecommendationAvailable === true
                 ? { pluginRecommendationAvailable: true }
                 : {}),
+            ...(scope.desktopManageAvailable === true ? { desktopManageAvailable: true } : {}),
+            ...(scope.cronToolsAvailable === true ? { cronToolsAvailable: true } : {}),
+            ...(scope.memoryToolsAvailable === true ? { memoryToolsAvailable: true } : {}),
             canonicalRole: policy.canonicalRole,
             builtinAgent: policy.builtinAgent,
+            ...(policy.coordinator === true ? { coordinator: true } : {}),
             disabledSkillNames: restrictions.disabledBuiltinSkillNames,
             resumeCodexAvailable: restrictions.resumeCodexAvailable === true,
         }),
-    };
-}
-function catalogOptions(scope) {
-    return {
-        ...(scope.firstTurnSessionId !== undefined
-            ? { firstTurnSessionId: scope.firstTurnSessionId }
-            : {}),
-        ...(scope.contextWindowTokens !== undefined
-            ? { contextWindowTokens: scope.contextWindowTokens }
-            : {}),
-        ...(scope.additionalSkills !== undefined ? { additionalSkills: scope.additionalSkills } : {}),
     };
 }
 //# sourceMappingURL=hosted-reader.js.map

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
 import { createUserMessageId, isQueueMessageSource } from '../../../session-system/index.js';
-import { isTeardownDurableSteeringProducer } from '../../agent-host/contracts.js';
+import { isTeardownDurableSteeringProducer } from '@mavis/harness';
 import { queueModelFromAgentHost } from '../../agent-host/index.js';
 import { toQueueChannelContext } from '../../turn-submission.service.js';
 import { pausesQueueOnAbort } from '../queue-pause-on-abort.js';
@@ -544,12 +544,13 @@ function toRequeueModel(model) {
 function toRequeueAttachment(input) {
     const filePath = (input.filePath ?? '').trim();
     const optional = optionalAttachmentFields(input);
-    if (!filePath && !optional.dataUrl && !optional.assetId && !optional.error)
+    const hasPayload = filePath || optional.dataUrl || optional.assetId || optional.error;
+    if (!hasPayload && !optional.driveNodeId)
         return [];
     const mimeType = (input.mimeType ?? '').trim();
     return [
         {
-            type: requeueAttachmentType(input.type, mimeType),
+            type: requeueAttachmentType(input.type, mimeType, optional.driveNodeId),
             fileName: requeueAttachmentFileName(input.fileName, filePath),
             mimeType,
             filePath,
@@ -559,13 +560,21 @@ function toRequeueAttachment(input) {
 }
 function optionalAttachmentFields(input) {
     const dataUrl = input.dataUrl?.trim();
+    const driveNodeId = input.driveNodeId?.trim();
+    const drivePath = input.drivePath?.trim();
     return {
         ...(dataUrl ? { dataUrl } : {}),
         ...(input.assetId ? { assetId: input.assetId } : {}),
         ...(input.error ? { error: input.error } : {}),
+        // Drive facts only travel with their node id; they never locate a file.
+        ...(driveNodeId ? { driveNodeId } : {}),
+        ...(driveNodeId && drivePath ? { drivePath } : {}),
+        ...(driveNodeId && input.sizeBytes !== undefined ? { sizeBytes: input.sizeBytes } : {}),
     };
 }
-function requeueAttachmentType(type, mimeType) {
+function requeueAttachmentType(type, mimeType, driveNodeId) {
+    if (driveNodeId && type === 'folder')
+        return 'folder';
     return type === 'image' || mimeType.startsWith('image/') ? 'image' : 'file';
 }
 function requeueAttachmentFileName(fileName, filePath) {

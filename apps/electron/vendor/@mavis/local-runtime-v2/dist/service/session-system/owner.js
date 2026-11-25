@@ -8,6 +8,7 @@ import { SessionArtifactsService } from './files/artifacts-service.js';
 import { createSideChatDataCapability } from './sessions/sidechat-data-capability.js';
 import { createSessionForkDataCapability } from './fork/index.js';
 import { createSessionAssetRepository } from './files/repo/assets.js';
+import { createSessionFileSyncRepository } from './files/repo/file-syncs.js';
 import { createHistoryPersistenceRepository, createLegacyHistorySourceReader, LegacyOpencodeImporter, } from './legacy-migration/index.js';
 import { createLegacySessionMigrationRepository } from './legacy-migration/repo/migration-repository.js';
 import { createReleasedSessionHistoryReader, createSessionHistoryActivity, createSessionHistoryIoLane, createSessionHistoryLocationResolver, createSessionSystemCanonicalHistoryProvider, createSessionHistoryMutationAdapter, createSessionRewindCapability, ConversationActionProjectionService, MessageQueryService, SessionSourceQueryService, SessionInputSummaryService, UserMessageCommitService, } from './messages/index.js';
@@ -37,7 +38,8 @@ import { SessionArtifactService } from './sessions/support/artifact-service.js';
 import { createPlanDocumentOwner } from './sessions/support/plan-document.js';
 import { SessionDeletionGate } from './sessions/lifecycle/deletion-gate.js';
 import { createConversationMutationState, createSessionOperationIntentRepository, } from './mutation/index.js';
-import { SessionRecoveryService } from './sessions/recovery/recovery-service.js';
+import { SessionRecoveryService, } from './sessions/recovery/recovery-service.js';
+import { createSubagentExecutionEvents, } from './session-send/subagent-execution-events.js';
 import { RootSessionInvariantService, } from './sessions/root/root-invariant-service.js';
 import { SessionTitleService, } from './sessions/index.js';
 import { SessionStreamService } from './stream/session-stream-service.js';
@@ -165,7 +167,7 @@ export function initializeSessionSystem(options) {
         }),
         facts: queueFacts,
     });
-    const files = new SessionFilesService({ sessions, messages, assets, nowMs });
+    const files = createSessionFilesService(options.db, { sessions, messages, assets, nowMs });
     const artifactCatalog = createArtifactCatalog(options, files);
     const inputSummaries = createInputSummaries(options, sessions, legacy, files);
     const artifacts = new SessionArtifactService({
@@ -210,7 +212,7 @@ export function initializeSessionSystem(options) {
             records,
             root: roots,
             activation,
-            recovery: new SessionRecoveryService({ sessions, messages, canonicalHistory }),
+            recovery: createRecoveryService({ sessions, messages, canonicalHistory, stream }, options),
             state: createSessionStateWriter(sessions),
             execution: createSessionExecutionSource(sessions, legacy),
             interactionMode,
@@ -499,6 +501,19 @@ function createQueueAdmission(deletionGate, operations) {
                 : undefined),
     };
 }
+/** Recovery closes durable child-turn markers before clearing stale Session state. */
+function createRecoveryService(deps, options) {
+    const { stream, ...recovery } = deps;
+    return new SessionRecoveryService({
+        ...recovery,
+        subagentExecutions: createSubagentExecutionEvents({
+            sessions: deps.sessions,
+            messages: deps.messages,
+            stream,
+            onCommitted: options.onSubagentExecutionCommitted,
+        }),
+    });
+}
 function createAgentCapabilities(input) {
     const conversationActions = new ConversationActionProjectionService({
         sessions: input.sessions,
@@ -507,6 +522,12 @@ function createAgentCapabilities(input) {
         availability: input.conversationMutationState,
     });
     const agentProjection = createSessionSystemAgentProjection({
+        subagentExecutions: createSubagentExecutionEvents({
+            sessions: input.sessions,
+            messages: input.messages,
+            stream: input.stream,
+            onCommitted: input.options.onSubagentExecutionCommitted,
+        }),
         state: createSessionStateWriter(input.sessions),
         sessions: input.sessions,
         messages: input.messages,
@@ -519,9 +540,6 @@ function createAgentCapabilities(input) {
             : {}),
         ...(input.options.originProjection ? { originProjection: input.options.originProjection } : {}),
         compactionFacts: composeCompactionFactSink(input.llmCalls, input.options.compactionFacts),
-        ...(input.options.compactionMetrics
-            ? { compactionMetrics: input.options.compactionMetrics }
-            : {}),
         ...(input.options.toolCallMode
             ? { toolCallMode: { policy: input.options.toolCallMode, sessions: input.sessions } }
             : {}),
@@ -565,6 +583,9 @@ function createUsageProjector(input) {
                 input.usageCommits.publish(record.sessionId);
         },
     };
+}
+function createSessionFilesService(db, ports) {
+    return new SessionFilesService({ ...ports, fileSyncs: createSessionFileSyncRepository({ db }) });
 }
 function createInputSummaries(options, sessions, legacy, files) {
     return new SessionInputSummaryService({
@@ -652,12 +673,12 @@ function createSessionSystemCloser(titles, stream, artifactCatalog, roster) {
 function createTitleCommitter(records, facts) {
     return async (sessionId, title, expectedTitle, outcome) => {
         // A fallback title is truncated user input, not a model summary. Keeping the Session on
-        // `default` lets the next accepted message retry generation; claiming `auto` would strand
-        // it on a title no model ever wrote. `titleSource` must stay explicit because a title
-        // mutation without one is normalized to `manual`.
+        // `default` hands naming to the reply review, which reads the user inputs and the final reply
+        // together; claiming `auto` would strand it on a title no model ever wrote. `titleSource` must
+        // stay explicit because a title mutation without one is normalized to `manual`.
         const updated = await records.mutateSession(sessionId, outcome === 'success'
             ? { title, titleSource: 'auto', titleReviewState: 'pending' }
-            : { title, titleSource: 'default' }, undefined, { title: expectedTitle, source: 'default' });
+            : { title, titleSource: 'default', titleReviewState: 'pending' }, undefined, { title: expectedTitle, source: 'default' });
         facts.handle({ kind: 'title-updated', session: updated, title });
     };
 }
@@ -671,9 +692,12 @@ function createSessionTitles(sessions, records, options) {
         sessions,
         model: options.title.model,
         promptSnapshots: options.title.reviewPromptSnapshots,
+        ...(options.title.locale ? { locale: options.title.locale } : {}),
         waitForGeneration: (sessionId) => titles.waitForGeneration(sessionId),
         commitTitle: async (sessionId, title, expected) => {
-            const updated = await records.mutateSession(sessionId, { title, titleSource: 'auto' }, undefined, expected);
+            // A reviewed title closes the pass: a Session that was still on a fallback must not be
+            // reviewed again as an automatic title on the next reply.
+            const updated = await records.mutateSession(sessionId, { title, titleSource: 'auto', titleReviewState: 'completed' }, undefined, expected);
             options.facts.handle({ kind: 'title-updated', session: updated, title });
         },
         onOutcome: options.title.onReviewOutcome,

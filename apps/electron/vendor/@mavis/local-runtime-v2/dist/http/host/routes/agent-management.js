@@ -36,11 +36,11 @@ export class LocalAgentManagementRoutes {
             throw error;
         }
     }
-    async getLocalAgent(name) {
+    async getLocalAgent(name, options) {
         try {
             const resp = await this.ctx.agentRuntimePort.getAgent({
                 name,
-                include: 'identity,persona,system_prompt',
+                include: options?.includeContent === false ? 'identity' : 'identity,persona,system_prompt',
             });
             return resp.agent ? detailToRecord(resp.agent) : undefined;
         }

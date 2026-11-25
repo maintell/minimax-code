@@ -37,11 +37,16 @@ function bashTargetReaches({ root, bases, home, protects, }, target) {
     // Variables and other expansions cannot be resolved here; a target that
     // still names the protected directory by its last segments is treated as it.
     if (resolved === undefined)
-        return namesDirectory(root, target.path);
+        return namesDirectory(root, target.path, protects);
     return resolved.some((candidate) => {
         const canonical = canonicalPath(candidate);
         if (protects(root, canonical))
             return true;
+        // A glob may match a protected entry of the directory it expands in.
+        if (glob !== undefined &&
+            protects(root, path.join(canonical, globSegment(target.path, glob)))) {
+            return true;
+        }
         // Deleting or moving away a literal parent removes the protected directory too.
         return target.action === 'delete' && glob === undefined && isInside(canonical, root);
     });
@@ -63,7 +68,7 @@ function resolveBashPath(raw, bases, home, pathSyntax) {
     });
 }
 /** Every `cd`/`pushd` to a literal directory, resolved from the session directories. */
-function literalCdTargets(script, bases, home) {
+export function literalCdTargets(script, bases, home) {
     return splitCommand(script).flatMap((segment) => {
         const parsed = readBashCommand(segment.trim());
         if (!parsed || !['cd', 'pushd'].includes(parsed.executable))
@@ -85,9 +90,33 @@ function staticGlobDirectory(raw, globIndex) {
         return '.';
     return slash === 0 ? '/' : raw.slice(0, slash);
 }
-function namesDirectory(root, raw) {
+/** The path segment that holds the first glob character, e.g. `*.md` for `memory/*.md`. */
+function globSegment(raw, globIndex) {
+    const start = Math.max(raw.lastIndexOf('/', globIndex), raw.lastIndexOf('\\', globIndex)) + 1;
+    const end = raw.slice(globIndex).search(/[\\/]/);
+    return end < 0 ? raw.slice(start) : raw.slice(start, globIndex + end);
+}
+/**
+ * A target only the shell can expand that names the protected directory by its
+ * last two segments. The literal segments after the directory decide, as far
+ * as they go; with none, the whole directory is named.
+ */
+function namesDirectory(root, raw, protects) {
     const tail = `${path.basename(path.dirname(root))}/${path.basename(root)}`;
     const normalized = `/${raw.replaceAll('\\', '/')}/`;
-    return normalized.includes(`/${tail}/`);
+    const index = normalized.indexOf(`/${tail}/`);
+    if (index < 0)
+        return false;
+    const literal = [];
+    for (const segment of normalized.slice(index + tail.length + 2).split('/')) {
+        if (!segment)
+            continue;
+        if (/[$%`{]/.test(segment))
+            break;
+        literal.push(segment);
+        if (/[*?[]/.test(segment))
+            break;
+    }
+    return literal.length === 0 || protects(root, path.join(root, ...literal));
 }
 //# sourceMappingURL=bash-write-targets.js.map

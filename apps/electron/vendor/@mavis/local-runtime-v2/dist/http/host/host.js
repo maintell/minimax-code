@@ -2,14 +2,16 @@ import { buildHostMavisSessionAdapter } from './session/host-session-adapter.js'
 import { HostResourceLifecycle } from './host-lifecycle.js';
 import { ProcessLocalPermissionModeWriter } from './host-permission-mode.js';
 import { join } from 'node:path';
+import { buildOwnerDesktopToolAdapters, buildOwnerSidebarToolsAdapter, ownerNamespacedToolAvailability, } from './desktop-tool-adapters.js';
 import { initializeHostEnvironment, resolveHostIdentityOptions, resolveHostConfigOptions, readTuiWindowsHardSafetyOptOut, resolveHostCapabilityOptions, resolveHostModelResolver, resolveHostShellFamily, } from './host-environment.js';
 import { HostChannelRuntime } from './host-channel-runtime.js';
 import { createHostSessionPersistence, createHostSessionHistory, initializeHostSessionProjections, } from './session/host-session-persistence.js';
-import { LocalPermissionRuleStore, LocalPermissionApprovalService, resolveLocalPermissionService, abortLocalPermissionRequests, readLocalPermissionMode, } from '../../service/permission/index.js';
+import { LocalPermissionRuleStore, LocalPermissionApprovalService, resolveLocalPermissionService, abortLocalPermissionRequests, } from '../../service/permission/index.js';
 import { createLocalFileApiGitChangesCoordinator } from '../../service/workspace/index.js';
 import { LocalGreetingSystemReminderSender } from './host-greeting-sender.js';
 import { wakeSessionQueueAfterDependencyRelease as wakeHostSessionQueue } from './turn/host-background-tasks.js';
 import { routeHostApi } from './host-api-router.js';
+import { buildHostRouteApiInput } from './host-request-routing.js';
 import { createHostCronRuntime, startHostCronRuntime } from './host-cron-runtime.js';
 import { buildDesktopServiceHandler as buildDesktopHandler } from './desktop-service-handler.js';
 import { LocalSessionController, LocalMessageQueueStore, LocalPiHistoryStore, } from '../../service/session-system/index.js';
@@ -20,21 +22,19 @@ import { hasActiveLocalTeamOwner, runForegroundLocalTask } from '../../service/t
 import { isLocalRuntimeStartupExecutionEnabled } from '../../infra/runtime-owner/startup-execution-policy.js';
 import { LocalHookService } from '../../service/hook/index.js';
 import { LocalBrowserBroker } from '../../service/browser-use/index.js';
-import { initializeWebFetchRouter } from '../../service/web-fetch/index.js';
 import { LocalTurnFileChangeCaptureService } from '../../service/turn-system/index.js';
 import {} from '../../infra/conversation/session-record.js';
 import { createLocalGreetingSystemReminderSender, createHostHookService, } from './turn/host-turn-service-factories.js';
-import { resolveLocalRuntimeLocale } from '../../infra/config/locale.js';
 import { LegacyOpencodeRuntime } from '../../infra/legacy-db/legacy-opencode-runtime.js';
 import { buildLocalRuntimeSurfaceCapabilities, buildLocalRuntimeCapabilities, legacyRuntimeEnabledForMode, } from '../../infra/runtime-owner/mode.js';
 import { buildPermissionRouteContext, buildQuestionnaireServiceDeps, createHostRouteContext, createQuestionnaireOwnedActionBinder, createQuestionnaireRequestAdmissionBinder, } from './host-route-contexts.js';
-import { hostNormalizeCleanLocalSession, hostSerializeSession, hostSerializeSessions, hostSerializeSessionTree, } from './session/host-session-state.js';
-import { requestConversationCompaction } from './routes/compaction.js';
-import { deliverQuestionnaireAskToChannel as deliverQuestionnaireAskToChannelHelper } from './interaction/host-questionnaire-delivery.js';
+import { hostSerializeSession, hostSerializeSessions, } from './session/host-session-state.js';
 import { resolveHostStores } from './host-stores.js';
 import { makeId } from '../../infra/transport/host-http.js';
-import { isReadOnlyLegacySession, markMigratedLegacySessionDeleted, } from './session/host-legacy-helpers.js';
+import { isReadOnlyLegacySession } from './session/host-legacy-helpers.js';
 import { LocalApiAgentRoutes } from './routes/agents.js';
+import { buildHostSessionStateHandle, createHostAgentRoutes } from './host-agent-routes.js';
+import { buildHostWebFetchRouter, createHostPermissionApprovalService, deliverHostQuestionnaireAskToChannel, resolveHostImmediateTaskAdmission, } from './host-runtime-services.js';
 import { buildRuntimeDoctorSnapshot, resolveDefaultLocalWorkspaceDir } from './host-support.js';
 import { resolveLocalApiHostEntryPath, resolveStrictMavisApiPath, routeLocalRuntimeRequest, } from './host-routing.js';
 import { buildLocalTurnToolSourcesForHost, } from '../../service/turn-system/index.js';
@@ -183,6 +183,9 @@ export class LocalRuntimeApiHost {
     lockOwner;
     runtimeStartupToken;
     promptSnapshots;
+    sidebarTools;
+    desktopAgentTools;
+    uiRequestBroker;
     internalTurnPromptReads;
     startupExecutionEnabled;
     channelCapabilityEnabled;
@@ -317,13 +320,7 @@ export class LocalRuntimeApiHost {
         this.lockOwner = identity.lockOwner;
         this.useImmediateTaskAdmission = this.resolveImmediateTaskAdmission();
         this.mcpRuntime = options.mcpService;
-        this.hookService = createHostHookService({
-            options,
-            dataDir: () => this.configGetter().dataDir,
-            nowMs: this.nowMs,
-            resolveWorkspaceDir: () => this.resolveDefaultWorkspaceDir(),
-            getSessionById: (sessionId) => this.getSessionById(sessionId),
-        });
+        this.hookService = createHostHookService(options);
         for (const registration of this.turnFileChanges.getToolCaptureHookRegistrations()) {
             this.hookService.registry.registerBuiltin(registration);
         }
@@ -377,17 +374,7 @@ export class LocalRuntimeApiHost {
         });
     }
     createPermissionApprovalService() {
-        return new LocalPermissionApprovalService({
-            agentName: this.agentName,
-            nowMs: this.nowMs,
-            permissionRules: this.permissionRules,
-            publishGlobalEvent: (event) => this.publishGlobalEvent(event),
-            channelPermissionOutbound: {
-                onPermissionAsk: (event) => this.requireChannelPort('permission ask fan-out').permissionOutbound.onPermissionAsk(event),
-            },
-            metricsClient: this.metricsClient,
-            permissionMode: readLocalPermissionMode(this.configGetter().permissionMode),
-        });
+        return createHostPermissionApprovalService(this);
     }
     startRecovery(deferQuestionnaireRecovery) {
         if (!this.startupExecutionEnabled)
@@ -403,47 +390,17 @@ export class LocalRuntimeApiHost {
         }
     }
     resolveImmediateTaskAdmission() {
-        const { ownerKind } = this.lockOwner;
-        return ((ownerKind === 'electron' && this.capabilities.electronHost === true) ||
-            isCliRestrictedRuntime(ownerKind, this.capabilities.cliEmbedded) ||
-            (ownerKind === 'app-server' && this.capabilities.cliEmbedded === true));
+        return resolveHostImmediateTaskAdmission(this.lockOwner, this.capabilities);
     }
     createAgentRoutes() {
-        return new LocalApiAgentRoutes({
-            controller: this.controller,
-            ...(this.runtimeConversation ? { conversation: this.runtimeConversation } : {}),
-            agentRuntimePort: this.agentRuntimePort,
+        return createHostAgentRoutes(this, {
             legacyMigrator: this.legacyMigrator,
             runtimeMode: this.runtimeMode,
-            agentName: this.agentName,
-            agentDisplayName: this.agentDisplayName,
-            configGetter: this.configGetter,
-            nowMs: this.nowMs,
-            resolveDefaultWorkspaceDir: () => this.resolveDefaultWorkspaceDir(),
+            channelCapabilityEnabled: this.channelCapabilityEnabled,
             getLegacyRuntime: () => this.getLegacyRuntime(),
-            getSessionById: (id) => this.getSessionById(id),
-            listAllSessions: (a, o) => this.listAllSessions(a, o),
-            serializeSessions: (s) => hostSerializeSessions(this.sessionStateHost(), s),
-            serializeSessionTree: (sessions, url, agentName, getSessionById) => hostSerializeSessionTree(this.sessionStateHost(), sessions, {
-                url,
-                agentName,
-                getSessionById,
-            }),
-            serializeSession: (s) => hostSerializeSession(this.sessionStateHost(), s),
-            isReadOnlyLegacySession: (s) => isReadOnlyLegacySession(this.legacyMigrator, s),
-            markMigratedLegacySessionDeleted: (id) => markMigratedLegacySessionDeleted(this.legacyMigrator, id),
-            requestCompaction: (s, b) => requestConversationCompaction(this.requireRuntimeConversation('Session compaction'), s, b),
-            abortLocalSessionTurn: (id) => this.abortLocalSessionTurn(id),
-            normalizeCleanLocalSession: (s) => hostNormalizeCleanLocalSession(this.sessionStateHost(), s),
-            publishGlobalEvent: (event) => this.publishGlobalEvent(event),
-            ...(this.channelCapabilityEnabled
-                ? {
-                    routeAgentIm: (a, m) => this.requireChannelPort('agent IM routes').routeAgentIm(a, m),
-                    getAgentChannelConfig: (a) => this.requireChannelPort('agent channel config').buildAgentChannelConfig(a),
-                }
-                : {}),
-            resolveLocale: () => resolveLocalRuntimeLocale(),
-            metricsReporter: this.metrics,
+            sessionStateHost: () => this.sessionStateHost(),
+            requireRuntimeConversation: (operation) => this.requireRuntimeConversation(operation),
+            abortLocalSessionTurn: (sessionId) => this.abortLocalSessionTurn(sessionId),
         });
     }
     supportsInteraction(capability) {
@@ -451,6 +408,23 @@ export class LocalRuntimeApiHost {
     }
     bindPromptSnapshots(source) {
         this.promptSnapshots = source;
+    }
+    bindSidebarTools(owner) {
+        this.sidebarTools = owner;
+    }
+    bindDesktopAgentTools(owner) {
+        this.desktopAgentTools = owner;
+    }
+    bindUiRequestBroker(broker) {
+        this.uiRequestBroker = broker;
+        // The Runtime composed the broker before the host existed, so the host's
+        // MetricsClient is attached here.
+        if (broker && this.metricsClient)
+            broker.attachMetrics(this.metricsClient);
+    }
+    /** The reply route settles one pending UI request; absent on hosts without a broker. */
+    getUiRequestBroker() {
+        return this.uiRequestBroker;
     }
     bindInternalTurnPromptReads(registry) {
         this.internalTurnPromptReads = registry;
@@ -468,7 +442,23 @@ export class LocalRuntimeApiHost {
             mavisAgentAdapter: createLocalMavisAgentAdapter(this.agentRuntimePort),
             mavisCronAdapter: this.buildOwnerMavisCronAdapter(),
             mavisSessionAdapter: this.buildOwnerMavisSessionAdapter(),
+            sidebarToolsAdapter: buildOwnerSidebarToolsAdapter(this.ownerDesktopToolAdapterPorts()),
+            ...buildOwnerDesktopToolAdapters(this.ownerDesktopToolAdapterPorts()),
         });
+    }
+    /** Desktop / Cron capability facts the namespace Skills are gated by, answered from the
+     * same owner state `buildOwnerTurnToolSources` reads; see `ownerNamespacedToolAvailability`. */
+    resolveNamespacedToolAvailability() {
+        return ownerNamespacedToolAvailability(this.ownerDesktopToolAdapterPorts(), this.buildOwnerMavisCronAdapter());
+    }
+    ownerDesktopToolAdapterPorts() {
+        return {
+            isElectronOwner: this.getRuntimeOwnerKind() === 'electron',
+            publishGlobalEvent: (event) => this.publishGlobalEvent(event),
+            sidebarTools: this.sidebarTools,
+            desktopAgentTools: this.desktopAgentTools,
+            uiRequestBroker: this.uiRequestBroker,
+        };
     }
     createHostedAgentCapabilities() {
         return createHostedCapabilities(this, this.lockOwner.ownerKind, this.capabilities.cliEmbedded, this.capabilityProfile);
@@ -633,6 +623,7 @@ export class LocalRuntimeApiHost {
         configUpdater: (body) => this.configUpdater(body),
         syncAcceptEditsSeed: () => resolveLocalPermissionService(this.routeContextHost).syncAcceptEditsSeed(),
         publishGlobalEvent: (event) => this.publishGlobalEvent(event),
+        metricsClient: () => this.metricsClient,
     });
     /** Redacted process-local diagnostics owned by this concrete Runtime host. */
     getProcessLocalRuntimeDiagnostics() {
@@ -687,41 +678,24 @@ export class LocalRuntimeApiHost {
         });
     }
     routeApi(request, apiPath, url) {
-        return routeHostApi({
+        return routeHostApi(buildHostRouteApiInput(this, {
             runtimeMode: this.runtimeMode,
             capabilities: this.capabilities,
             surfaces: this.surfaces,
             runtimeOwnerKind: this.lockOwner.ownerKind,
             runtimeStartupToken: this.runtimeStartupToken,
             channelCapabilityEnabled: this.channelCapabilityEnabled,
-            configGetter: this.configGetter,
-            configUpdater: this.configUpdater,
-            ptcDefault: this.ptcDefault,
-            authContextGetter: this.authContextGetter,
-            routingContextGetter: this.routingContextGetter,
-            fetchImpl: this.fetchImpl,
             hostDiagnosticsProvider: this.hostDiagnosticsProvider,
-            metrics: this.metrics,
-            nowMs: this.nowMs,
             communicationMessageStore: this.communicationMessageStore,
             tokenUsageStore: this.tokenUsageStore,
-            runtimeConversation: this.runtimeConversation,
-            coordinatorRoster: this.coordinatorRoster,
             legacyMigrator: this.legacyMigrator,
             contentSafety: this.contentSafety,
-            cronRuntime: this.cronRuntime,
             browserBroker: this.browserBroker,
-            agentRoutes: this.agentRoutes,
             fileGitChangesCoordinator: this.fileGitChangesCoordinator,
-            getSessionById: (id) => this.getSessionById(id),
+            metrics: this.metrics,
             listAllSessions: (agent, options) => this.listAllSessions(agent, options),
-            getPiHistory: (id) => this.getPiHistory(id),
-            ensureLegacyPiHistoryMigrated: (id) => this.ensureLegacyPiHistoryMigrated(id),
-            publishGlobalEvent: (event) => this.publishGlobalEvent(event),
-            getProcessLocalRuntimeDiagnostics: () => this.getProcessLocalRuntimeDiagnostics(),
-            permissionRouteContext: () => this.permissionRouteContext(),
-            syncAcceptEditsSeed: () => resolveLocalPermissionService(this.routeContextHost).syncAcceptEditsSeed(),
-        }, request, apiPath, url);
+            routeContextHost: this.routeContextHost,
+        }), request, apiPath, url);
     }
     routeContextHost = createHostRouteContext(this);
     permissionRouteContext() {
@@ -732,11 +706,7 @@ export class LocalRuntimeApiHost {
     }
     bindQuestionnaireOwnedActionHandler = createQuestionnaireOwnedActionBinder(this.routeContextHost);
     bindQuestionnaireRequestAdmission = createQuestionnaireRequestAdmissionBinder(this.routeContextHost);
-    deliverQuestionnaireAskToChannel = (record) => deliverQuestionnaireAskToChannelHelper({
-        sendQuestionnaireMessage: (input) => this.requireChannelPort('questionnaire ask delivery').sendQuestionnaireMessage(input),
-        emitBusEvent: (type, payload) => this.emitBusEvent(type, payload),
-        ...(this.metrics ? { metrics: this.metrics } : {}),
-    }, record);
+    deliverQuestionnaireAskToChannel = (record) => deliverHostQuestionnaireAskToChannel(this, record);
     /** 外部 Channel owner 只允许绑定一次。 */
     bindExternalChannelSubsystem(port) {
         this.channelRuntime.bind(port);
@@ -792,28 +762,8 @@ export class LocalRuntimeApiHost {
     logWorkspaceSemanticSearchUnavailable(sessionId, error) {
         hostLogWorkspaceSemanticSearchUnavailable(sessionId, error);
     }
-    /**
-     * One router per Runtime: its backoff, breaker, learned intranet hosts and
-     * daily counts must outlive a Turn.
-     */
     buildWebFetchRouter() {
-        const metricsClient = this.metricsClient;
-        return initializeWebFetchRouter({
-            dataDir: () => this.configGetter().dataDir,
-            ...(metricsClient
-                ? {
-                    histogram: (name, value, labels) => metricsClient.histogram(name, value, labels),
-                }
-                : {}),
-            ...(this.fetchImpl ? { fetchImpl: this.fetchImpl } : {}),
-            ...(this.authContextGetter ? { authContextGetter: this.authContextGetter } : {}),
-            ...(this.authContextInvalidator
-                ? { authContextInvalidator: this.authContextInvalidator }
-                : {}),
-            ...(this.routingContextGetter ? { routingContextGetter: this.routingContextGetter } : {}),
-            ...(this.metrics ? { metrics: this.metrics } : {}),
-            ...(this.matrixLogger ? { matrixLogger: this.matrixLogger } : {}),
-        });
+        return buildHostWebFetchRouter(this);
     }
     getRuntimeOwnerKind() {
         return this.lockOwner.ownerKind;
@@ -848,12 +798,7 @@ export class LocalRuntimeApiHost {
         });
     }
     sessionStateHost() {
-        return {
-            configGetter: () => ({ ...this.configGetter() }),
-            legacyMigrator: this.legacyMigrator,
-            readSessionPinned: this.readSessionPinned,
-            getSessionById: (id) => this.getSessionById(id),
-        };
+        return buildHostSessionStateHandle(this, this.legacyMigrator);
     }
     getLegacyRuntime() {
         if (!this.isLegacyRuntimeEnabled()) {

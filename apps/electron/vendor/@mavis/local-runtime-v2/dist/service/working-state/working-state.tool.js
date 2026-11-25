@@ -4,9 +4,9 @@ import { WORKING_STATE_TOOL_NAME } from './contracts.js';
 /** @internal Exported only for focused tests. */
 export const WORKING_STATE_TOOL_DESCRIPTION = [
     '读写工作状态账本（近期约定）。什么时候写、什么不进账本，见系统提示的 <memory> 和 <ask_user>。',
-    'action：add 新增，必填 kind、text；kind 取 correction（纠正）、constraint（约束）、open_question（待答问题）、context_gap（已说定、还没写进空间 context.md 的决定）；scope 默认 global，只有 context_gap 用 space:<空间 ID>；expires_at 可选，ISO 8601 时间，到期自动关闭。用户纠正时，text 写新做法，replaces 写被否定的做法。text 用用户原话的语言写，名字、编号、数字和带名字的说法照原文写，不要翻译（“Atlas board”不写成“Atlas 看板”）。',
+    'action：add 新增，必填 kind、text；kind 取 correction（纠正）、constraint（约束）、open_question（待答问题）、context_gap（已说定、还没写进事项 context.md 的决定）；scope 默认 global，只有 context_gap 用 space:<事项 ID>；expires_at 可选，ISO 8601 时间，到期自动关闭。用户纠正时，text 写新做法，replaces 写被否定的做法。text 用用户原话的语言写，名字、编号、数字和带名字的说法照原文写，不要翻译（“Atlas board”不写成“Atlas 看板”）。',
     'update 改写一条现行条目，必填 entry_id、text：text 写完整的现行规则，例外也写进去（如“周报一律不抄送客户，只有季度总结可以抄送”）；旧条目变为已替代，返回新条目。close 关闭一条现行条目，必填 entry_id、reason（answered 已回答、done 已完成、withdrawn 撤回）；answered、withdrawn 还必填 note：answered 写用户的回答，withdrawn 写这条为什么不再适用。关闭的条目连同 note 在账本里再列 7 天。update 和 close 的 text、note 保留原条目里的名字和编号，之后按名字问起才对得上。',
-    'context_gap 用 `space context write` 写进空间 context.md 的“已定事项”后，当轮用 close（done）关闭这条条目。',
+    'context_gap 用 bunny_task_space_context_write 写进事项 context.md 的“已定事项”后，当轮用 close（done）关闭这条条目。',
     'list 只读，可按 kind、scope、status（active、superseded、done）过滤，返回条目和账本版本；注入因篇幅截掉的条目用它读全。',
 ].join('\n');
 function entryView(entry) {

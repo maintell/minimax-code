@@ -4,7 +4,7 @@ import { LocalModelProviderError, } from '../contracts.js';
 import { generateProviderKey } from './provider-key.js';
 import {} from '../catalog/provider-views.js';
 import { ModelProviderServiceContext } from './service-context.js';
-import { modelAccessProviderReadOnlyError, assertCustomProviderEffortOptions, nextDuplicateProviderName, removeLegacyCustomProviderNpm, resetUnavailableCustomDefaultModel, } from './service-helpers.js';
+import { modelAccessProviderReadOnlyError, nextDuplicateProviderName, removeLegacyCustomProviderNpm, resetUnavailableCustomDefaultModel, } from './service-helpers.js';
 import { failoverPlan, readFailoverConfig } from '../failover/pool-config.js';
 import { groupHasAccount, reselectGroupAccounts } from '../failover/pool-groups.js';
 import { isModelAccessProvider, readModelAccessMetadata, readRemovedModels, } from '../model-access/projection.js';
@@ -49,7 +49,6 @@ export async function createUserProvider(context, input) {
                 }
                 : {}),
         };
-        assertCustomProviderEffortOptions(provider);
         tree[providerKey] = provider;
         draft.custom_provider = tree;
     });
@@ -250,7 +249,6 @@ function applyUserProviderUpdate(draft, providerKey, input, prepared) {
     assertModelAccessUpdateAllowed(provider, input);
     removeLegacyCustomProviderNpm(provider);
     applyProviderFields(provider, input, prepared.apiFormat, prepared.implicitCustomProviderThinking);
-    assertCustomProviderEffortOptions(provider);
     provider.options = updatedProviderOptions(provider, input, prepared);
     draft.custom_provider = tree;
 }

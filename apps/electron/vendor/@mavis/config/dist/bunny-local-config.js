@@ -17,6 +17,7 @@ export function parseBunnyConfig(raw) {
             ? { memory: { enabled: memoryRecord.enabled } }
             : {}),
         ...(typeof record.helperAgents === 'boolean' ? { helperAgents: record.helperAgents } : {}),
+        ...(typeof record.verdictGate === 'boolean' ? { verdictGate: record.verdictGate } : {}),
     };
 }
 //# sourceMappingURL=bunny-local-config.js.map

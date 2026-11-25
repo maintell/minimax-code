@@ -34,6 +34,9 @@ export function listEnabledMiniAppDefinitions(snapshot) {
         ...(plugin.iconPath ? { iconPath: plugin.iconPath } : {}),
         ...(plugin.miniapp?.surface.widget ? { widget: plugin.miniapp.surface.widget } : {}),
         ...(plugin.version ? { version: plugin.version } : {}),
+        ...(plugin.miniapp?.fileHandlers?.length
+            ? { fileHandlers: plugin.miniapp.fileHandlers }
+            : {}),
         candidate: miniAppCandidateFromPackage({ plugin }),
     }))
         .sort((left, right) => left.candidate.pluginId.localeCompare(right.candidate.pluginId));

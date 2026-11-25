@@ -1,12 +1,16 @@
 import { EventBridge } from '../event-bridge/index.js';
+import { newContentReviewTurnState, withContentReviewRequests, } from './content-review.js';
 import { composeStreamFn, resolveHostOutputTokenCap } from './llm.js';
 import { withLLMCallPreemption } from './llm-preemption.js';
 import { withLLMRetry } from './llm-retry.js';
 import { LLM_RESUME_STALL_MS } from './llm-stream-timeout.js';
+import { withRejectedMediaRetry } from './rejected-media-retry.js';
 import { withTurnRequestPhase } from './turn-timing.js';
 import { newTools } from './tools.js';
 export function newTurn(input, deps) {
     const resolved = input.llm;
+    // 先校验审核配置：给错直接让本轮在发出任何请求之前失败。
+    const contentReview = newContentReviewTurnState(input.contentReview);
     const networkRecovery = input.llmRetry?.networkRecovery;
     const composedStreamFn = composeStreamFn(resolved, networkRecovery
         ? { onResume: (listener) => networkRecovery.onResume(listener), stallMs: LLM_RESUME_STALL_MS }
@@ -68,10 +72,24 @@ export function newTurn(input, deps) {
         delete preemption.resendPhase;
         return resent ?? (logicalCalls++ === 0 ? 'initial' : 'iteration');
     };
-    // Outside retry, so a preempted call is never retried. Auxiliary calls stay unwrapped.
+    // Each resend without rejected media is a logical call of its own. The metrics
+    // have recorded the rejected attempt by the time it is resent, so it comes off
+    // the turn's failure provenance first: an accepted resend leaves no failure
+    // behind, and one that fails is attributed to its own cause. Auxiliary calls
+    // stay unwrapped.
+    const mediaCheckedStreamFn = withRejectedMediaRetry(mainStreamFn, {
+        logger: deps.logger,
+        sessionId: input.sessionId,
+        turnId: input.turnId,
+        beforeResend: () => deps.metrics?.forgetLLMFailureObservation(),
+    });
+    // Outside retry, so a preempted call is never retried. Outside the media
+    // check too: a preempted call ends in an abort the check passes through, and
+    // the response that stands in for it never reaches the check, so the media it
+    // carried is not taken as accepted. Auxiliary calls stay unwrapped.
     const preemptibleStreamFn = input.llmPreemption
-        ? withLLMCallPreemption(mainStreamFn, preemption, deps.nowMs, input.llmPreemption.wakeReasons, input.llmPreemption.interruptedUserMessage)
-        : mainStreamFn;
+        ? withLLMCallPreemption(mediaCheckedStreamFn, preemption, deps.nowMs, input.llmPreemption.wakeReasons, input.llmPreemption.interruptedUserMessage)
+        : mediaCheckedStreamFn;
     let eventSeq = 0;
     let runtimeSeq = 0;
     const nextEventId = input.eventIdGenerator ?? ((kind) => `evt_${input.turnId}_${kind}_${++eventSeq}`);
@@ -97,6 +115,7 @@ export function newTurn(input, deps) {
         logger: deps.logger,
         ...(input.captureToolTiming ? { captureToolTiming: true } : {}),
         ...(toolCallProvenanceResolver ? { toolCallProvenanceResolver } : {}),
+        ...(input.toolCallContent ? { toolCallContent: input.toolCallContent } : {}),
         ...(typeof modelContextWindow === 'number' &&
             Number.isFinite(modelContextWindow) &&
             modelContextWindow > 0
@@ -129,7 +148,9 @@ export function newTurn(input, deps) {
         bridge,
         hooks,
         tools,
-        streamFn: withSyntheticResponse(withLlmCallPreparedObservers(withTurnRequestPhase(preemptibleStreamFn, mainPhase, resolved.turnPhaseHeader), {
+        streamFn: withSyntheticResponse(
+        // 请求改写在 llm-retry 外层：同一次调用的物理重试复用同一份改写。
+        withLlmCallPreparedObservers(withContentReviewRequests(withTurnRequestPhase(preemptibleStreamFn, mainPhase, resolved.turnPhaseHeader), contentReview), {
             input,
             llm: resolved,
             tools,
@@ -144,12 +165,14 @@ export function newTurn(input, deps) {
             : {}),
         thinkingLevel: resolved.thinkingLevel ?? 'off',
         initialMessages: [...(input.history ?? [])],
+        assistantMessageIds: new WeakMap(),
         blockedToolCalls: [],
         syntheticResponse,
         rejectedAssistantMessages: new Set(),
         preemption,
         requestStoppedBeforeSend: false,
         recovery: { used: false, turnFailureRecoveries: 0 },
+        contentReview,
         nextEventId,
         nextRuntimeSeq,
     };

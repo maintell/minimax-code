@@ -1,7 +1,12 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { open, opendir } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, open, opendir, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
+import { isRetryableWindowsFileError } from '@mavis/shared';
+import { logger } from '../../../../infra/logging/logger.js';
+import { KeyedOperationQueue } from '../../../../infra/util/keyed-operation-queue.js';
+import { PluginSystemError } from '../../errors.js';
 import { isMiniAppRuntimePayloadExcludedPath, isPathCoveredByRoots } from './miniapp/path.js';
 export const PLUGIN_PACKAGE_V1_LIMITS = {
     maxArchiveBytes: 64 * 1024 * 1024,
@@ -169,6 +174,7 @@ export async function computePluginDirectoryDigest(root, options = {}) {
         totalBytes: 0,
         pathPolicy,
         rejectHardlinks: options.rejectHardlinks === true,
+        ...(options.exclude ? { skip: options.exclude } : {}),
     });
     const files = validateEntries(entries, false, pathPolicy);
     const hash = createContentHash(files.length);
@@ -258,6 +264,253 @@ export function pluginDigestCacheKey(contentDigest) {
     if (!match)
         fail('INVALID_CONTENT_DIGEST', 'content digest has an unsupported format');
     return `sha256-tree-v1-${match[1]}`;
+}
+// Same-process publishers serialize by root; cross-process safety relies only on
+// atomic rename and verification after a collision, not on this promise chain.
+const publications = new KeyedOperationQueue();
+const WINDOWS_CACHE_RETRIES = 4;
+const WINDOWS_CACHE_RETRY_DELAY_MS = 50;
+/**
+ * Publishes `<parent>/<cacheKey>` content-addressed: staging → verify digest → rename. An
+ * existing directory with the same digest is reused, also when a concurrent writer published it
+ * first. A persistent Windows file lock may prevent staging cleanup.
+ */
+export async function materializeContentAddressedDirectory(input) {
+    const holds = input.holds ??
+        ((root, contentDigest) => holdsDirectoryDigest(root, contentDigest, input.digestOptions));
+    await mkdir(input.parent, { recursive: true });
+    const materialize = () => materializeStagedDirectory(input, holds);
+    if (input.expectedDigest === undefined)
+        return materialize();
+    const root = path.resolve(input.parent, pluginDigestCacheKey(input.expectedDigest));
+    return publications.run(root, materialize);
+}
+async function materializeStagedDirectory(input, holds) {
+    if (input.expectedDigest !== undefined) {
+        const cacheKey = pluginDigestCacheKey(input.expectedDigest);
+        const root = path.join(input.parent, cacheKey);
+        if (await holds(root, input.expectedDigest)) {
+            return { cacheKey, root, contentDigest: input.expectedDigest, reused: true };
+        }
+    }
+    const staging = await mkdtemp(path.join(input.parent, input.stagingPrefix));
+    try {
+        await input.populate(staging);
+        const { contentDigest } = await computePluginDirectoryDigest(staging, input.digestOptions);
+        if (input.expectedDigest !== undefined && contentDigest !== input.expectedDigest) {
+            throw input.mismatchError?.() ?? new Error('staged content does not match its digest');
+        }
+        const cacheKey = pluginDigestCacheKey(contentDigest);
+        const root = path.join(input.parent, cacheKey);
+        const publish = async () => {
+            input.beforePublish?.();
+            // Known up front, the existing directory was checked before populating.
+            const reused = (input.expectedDigest === undefined && (await holds(root, contentDigest))) ||
+                (await publishStaged(staging, root, (candidateRoot) => holds(candidateRoot, contentDigest), input.beforePublish));
+            return { cacheKey, root, contentDigest, reused };
+        };
+        return await (input.expectedDigest === undefined
+            ? publications.run(path.resolve(root), publish)
+            : publish());
+    }
+    finally {
+        await removeStagingDirectory(staging);
+    }
+}
+/** Renames staging into place; `true` when a concurrent writer of the same content won. */
+async function publishStaged(staging, root, holds, beforeRetry) {
+    const move = () => renameStagedDirectory(staging, root, beforeRetry);
+    try {
+        await move();
+        return false;
+    }
+    catch (error) {
+        if (!isPublicationCollision(error) && !isRetryableWindowsFileError(error))
+            throw error;
+        if (await holds(root))
+            return true;
+        if (!isPublicationCollision(error))
+            throw error;
+    }
+    const aside = `${root}.corrupt-${randomUUID()}`;
+    try {
+        await rename(root, aside);
+    }
+    catch (error) {
+        if (error.code !== 'ENOENT')
+            throw error;
+        return renameOrReuse(move, root, holds);
+    }
+    if (await holdsQuarantinedDirectory(aside, holds)) {
+        // A cross-process winner may have replaced the damaged root before quarantine.
+        // Putting it back leaves a transient ENOENT for readers, as the pre-refactor rm
+        // path did; profile-level dataDir isolation makes same-root cross-process writes rare.
+        await restoreQuarantinedDirectory(aside, root, holds);
+        await rm(aside, { recursive: true, force: true });
+        return true;
+    }
+    try {
+        return await renameOrReuse(move, root, holds);
+    }
+    finally {
+        await rm(aside, { recursive: true, force: true });
+    }
+}
+async function renameStagedDirectory(staging, root, beforeRetry) {
+    for (let attempt = 0;; attempt++) {
+        try {
+            return await rename(staging, root);
+        }
+        catch (error) {
+            if (!isRetryableWindowsFileError(error))
+                throw error;
+            // An existing destination must go through digest verification and collision recovery.
+            if (await canStatDestination(root))
+                throw error;
+            const exhausted = attempt >= WINDOWS_CACHE_RETRIES;
+            logger.warn({
+                cacheKey: path.basename(root),
+                code: error.code,
+                attempt: attempt + 1,
+                outcome: exhausted ? 'exhausted' : 'retrying',
+            }, '[plugin-cache] Windows denied staged directory publication');
+            if (exhausted) {
+                throw new PluginSystemError('PLUGIN_CACHE_BUSY', 'Plugin cache is in use', {
+                    cause: error,
+                });
+            }
+            await delay(WINDOWS_CACHE_RETRY_DELAY_MS * (attempt + 1));
+            beforeRetry?.();
+        }
+    }
+}
+async function canStatDestination(root) {
+    try {
+        await lstat(root);
+        return true;
+    }
+    catch (error) {
+        // A locked lookup uses the same retry budget as the rename.
+        if (error.code === 'ENOENT' || isRetryableWindowsFileError(error))
+            return false;
+        throw error;
+    }
+}
+async function removeStagingDirectory(staging) {
+    const onWindows = process.platform === 'win32';
+    try {
+        await rm(staging, {
+            recursive: true,
+            force: true,
+            maxRetries: onWindows ? WINDOWS_CACHE_RETRIES : 0,
+            retryDelay: WINDOWS_CACHE_RETRY_DELAY_MS,
+        });
+    }
+    catch (error) {
+        // Preserve the publication outcome if a Windows handle still blocks staging cleanup.
+        const { code } = error;
+        if (!isRetryableWindowsFileError(error) && !(onWindows && code === 'ENOTEMPTY'))
+            throw error;
+        logger.warn({ staging: path.basename(staging), code }, '[plugin-cache] Windows retained a locked staging directory after cleanup retries');
+    }
+}
+async function renameOrReuse(move, root, holds) {
+    try {
+        await move();
+        return false;
+    }
+    catch (error) {
+        if (!isPublicationCollision(error) && !isRetryableWindowsFileError(error))
+            throw error;
+        if (await holds(root))
+            return true;
+        throw error;
+    }
+}
+async function holdsQuarantinedDirectory(root, holds) {
+    try {
+        return await holds(root);
+    }
+    catch {
+        // Once quarantined, an unverifiable entry is damaged and must be cleaned up.
+        return false;
+    }
+}
+async function restoreQuarantinedDirectory(aside, root, holds) {
+    const displaced = `${root}.corrupt-${randomUUID()}`;
+    let removeDisplaced = true;
+    let restorationFailure;
+    try {
+        try {
+            await renameOrReuse(() => rename(aside, root), root, holds);
+            return;
+        }
+        catch (error) {
+            if (!isPublicationCollision(error))
+                throw error;
+        }
+        // One bounded retry: move the invalid interloper out before restoring the winner.
+        try {
+            await rename(root, displaced);
+        }
+        catch (error) {
+            if (error.code !== 'ENOENT')
+                throw error;
+        }
+        // The interloper could itself have been replaced by another valid winner.
+        removeDisplaced = !(await holdsQuarantinedDirectory(displaced, holds));
+        await renameOrReuse(() => rename(aside, root), root, holds);
+        removeDisplaced = true;
+    }
+    catch (error) {
+        const retained = removeDisplaced ? aside : `${aside}, ${displaced}`;
+        restorationFailure = new Error(`could not restore valid quarantined directory; retained at ${retained}`, { cause: error });
+    }
+    finally {
+        if (removeDisplaced)
+            await cleanupDisplacedDirectory(displaced, aside, restorationFailure);
+    }
+    if (restorationFailure)
+        throw restorationFailure;
+}
+async function cleanupDisplacedDirectory(displaced, aside, restorationFailure) {
+    try {
+        await rm(displaced, { recursive: true, force: true });
+    }
+    catch (cleanupFailure) {
+        const retained = [displaced];
+        try {
+            await lstat(aside);
+            retained.unshift(aside);
+        }
+        catch (error) {
+            if (error.code !== 'ENOENT')
+                retained.unshift(aside);
+        }
+        throw new Error(`${restorationFailure?.message ?? 'quarantine restoration completed'}; cleanup failed; retained at ${retained.join(', ')}`, {
+            cause: restorationFailure
+                ? new AggregateError([restorationFailure, cleanupFailure])
+                : cleanupFailure,
+        });
+    }
+}
+function isPublicationCollision(error) {
+    const code = error.code;
+    return (code === 'EEXIST' ||
+        code === 'ENOTEMPTY' ||
+        code === 'ENOTDIR' ||
+        (code === 'EPERM' && process.platform === 'win32'));
+}
+async function holdsDirectoryDigest(root, contentDigest, options) {
+    try {
+        const stat = await lstat(root);
+        if (stat.isSymbolicLink() || !stat.isDirectory())
+            return false;
+        return (await computePluginDirectoryDigest(root, options)).contentDigest === contentDigest;
+    }
+    catch {
+        return false;
+    }
 }
 function validateEntries(entries, requireContent, pathPolicy) {
     if (entries.length > PLUGIN_PACKAGE_V1_LIMITS.maxArchiveEntries) {

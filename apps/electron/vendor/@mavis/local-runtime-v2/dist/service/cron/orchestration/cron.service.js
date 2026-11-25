@@ -50,6 +50,17 @@ class SchedulerBackedCronService {
     targetsMainConversation(agentName) {
         return this.deps.lifecycle.targetsMainConversation(agentName);
     }
+    recordScheduleOrigin(command) {
+        const store = this.deps.scheduleOrigins;
+        if (!store)
+            return false;
+        const definition = this.deps.definitions.get(command.cronId);
+        if (!definition || definition.agentName !== command.agentName)
+            return false;
+        if (!this.deps.lifecycle.targetsMainConversation(command.agentName))
+            return false;
+        return store.record(command.cronId, command.originChannel);
+    }
     getDefinition(cronId) {
         const definition = this.deps.definitions.get(cronId, true);
         if (!definition)

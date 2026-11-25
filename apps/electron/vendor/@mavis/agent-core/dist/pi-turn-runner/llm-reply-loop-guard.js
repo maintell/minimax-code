@@ -14,7 +14,10 @@
 // counted at all. An emoji counts as a word: a reply stuck emitting the same
 // emoji (#592) is a loop like any other. A loop with no break in it
 // ("mcp mcp mcp …", "🤯🤯🤯…") is read on its own once a unit grows to
-// UNIT_MOST characters.
+// UNIT_MOST characters. Such a run may also be marks alone, with no letter,
+// digit or emoji (">>>>…", "⇒⇒⇒…", "✗ ✗ ✗ …"); those are read as a loop only
+// when one short piece repeats exactly, since a long line of a few marks can be
+// a real answer (Morse code, a Brainfuck program).
 /** Units of a channel looked at. */
 export const LOOP_WINDOW = 256;
 /**
@@ -67,6 +70,8 @@ const LETTER = /\p{L}/u;
 const DIGIT = /\p{Nd}/u;
 const WORD_CHAR = /[\p{L}\p{Nd}_]/u;
 const SPACE = /\s/u;
+const LETTER_OR_DIGIT = /[\p{L}\p{Nd}]/u;
+const VISIBLE = /\S/u;
 const UNIT_TAIL = /[.!?。！？,，;；:：…\s]+$/u;
 /** A word, or one emoji: the tokens a run-on loop is counted in. */
 const TOKEN = /[\p{L}\p{Nd}_]+|\p{Extended_Pictographic}/gu;
@@ -173,12 +178,15 @@ class UnitRun {
     }
 }
 /**
- * Whether `s`, written with no break, is the same few words or emoji over and
- * over, and which. A long line of prose, code, JSON, base64 or a table row has
- * many different words (its names, numbers and cells) or none.
+ * Whether `s`, written with no break, is the same few words, emoji or marks
+ * over and over, and which. A long line of prose, code, JSON, base64 or a table
+ * row has many different words (its names, numbers and cells) or none; marks
+ * alone count only as one short piece repeated exactly.
  */
 export function runOnWords(s) {
-    if (!hasWordOrEmoji(s))
+    const worded = hasWordOrEmoji(s);
+    // Otherwise marks alone (`>>>`, `⇒ ⇒`, `✗ ✗`): no letter or digit, and not blank.
+    if (!worded && (LETTER_OR_DIGIT.test(s) || !VISIBLE.test(s)))
         return undefined;
     // One piece repeated: a word or a few with no space between.
     for (let p = 1; p <= 64 && 4 * p <= s.length; p += 1) {
@@ -188,6 +196,8 @@ export function runOnWords(s) {
         if (i === s.length)
             return [s.slice(0, Math.min(3 * p, s.length)).trim()];
     }
+    if (!worded)
+        return undefined;
     const counts = new Map();
     let words = 0;
     for (const [word] of s.toLowerCase().matchAll(TOKEN)) {

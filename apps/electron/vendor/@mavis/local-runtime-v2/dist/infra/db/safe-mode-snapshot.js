@@ -1,6 +1,6 @@
 // GENERATED FILE — DO NOT EDIT BY HAND.
 // Regenerate with: node scripts/generate-local-runtime-schema-snapshot.mjs
-// Source: sqlite_master after running ALL_MIGRATIONS (schema version 65).
+// Source: sqlite_master after running ALL_MIGRATIONS (schema version 72).
 //
 // Safe-mode startup replays these idempotent statements to backfill schema
 // structure when a migration is quarantined; the contract test in
@@ -65,7 +65,7 @@ export const SCHEMA_SNAPSHOT_STATEMENTS = [
     'CREATE INDEX IF NOT EXISTS idx_local_runtime_turn_ingress_clients_turn\n    ON local_runtime_turn_ingress_client_requests(turn_id, ordinal)',
     'CREATE UNIQUE INDEX IF NOT EXISTS idx_local_runtime_legacy_migrations_local_session\n    ON local_runtime_legacy_migrations(local_session_id)',
     'CREATE INDEX IF NOT EXISTS idx_local_runtime_legacy_migrations_framework_session\n    ON local_runtime_legacy_migrations(legacy_framework_session_id)',
-    "CREATE TABLE IF NOT EXISTS \"local_runtime_projects\" (\n      project_id INTEGER PRIMARY KEY AUTOINCREMENT,\n      project_kind TEXT NOT NULL CHECK(project_kind IN ('default', 'workspace')),\n      workspace_dir TEXT,\n      pinned INTEGER NOT NULL DEFAULT 0,\n      hidden INTEGER NOT NULL DEFAULT 0,\n      order_index INTEGER NOT NULL DEFAULT 2147483647,\n      recent_at_ms INTEGER,\n      latest_activity_at_ms INTEGER NOT NULL DEFAULT 0,\n      session_count INTEGER NOT NULL DEFAULT 0,\n      extra_data_json TEXT NOT NULL DEFAULT '{}',\n      created_at_ms INTEGER NOT NULL,\n      updated_at_ms INTEGER NOT NULL, display_name TEXT,\n      CHECK (\n        (project_kind = 'default' AND workspace_dir IS NULL)\n        OR (project_kind = 'workspace' AND workspace_dir IS NOT NULL AND trim(workspace_dir) <> '')\n      )\n    )",
+    "CREATE TABLE IF NOT EXISTS \"local_runtime_projects\" (\n      project_id INTEGER PRIMARY KEY AUTOINCREMENT,\n      project_kind TEXT NOT NULL CHECK(project_kind IN ('default', 'workspace')),\n      workspace_dir TEXT,\n      pinned INTEGER NOT NULL DEFAULT 0,\n      hidden INTEGER NOT NULL DEFAULT 0,\n      order_index INTEGER NOT NULL DEFAULT 2147483647,\n      recent_at_ms INTEGER,\n      latest_activity_at_ms INTEGER NOT NULL DEFAULT 0,\n      session_count INTEGER NOT NULL DEFAULT 0,\n      extra_data_json TEXT NOT NULL DEFAULT '{}',\n      created_at_ms INTEGER NOT NULL,\n      updated_at_ms INTEGER NOT NULL, display_name TEXT, listed_at_ms INTEGER,\n      CHECK (\n        (project_kind = 'default' AND workspace_dir IS NULL)\n        OR (project_kind = 'workspace' AND workspace_dir IS NOT NULL AND trim(workspace_dir) <> '')\n      )\n    )",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_local_runtime_projects_one_default_v1\n    ON local_runtime_projects(project_kind) WHERE project_kind = 'default'",
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_local_runtime_projects_workspace_v1\n    ON local_runtime_projects(workspace_dir) WHERE project_kind = 'workspace'",
     'CREATE INDEX IF NOT EXISTS idx_local_runtime_projects_list_v1\n    ON local_runtime_projects(\n      hidden, pinned DESC, order_index ASC, latest_activity_at_ms DESC, project_id ASC\n    )',
@@ -172,5 +172,10 @@ export const SCHEMA_SNAPSHOT_STATEMENTS = [
     'CREATE INDEX IF NOT EXISTS idx_miniapp_creations_session\n      ON local_runtime_miniapp_creations(account_id, deployment, session_id)',
     "CREATE INDEX IF NOT EXISTS idx_local_runtime_sessions_hidden_purpose_v3\n    ON local_runtime_sessions(purpose)\n    WHERE columnar_version = 3 AND archived = 0 AND visibility = 'hidden'",
     'CREATE TABLE IF NOT EXISTS local_runtime_v2_session_auto_resume (\n      session_id TEXT PRIMARY KEY,\n      turn_id TEXT NOT NULL,\n      resume_at_ms INTEGER NOT NULL,\n      interrupted_at_ms INTEGER NOT NULL,\n      auto_retry_count INTEGER NOT NULL DEFAULT 0,\n      model_name TEXT NOT NULL,\n      updated_at_ms INTEGER NOT NULL\n    )',
+    'CREATE TABLE IF NOT EXISTS local_runtime_session_file_syncs (\n      session_id TEXT NOT NULL,\n      path TEXT NOT NULL,\n      node_id TEXT NOT NULL,\n      sha256 TEXT NOT NULL,\n      size INTEGER NOT NULL,\n      mtime_ms INTEGER NOT NULL,\n      drive_path TEXT,\n      updated_at_ms INTEGER NOT NULL, account_id TEXT,\n      PRIMARY KEY (session_id, path)\n    )',
+    'CREATE INDEX IF NOT EXISTS idx_session_file_sync_node ON local_runtime_session_file_syncs (node_id)',
+    'CREATE TABLE IF NOT EXISTS extension_preview_consents (\n      session_id TEXT NOT NULL,\n      plugin_id TEXT NOT NULL,\n      bound_digest TEXT NOT NULL,\n      updated_at_ms INTEGER NOT NULL,\n      PRIMARY KEY (session_id, plugin_id)\n    )',
+    'CREATE TABLE IF NOT EXISTS local_runtime_skill_usage (\n      skill_key TEXT PRIMARY KEY,\n      use_count INTEGER NOT NULL DEFAULT 0 CHECK (use_count >= 0),\n      last_used_at_ms INTEGER NOT NULL DEFAULT 0,\n      first_seen_at_ms INTEGER NOT NULL\n    )',
+    'CREATE TABLE IF NOT EXISTS local_runtime_v2_session_merge_requests (\n      session_id TEXT NOT NULL,\n      ref_key TEXT NOT NULL,\n      platform TEXT NOT NULL,\n      host TEXT NOT NULL,\n      project_path TEXT NOT NULL,\n      number INTEGER NOT NULL,\n      web_url TEXT NOT NULL,\n      source TEXT NOT NULL,\n      linked_at_ms INTEGER NOT NULL,\n      removed_at_ms INTEGER,\n      PRIMARY KEY (session_id, ref_key)\n    )',
 ];
 //# sourceMappingURL=safe-mode-snapshot.js.map

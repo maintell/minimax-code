@@ -89,7 +89,6 @@
       "src/service/turn-system/index.ts!",
       "src/service/agent/public.ts!",
       "src/service/turn-system/agent-host/index.ts!",
-      "src/service/turn-system/compaction/index.ts!",
       "src/service/model-system/index.ts!",
       "src/http/routing/bindings.gen.ts!",
       "src/http/routing/contracts.gen.ts!",
@@ -100,8 +99,11 @@
       "src/infra/config/routing-headers.ts!",
       "src/infra/runtime-owner/index.ts!",
       "src/infra/legacy-db/workspace-indexing-types.ts!",
-      "src/service/turn-system/agent-host/runner/ptc/quickjs-worker.ts!",
-      "src/service/model-access-extension/host-process/shim/host-entry.ts!"
+      "src/service/browser-use/program/browser-program-worker.ts!",
+      "src/service/model-access-extension/host-process/shim/host-entry.ts!",
+      "src/service/plugin-extension/host/realm/worker.ts!",
+      "src/service/plugin-extension/authoring/testing/worker.ts!",
+      "src/service/plugin-extension/sdk/author/*.ts!"
     ],
     "project": [
       "src/**/*.ts!",
@@ -122,6 +124,7 @@
     "@mavis/conversation-contract": "file:../conversation-contract",
     "@mavis/cron": "file:../cron",
     "@mavis/goal": "file:../goal",
+    "@mavis/harness": "file:../harness",
     "@mavis/mcp": "file:../mcp",
     "@minimax/model-access-sdk": "file:../../@minimax/model-access-sdk",
     "@mavis/permission": "file:../permission",
@@ -143,6 +146,7 @@
     "diff": "^8.0.4",
     "drizzle-orm": "^0.45.2",
     "es-module-lexer": "1.7.0",
+    "esbuild": "0.25.12",
     "gpt-tokenizer": "3.4.0",
     "handlebars": "^4.7.9",
     "hono": "^4.7.11",
@@ -155,6 +159,7 @@
     "saxes": "6.0.0",
     "smol-toml": "1.7.0",
     "typebox": "1.1.38",
+    "typescript": "^5",
     "yaml": "^2.9.0",
     "zod": "^3",
     "@mavis/background-task": "file:../background-task"

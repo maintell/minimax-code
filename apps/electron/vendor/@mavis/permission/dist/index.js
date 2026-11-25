@@ -27,6 +27,7 @@ export { HARD_BLOCKED_REGISTRY, SOFT_RISK_REGISTRY, SUBCOMMAND_DANGEROUS_PATTERN
 // ── Decision engine ──
 export { PermissionEngine } from './engine.js';
 export { registerDefaultCheckers } from './tools/index.js';
+export { EXTENSION_DEV_ROOT_SEGMENTS, EXTENSION_DEV_SESSION_SEGMENT, } from './tools/extension-dev-directory.js';
 export { unwrapCommandWrappers, unwrapBashCommandWrappers, readBashInlineScript, } from './tools/bash-wrapper-unwrap.js';
 export { isRmCommand, parseRmTargets, splitCommand } from './tools/bash-permission.js';
 export { stripDataHeredocBodies } from './tools/bash-safety-scan.js';
@@ -38,7 +39,10 @@ export { snapshotPermissionEffectiveInput, snapshotPermissionInput } from './eff
 export { createPermissionExecutionPlan, validatePermissionExecutionPlan, } from './execution-plan.js';
 export { isKnownSafeCommand } from './tools/safe-command.js';
 export { isKnownSafePowerShellCommand } from './tools/safe-command.js';
-export { isSameResolvedPath } from './tools/path-identity.js';
+export { isSameResolvedPath, reachesRootInOtherCase } from './tools/path-identity.js';
+export { READ_ONLY_TOOLS, TEMPLATE_SUFFIXES } from './tools/fs-permission.js';
+export { WRITE_TOOLS } from './tools/fs-input.js';
+export { resolveWriteTargetLocation } from './tools/fs-input.js';
 export { createToolPermissionContext } from './context.js';
 export { resolvePermissionPath } from './path-resolver.js';
 export { extractBashPathIntents } from './tools/path-capability.js';
@@ -48,6 +52,8 @@ export { isShellCommentStart, findShellCommentLineEnd, readBashExpansion, } from
 export { commandHasExecutedHeredocBody, commandHasShellScriptHeredocBody, } from './tools/bash-safety-scan.js';
 // ── Permission Core contract / reducer ──
 export { reducePermissionClassifierDecision, reducePermissionDecision, reducePermissionEvaluation, permissionModeToProfile, } from './permission-core.js';
+// ── MCP rule identity `(plugin, server, tool)` ──
+export { MCP_ALLOW_NOT_INHERITED, MCP_PLUGIN_RULE_PREFIX, mcpPluginRuleKey, } from './mcp-rule-subject.js';
 export { adaptLegacyPermissionResult, evaluateLegacyPermission, } from './legacy-permission-adapter.js';
 // ── Cloud gateway gating ──
 export { shouldUseCloudClassify } from './classifier/cloud-classify-client.js';

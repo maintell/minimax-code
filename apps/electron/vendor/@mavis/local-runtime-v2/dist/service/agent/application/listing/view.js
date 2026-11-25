@@ -17,6 +17,8 @@ export function toBuiltinRenderInput(context, resolveLocale) {
         cronEnabled: input.cronEnabled,
         ...(input.bunnyHelperAgents === true ? { bunnyHelperAgents: true } : {}),
         ...(input.bunnyMemory === true ? { bunnyMemory: true } : {}),
+        ...(input.bunnyVerdictGate === true ? { bunnyVerdictGate: true } : {}),
+        ...(input.inlineActions === true ? { inlineActions: true } : {}),
         ...(input.dataDirToken === undefined ? {} : { dataDirToken: input.dataDirToken }),
     };
 }

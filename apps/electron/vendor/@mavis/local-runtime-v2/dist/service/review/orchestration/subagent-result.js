@@ -22,6 +22,8 @@ export async function waitForReviewCompletion(conversation, sessionId, completio
             resolve({ status: 'aborted', messages: [] });
         };
         signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted)
+            onAbort();
     });
     try {
         return await Promise.race([completion, aborted]);

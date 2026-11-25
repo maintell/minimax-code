@@ -1,17 +1,14 @@
-import { createHash } from 'node:crypto';
-import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { activeHistoryGeneration, assertAppendIdentityBoundary, assertCanonicalRecordChange, assertCompactionCommitted, canonicalHistoryMessage, canonicalRecord, historyArchive, markHistoryArtifact, messageIdFromSeed, placeCompaction, planAppend, planCompaction, planReplacement, safeCompactionId, semanticHistoryRevision, storedHistoryGeneration, withoutHistoryArtifact, } from '@mavis/harness';
 import { canonicalActiveHistoryRevision, canonicalHistoryRevision, JsonlAppendCommitUncertainError, } from '../../sessions/representation/canonical-history-contract.js';
 import { createCanonicalHistoryFileAdapter } from '../../sessions/representation/canonical-history.js';
 import { repairCanonicalHistory } from './canonical-history-recovery.js';
 import { deleteSessionHistory } from './session-history-paths.js';
 import { createSessionHistoryLocationResolver, } from './session-history-location.js';
 import { ensureCanonicalHistoryMaterialized, } from './canonical-history-materializer.js';
-import { HistoryScannerError, verifyCompactionParent, } from './mutation/canonical-history-scanner.js';
-import { isUserMessageId } from '../../shared/user-message-id.js';
+import { canonicalSnapshotCodec, canonicalSnapshotEntry, HistoryScannerError, verifyCompactionParent, } from './mutation/canonical-history-scanner.js';
 import { readSegmentId } from './segment/segment-prefix.js';
 import { segmentReplacementEnvelopes } from './segment/segment-replacement.js';
-import { isSideChatModeMessage } from '../../shared/sidechat-mode.js';
 import { createSessionHistoryIoLane, } from './mutation/session-history-coordination.js';
 import { repairCorruptedCanonicalHistory, } from './mutation/canonical-history-repair.js';
 import { resetCanonicalHistory, restoreCanonicalHistoryResetBackup, } from './mutation/canonical-history-reset.js';
@@ -64,7 +61,7 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
             const active = await files.readActiveStrict(paths.messages);
             return {
                 segmentId: readSegmentId(active),
-                generation: activeGeneration(active),
+                generation: activeHistoryGeneration(active),
                 // The reader's records are deeply frozen and owned by it; share them instead of copying.
                 records: active.map(({ message_id, turn_id, message }) => ({
                     message_id,
@@ -86,16 +83,14 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
         }),
         append: (change) => inLane(change.sessionId, async () => {
             await persistCanonical(async () => {
-                assertChange(change, 'messageDelta');
+                assertCanonicalRecordChange(change, 'messageDelta');
                 const paths = await ensureInitialized(change.sessionId);
                 const existing = await files.readActiveStrict(paths.messages);
-                const appended = appendEnvelopes(change);
-                assertAppendIdentityBoundary(existing, appended);
                 await appendWithInterruptedToolRoundRecovery({
                     files,
                     path: paths.messages,
                     existing,
-                    appended,
+                    appended: canonicalEnvelopes(planAppend(existing, change)),
                 });
             }, retryDelay);
             const committed = await readSnapshot(change.sessionId, true);
@@ -104,15 +99,13 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
         }),
         replace: (change) => inLane(change.sessionId, async () => {
             await persistCanonical(async () => {
-                assertChange(change, 'replaceMessages');
+                assertCanonicalRecordChange(change, 'replaceMessages');
                 const paths = await ensureInitialized(change.sessionId);
                 const existing = await files.readStrict(paths.messages);
-                const snapshotId = replacementSnapshotId(change.metadata);
-                if (snapshotId) {
-                    const generation = activeGeneration(existing);
-                    await files.publishSnapshot(join(paths.snapshots, `g${String(generation).padStart(12, '0')}--${safeCompactionId(snapshotId)}.jsonl`), existing);
-                }
-                await files.replace(paths.messages, replacementEnvelopes(change, existing));
+                const plan = planReplacement(existing, change, activeHistoryGeneration(existing));
+                if (plan.archive)
+                    await publishArchive(files, paths, plan.archive);
+                await files.replace(paths.messages, canonicalEnvelopes(plan.active));
             }, retryDelay);
             const committed = await readSnapshot(change.sessionId, true);
             options.activity?.notify(change.sessionId);
@@ -132,29 +125,14 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
             files.forget?.(paths.messages);
             const active = await files.readActiveStrict(paths.messages);
             await verifyCompactionParentAllowingMissing(paths, active);
-            const generation = activeGeneration(active);
-            const compactionId = safeCompactionId(change.compactionId);
-            const snapshotPath = join(paths.snapshots, `g${String(generation).padStart(12, '0')}--${compactionId}.jsonl`);
-            const preRevision = canonicalActiveHistoryRevision(active);
-            const replacement = compactionReplacementEnvelopes(change, active);
-            const marker = {
-                schemaVersion: 1,
-                generation: generation + 1,
-                producedBy: persistedProducer(change.method),
-                parentSnapshot: {
-                    generation,
-                    compactionId,
-                    revision: preRevision,
-                },
-            };
-            const markedReplacement = markHistoryArtifact(replacement, marker);
-            await files.publishSnapshot(snapshotPath, active);
-            await files.replaceActive(paths.messages, markedReplacement);
+            const plan = planCanonicalCompaction(active, change);
+            // The record marker names the pre-image itself, so placement reads no other archive.
+            const placement = placeCompaction(canonicalSnapshotCodec(paths.snapshots), { entries: [] }, plan);
+            for (const archive of placement.archives)
+                await publishArchive(files, paths, archive);
+            await files.replaceActive(paths.messages, canonicalEnvelopes(plan.active));
             const committed = await files.readActiveStrict(paths.messages);
-            const committedGeneration = activeGeneration(committed);
-            if (committedGeneration !== generation + 1) {
-                throw new Error(`Canonical compaction generation verification failed: ${change.sessionId}`);
-            }
+            const committedGeneration = assertCompactionCommitted(storedHistoryGeneration(committed), placement, change.sessionId);
             const result = {
                 revision: canonicalActiveHistoryRevision(committed),
                 generation: committedGeneration,
@@ -210,14 +188,14 @@ export function createSessionSystemCanonicalHistoryProvider(options) {
 /** The handoff header a context reset leaves as the whole active history (context reset spec 4.1). */
 function resetEnvelope(input) {
     const resetId = safeCompactionId(input.resetId);
-    const header = historyMessage(input.header);
+    const header = canonicalHistoryMessage(input.header);
     return {
         resetId,
-        header: {
+        header: canonicalEnvelope({
             message_id: messageIdFromSeed(`${resetId}:0:${JSON.stringify(header)}`),
             turn_id: `${input.turnId}:compaction`,
             message: header,
-        },
+        }),
     };
 }
 async function persistCanonical(operation, retryDelay, attempt = 1) {
@@ -259,326 +237,51 @@ function repairedCommittedTail(existing, appended) {
         issue.recordIndex < existing.length;
     return repairsCommittedTail ? recovery.records : undefined;
 }
-function appendEnvelopes(change) {
-    const identityHints = appendIdentityHints(change);
-    return change.messages.map((message, index) => envelope({
-        change,
-        message,
-        turnId: change.turnId,
-        index,
-        identityHint: identityHints.get(index),
-    }));
-}
-function appendIdentityHints(change) {
-    const hints = new Map();
-    for (const hint of change.identityHints ?? []) {
-        if (!Number.isSafeInteger(hint.index) ||
-            hint.index < 0 ||
-            hint.index >= change.messages.length) {
-            throw new TypeError(`Canonical history identity hint index is invalid: ${String(hint.index)}`);
-        }
-        if (hints.has(hint.index)) {
-            throw new TypeError(`Canonical history identity hint index is duplicated: ${String(hint.index)}`);
-        }
-        assertAppendIdentityHint(hint, historyMessage(change.messages[hint.index]));
-        hints.set(hint.index, hint);
-    }
-    if (new Set([...hints.values()].map(({ messageId }) => messageId)).size !== hints.size) {
-        throw new TypeError('Canonical history identity hint message id is duplicated.');
-    }
-    return hints;
-}
-function assertAppendIdentityHint(hint, message) {
-    if (!hint.messageId.trim() || !/^msg-.+/u.test(hint.messageId)) {
-        throw new TypeError('Canonical history identity hint message id is invalid.');
-    }
-    if (hint.source === 'display-user') {
-        if (message.role !== 'user' || !isUserMessageId(hint.messageId)) {
-            throw new TypeError('Canonical display user identity hint is invalid.');
-        }
-        return;
-    }
-    if (hint.source !== 'preserved' && hint.source !== 'internal-new') {
-        throw new TypeError('Canonical history identity hint source is invalid.');
-    }
-    if (hint.source === 'internal-new' && isUserMessageId(hint.messageId)) {
-        throw new TypeError('Canonical internal identity cannot use an external user id.');
-    }
-}
-function assertAppendIdentityBoundary(existing, appended) {
-    const identities = new Set(existing.map(({ message_id }) => message_id));
-    for (const { message_id } of appended) {
-        if (identities.has(message_id)) {
-            throw new TypeError(`Canonical history append identity is duplicated: ${message_id}`);
-        }
-        identities.add(message_id);
-    }
-}
-function replacementEnvelopes(change, existing) {
-    const entries = change.replacementEntries;
-    if (!entries || entries.length !== change.messages.length) {
-        throw new TypeError('Canonical history replacement identity plan is required.');
-    }
-    const existingById = new Map();
-    for (const record of existing) {
-        if (existingById.has(record.message_id)) {
-            throw new TypeError(`Canonical history contains duplicate message id: ${record.message_id}`);
-        }
-        existingById.set(record.message_id, record);
-    }
-    const used = new Set();
-    const replacement = entries.map((entry, index) => {
-        const normalized = historyMessage(entry.message);
-        const { messageId, previous } = resolveReplacementIdentity({
-            entry,
-            normalized,
-            existingById,
-            change,
-            index,
-        });
-        if (used.has(messageId))
-            throw new TypeError(`Canonical history replacement identity is duplicated: ${messageId}`);
-        used.add(messageId);
-        return {
-            ...(previous ?? {}),
-            message_id: messageId,
-            turn_id: previous?.turn_id ??
-                (normalized.role === 'user' ? `${change.turnId}:${String(index)}` : change.turnId),
-            message: normalized,
-        };
-    });
-    return preserveHistoryArtifact(existing, replacement);
-}
-function resolveReplacementIdentity(input) {
-    const { entry } = input;
-    if (entry.identity.kind === 'preserve') {
-        const previous = input.existingById.get(entry.identity.messageId);
-        if (!previous) {
-            throw new TypeError(`Canonical history identity is missing: ${entry.identity.messageId}`);
-        }
-        return { messageId: entry.identity.messageId, previous };
-    }
-    if (entry.identity.kind === 'external-user') {
-        assertExternalUserIdentity(entry.identity.messageId, input.normalized, input.existingById);
-        return { messageId: entry.identity.messageId };
-    }
-    if (!entry.identity.seed.trim()) {
-        throw new TypeError('Canonical history new identity seed is required.');
-    }
-    return {
-        messageId: messageIdFromSeed(`${input.change.operation.id}:${entry.identity.seed}:${String(input.index)}`),
-    };
-}
-function assertExternalUserIdentity(messageId, message, existingById) {
-    if (message.role !== 'user' || !isUserMessageId(messageId)) {
-        throw new TypeError(`External user identity requires a user message: ${messageId}`);
-    }
-    if (existingById.has(messageId)) {
-        throw new TypeError(`External user identity already exists; use preserve: ${messageId}`);
-    }
-}
-function envelope(input) {
-    const normalized = historyMessage(input.message);
-    return {
-        message_id: input.identityHint?.messageId ??
-            (input.change.operation.kind === 'worktree-reminder'
-                ? `msg-control-${createHash('sha256')
-                    .update(`${input.change.operation.id}:${String(input.index)}`)
-                    .digest('base64url')}`
-                : messageIdFromSeed(`${input.change.operation.id}:${String(input.index)}:${JSON.stringify(normalized)}`)),
-        turn_id: input.turnId,
-        message: normalized,
-    };
-}
-function messageIdFromSeed(seed) {
-    return `msg-${createHash('sha256').update(seed).digest('base64url')}`;
-}
-function historyMessage(value) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-        throw new TypeError('Canonical history contains a non-object message.');
-    }
-    const minimal = readMinimalCompactionSummary(value);
-    if (minimal)
-        return minimal;
-    const role = Reflect.get(value, 'role');
-    const timestamp = Reflect.get(value, 'timestamp');
-    if (typeof role !== 'string' ||
-        !role ||
-        typeof timestamp !== 'number' ||
-        !Number.isFinite(timestamp)) {
-        throw new TypeError('Canonical history contains an invalid Pi message.');
-    }
-    // Written records are decoded again from the file, so the caller's objects are never retained.
-    return value;
-}
-function readMinimalCompactionSummary(value) {
-    if (Reflect.get(value, 'role') !== 'compactionSummary')
-        return undefined;
-    const summary = Reflect.get(value, 'summary');
-    if (typeof summary !== 'string' ||
-        Object.hasOwn(value, 'timestamp') ||
-        Object.hasOwn(value, 'tokensBefore') ||
-        Object.keys(value).some((key) => key !== 'role' && key !== 'summary')) {
-        return undefined;
-    }
-    return { role: 'compactionSummary', summary };
-}
-function assertChange(change, reason) {
-    if (change.reason !== reason || !change.operation.id.trim()) {
-        throw new TypeError(`Canonical history ${reason} change is invalid.`);
-    }
-}
-function compactionReplacementEnvelopes(change, active) {
-    if (change.method === 'llm_segment_checkpoint') {
-        return segmentReplacementEnvelopes(change, active, {
-            create: (message, index) => envelope({ change, message, turnId: `${change.turnId}:compaction`, index }),
-            keep: withoutHistoryArtifact,
-            roleOf: (message) => historyMessage(message).role,
-        });
-    }
-    const currentUserTail = readCurrentUserTail(change, active);
-    const baseMessages = currentUserTail?.baseMessages ?? change.messages;
-    const replacement = baseMessages.map((message, index) => envelope({ change, message, turnId: `${change.turnId}:compaction`, index }));
-    assertCheckpointReplacement(replacement);
-    return currentUserTail ? [...replacement, ...currentUserTail.envelopes] : replacement;
-}
-function assertCheckpointReplacement(replacement) {
-    if (replacement[0]?.message.role !== 'compactionSummary' ||
-        (replacement.length !== 1 &&
-            !(replacement.length === 2 && isSideChatModeMessage(replacement[1]?.message)))) {
-        throw new TypeError('Canonical checkpoint compaction must contain one native summary.');
-    }
-}
-function readCurrentUserTail(change, active) {
-    const sourceIndex = change.currentUserSourceIndex;
-    if (sourceIndex === undefined)
-        return undefined;
-    if (!Number.isSafeInteger(sourceIndex) || sourceIndex < 0 || sourceIndex >= active.length) {
-        throw new TypeError('Canonical current-user tail source lineage is invalid.');
-    }
-    const markerCount = change.placedMarkerCount ?? 1;
-    if (!Number.isSafeInteger(markerCount) || markerCount < 1) {
-        throw new TypeError('Canonical current-user tail marker count is invalid.');
-    }
-    const tailLength = markerCount + 1;
-    if (change.messages.length < tailLength) {
-        throw new TypeError('Canonical current-user tail is incomplete.');
-    }
-    const baseLength = change.messages.length - tailLength;
-    const markers = change.messages.slice(baseLength, -1);
-    const userMessage = change.messages.at(-1);
-    const source = requireExternalCurrentUserSource(active[sourceIndex]);
-    const normalizedMarkers = markers.map(requireHiddenTypedCustom);
-    const normalizedUser = requireExactCurrentUserMessage(userMessage, source);
-    return {
-        baseMessages: change.messages.slice(0, baseLength),
-        user: source,
-        envelopes: [
-            ...normalizedMarkers.map((message, offset) => envelope({
-                change,
-                message,
-                turnId: `${change.turnId}:compaction`,
-                index: baseLength + offset,
-            })),
-            { ...withoutHistoryArtifact(source), message: normalizedUser },
-        ],
-    };
-}
-function requireExternalCurrentUserSource(source) {
-    if (!source || !isUserMessageId(source.message_id) || source.message.role !== 'user') {
-        throw new TypeError('Canonical current-user tail source is not an external user.');
-    }
-    return source;
-}
-function requireHiddenTypedCustom(value) {
-    if (!isHiddenTypedCustom(value)) {
-        throw new TypeError('Canonical current-user tail marker is invalid.');
-    }
-    return historyMessage(value);
-}
-function requireExactCurrentUserMessage(value, source) {
-    const normalized = historyMessage(value);
-    if (normalized.role !== 'user' || !sameJson(source.message, normalized)) {
-        throw new TypeError(`Canonical current-user tail changed external user payload: ${source.message_id}`);
-    }
-    return normalized;
-}
-function isHiddenTypedCustom(value) {
-    return (!!value &&
-        typeof value === 'object' &&
-        !Array.isArray(value) &&
-        Reflect.get(value, 'role') === 'custom' &&
-        Reflect.get(value, 'display') === false &&
-        typeof Reflect.get(value, 'customType') === 'string' &&
-        Boolean(Reflect.get(value, 'customType').trim()) &&
-        typeof Reflect.get(value, 'timestamp') === 'number' &&
-        Number.isFinite(Reflect.get(value, 'timestamp')));
-}
-function sameJson(left, right) {
-    return JSON.stringify(left) === JSON.stringify(right);
-}
-function preserveHistoryArtifact(existing, replacement) {
-    const artifact = existing[0]?.history_artifact;
-    if (!artifact)
-        return [...replacement];
-    return replacement.map((record, index) => {
-        const semanticEnvelope = withoutHistoryArtifact(record);
-        return index === 0 ? { ...semanticEnvelope, history_artifact: artifact } : semanticEnvelope;
-    });
-}
-function markHistoryArtifact(replacement, marker) {
-    if (replacement.length === 0) {
-        throw new TypeError('Canonical compaction replacement cannot be empty.');
-    }
-    return replacement.map((record, index) => {
-        const semanticEnvelope = withoutHistoryArtifact(record);
-        return index === 0 ? { ...semanticEnvelope, history_artifact: marker } : semanticEnvelope;
-    });
+async function publishArchive(files, paths, archive) {
+    const { path } = canonicalSnapshotEntry(paths.snapshots, archive);
+    await files.publishSnapshot(path, canonicalEnvelopes(archive.records));
 }
 /**
- * The producer written to disk. A segment checkpoint differs from a summary
- * checkpoint only in how it is committed; on disk it is a summary at index 0,
- * and readers find segments by that record, never by the producer. Writing the
- * summary producer keeps the file readable by releases that predate segments.
+ * A summary checkpoint is planned by the shared rules. A segment checkpoint keeps its
+ * planned source records verbatim and is stored as a summary checkpoint: on disk it is a
+ * summary at index 0, and readers find segments by that record, never by the producer.
+ * Writing the summary producer keeps the file readable by releases that predate segments.
  */
-function persistedProducer(method) {
-    return method === 'llm_segment_checkpoint' ? 'llm_checkpoint' : method;
-}
-function withoutHistoryArtifact(record) {
+function planCanonicalCompaction(active, change) {
+    const generation = activeHistoryGeneration(active);
+    if (change.method !== 'llm_segment_checkpoint')
+        return planCompaction(active, change, generation);
+    const compactionId = safeCompactionId(change.compactionId);
+    const revision = semanticHistoryRevision(active);
+    const replacement = segmentReplacementEnvelopes(change, active, {
+        create: (message, index) => canonicalEnvelope(canonicalRecord({ change, message, turnId: `${change.turnId}:compaction`, index })),
+        keep: (source) => canonicalEnvelope(withoutHistoryArtifact(source)),
+        roleOf: (message) => canonicalHistoryMessage(message).role,
+    });
+    const marker = {
+        schemaVersion: 1,
+        generation: generation + 1,
+        producedBy: 'llm_checkpoint',
+        parentSnapshot: { generation, compactionId, revision },
+    };
+    const next = markHistoryArtifact(replacement, marker);
     return {
-        message_id: record.message_id,
-        turn_id: record.turn_id,
-        message: record.message,
-        ...(record.turn_config ? { turn_config: record.turn_config } : {}),
+        archive: historyArchive({
+            generation,
+            compactionId,
+            records: active,
+            successor: next,
+            revision,
+        }),
+        active: next,
     };
 }
-function activeGeneration(records) {
-    const artifactGeneration = records[0]?.history_artifact?.generation;
-    if (artifactGeneration !== undefined)
-        return artifactGeneration;
-    const first = records[0]?.message;
-    if (!first || first.role !== 'user')
-        return 0;
-    const marker = Reflect.get(first, 'archonCompaction');
-    if (!marker || typeof marker !== 'object' || Array.isArray(marker))
-        return 0;
-    const generation = Reflect.get(marker, 'generation');
-    return typeof generation === 'number' && Number.isSafeInteger(generation) && generation >= 0
-        ? generation
-        : 0;
+/** The shared rules validate every message they emit, so their records are canonical envelopes. */
+function canonicalEnvelopes(records) {
+    return records;
 }
-function safeCompactionId(value) {
-    const sanitized = value.trim().replaceAll(/[^A-Za-z0-9._-]/gu, '-');
-    if (!sanitized)
-        throw new TypeError('Compaction id is required.');
-    const normalized = /^[A-Za-z0-9]/u.test(sanitized) ? sanitized : `c${sanitized}`;
-    return normalized.slice(0, 120);
-}
-function replacementSnapshotId(metadata) {
-    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata))
-        return undefined;
-    const value = Reflect.get(metadata, 'replacementId');
-    return typeof value === 'string' && value.trim() ? value : undefined;
+function canonicalEnvelope(record) {
+    return record;
 }
 /** The repair rewrites the whole file, so it is computed again from a full disk read. */
 async function replaceRecoveredHistory(files, path, allowPendingToolCallTail) {

@@ -73,7 +73,7 @@ export const APP_SERVER_FEATURE_PROJECT_ICON_UPDATE = 'project.icon.update';
 /**
  * Per-Session advisor model selection through DesktopService `SelectAdvisorModel`,
  * `ListModelsResp.advisor` and `SessionInfoView.advisor`. Declared only when the
- * app-server's package ships the advisor (`beta.advisor`, internal-only), so it is not
+ * app-server's package ships the advisor (`beta.advisor`), so it is not
  * part of the static `APP_SERVER_FEATURES`. Desktop reads the same value as
  * `RUNTIME_FEATURE_SESSION_ADVISOR`.
  */

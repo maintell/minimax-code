@@ -1,3 +1,4 @@
+import { listInAppBrowserTabs, } from '../../service/browser-use/index.js';
 const BROWSER_TURN_CONTEXT_PATH = '/mavis/api/session/:sessionId/browser-turn-context';
 /** Preserve the existing Browser snapshot URL while Runtime V2 owns its state. */
 export function mountBrowserTurnContextRoutes(app, service) {
@@ -68,7 +69,13 @@ function readInAppBrowserState(value) {
     if (typeof state.selectedTab !== 'boolean') {
         throw new TypeError('inAppBrowser.selectedTab must be a boolean');
     }
-    return { visible: state.visible, selectedTab: state.selectedTab };
+    const listed = listInAppBrowserTabs(state.tabs);
+    return {
+        visible: state.visible,
+        selectedTab: state.selectedTab,
+        ...(listed ? { tabs: listed.tabs } : {}),
+        ...(listed && listed.omitted > 0 ? { tabsOmitted: listed.omitted } : {}),
+    };
 }
 function invalidContext(error) {
     return Response.json({ error, code: 'INVALID_BROWSER_TURN_CONTEXT' }, { status: 400 });

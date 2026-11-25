@@ -7,18 +7,16 @@
  *   `bypassImmune`.
  *
  * The wider permission pipeline (agent-core `PermissionEngine`,
- * `path-capability`, `bash-permission`, `local-permission-checkers`,
- * `local-permission-facade`'s cloud-gateway branch — 22 distinct sites
- * as of this writing) produces verdicts with `behavior === 'ask'` for
- * many independent reasons:
+ * `path-capability`, `bash-permission`, and the facade's local-policy
+ * and cloud-gateway branches) produces verdicts with `behavior === 'ask'`
+ * for many independent reasons:
  *
  *   - user-persisted whole-tool / MCP server `ask` rules
  *   - tool checker `bypassImmune` safetyCheck (credential paths, etc.)
  *   - content-ask rules
  *   - interactive tools
  *   - bash safe-first-words fallback
- *   - local hard-check ASK (curl-pipe-shell, shell substitution,
- *     slow whole-tree scan, recursive rm, workspace-escape)
+ *   - local `policy` denies the facade demotes to an ask under default/auto
  *   - cloud gateway verdicts of `block` / `confirm` / `timeout`
  *
  * Before this gate each of those sites was responsible for "is this
@@ -37,10 +35,10 @@
  *   - `mode === 'bypassPermissions'`:
  *       - `behavior === 'deny'` → unchanged. Deny is reported back to
  *         the LLM as a tool error; it never surfaces a card. The
- *         bypass-immune deny set (UNC, `rm -rf /` / `~`) lives at
- *         `facade.ts:202` and short-circuits before we get here, so
- *         the verdict at this point is either an engine deny or
- *         nothing.
+ *         bypass-immune deny set (UNC, `rm -rf /` / `~`) is checked
+ *         by the facade's runtime-safety stage and short-circuits
+ *         before we get here, so the verdict at this point is either
+ *         an engine deny or nothing.
  *       - `behavior === 'allow'` → unchanged.
  *       - `behavior === 'ask'` → **downgraded to `allow`**. The user
  *         has waived per-call review for this mode.

@@ -132,14 +132,18 @@ export async function evaluateWindowsHardSafety(deps, request) {
         toolName: params.toolName,
         input: params.input,
         workspaceDir: workingDirectory,
+        additionalWorkspaceDirs: params.trustedAdditionalWorkingPaths,
         platform,
         ...runtimeCheckerShell(deps.shellFamily, params, request.nativeDelete),
     });
     const recoverableInsideWorkspace = recoverableNativeDelete !== undefined &&
         workingDirectory !== undefined &&
-        isRecoverableDeleteInsideWorkspace(recoverableNativeDelete.targets, workingDirectory);
-    if (pathSafety && !recoverableInsideWorkspace)
+        isRecoverableDeleteInsideWorkspace(recoverableNativeDelete.targets, workingDirectory, params.trustedAdditionalWorkingPaths);
+    // A `policy` finding is not a runtime boundary: the facade turns it into a
+    // confirmation under default/auto, and Full mode may allow it.
+    if (pathSafety?.denyKind === 'bypass-immune' && !recoverableInsideWorkspace) {
         return safetyDenial(pathSafety.reason);
+    }
     return windowsHardSafetyContext(recoverableNativeDelete, workingDirectory);
 }
 /**
@@ -155,6 +159,7 @@ export async function evaluateNativeDeleteSafety(deps, request, windowsHardSafet
         toolName: params.toolName,
         input: params.input,
         workspaceDir: workingDirectory,
+        additionalWorkspaceDirs: params.trustedAdditionalWorkingPaths,
         platform,
         skipWindowsHardSafetyChecks,
         ...runtimeCheckerShell(deps.shellFamily, params, true),
