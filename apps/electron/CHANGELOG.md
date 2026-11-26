@@ -6,6 +6,28 @@ section for the released version, so a version without a section cannot be
 released. Keep entries user-facing; internal refactors, test-only changes and
 packaging changes that do not alter behavior do not need an entry.
 
+## 3.1.19 · 2026-11-26
+
+### Changed
+
+- Client 3.1.19: refreshed renderer bundle and model menu, a new `pptx-core`
+  wasm module set, an updated session-transfer client and rebuilt vendored
+  native binaries.
+- Screenshot and selection capture now run through the main process: region
+  capture with a selection mask, window capture, annotation controls and
+  capture permissions.
+- Mini-app files can be opened from a conversation, the model menu gained its
+  advisor and limit logic, and browser pages gained takeover and scroll-guard
+  helpers.
+- The Windows installer stays per architecture; this release ships the x64
+  package (`MiniMax Code Setup 3.1.19-x64.exe`).
+
+### Fixed
+
+- A manual update check that races the background metadata probe no longer
+  leaves the updater stuck on "checking": both paths now wait for the in-flight
+  probe instead of starting a second check.
+
 ## 3.1.15 · 2026-11-15
 
 ### Changed
