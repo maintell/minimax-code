@@ -42,13 +42,28 @@ asarUnpack:
   # QuickJS wasm runtime the PTC agent host loads.
   - node_modules/quickjs-emscripten/**
   - node_modules/quickjs-emscripten-core/**
-  # The PTC worker is loaded as a module by URL and deliberately resolves to
-  # `app.asar.unpacked` (see `.../agent-host/runner/ptc/worker-path.js`), so the
-  # worker and the modules around it must live outside the archive. The shipped
-  # installation unpacks exactly these paths.
+  # Modules the utility process loads by URL and deliberately resolves to
+  # `app.asar.unpacked` (see each package's `worker-path.js`), so the workers
+  # and the modules around them must live outside the archive. The shipped
+  # installation unpacks exactly these paths. 3.1.19 moved the PTC agent host
+  # from `@mavis/local-runtime-v2` to `@mavis/harness` and added a plugin
+  # extension runtime spanning `harness` / `local-runtime-v2` / `shared`.
+  - node_modules/@mavis/harness/package.json
+  - node_modules/@mavis/harness/dist/agent-host/execution/ptc/**
+  - node_modules/@mavis/harness/dist/agent-host/runner/ptc/**
   - node_modules/@mavis/local-runtime-v2/package.json
-  - node_modules/@mavis/local-runtime-v2/dist/service/turn-system/agent-host/execution/ptc/**
-  - node_modules/@mavis/local-runtime-v2/dist/service/turn-system/agent-host/runner/ptc/**
+  - node_modules/@mavis/local-runtime-v2/dist/infra/async/settle.js
+  - node_modules/@mavis/local-runtime-v2/dist/infra/util/asar-unpacked-path.js
+  - node_modules/@mavis/local-runtime-v2/dist/service/browser-use/program/**
+  - node_modules/@mavis/local-runtime-v2/dist/service/plugin-extension/authoring/fixes.js
+  - node_modules/@mavis/local-runtime-v2/dist/service/plugin-extension/authoring/testing/**
+  - node_modules/@mavis/local-runtime-v2/dist/service/plugin-extension/host/**
+  - node_modules/@mavis/local-runtime-v2/dist/service/plugin-extension/sdk/**
+  - node_modules/@mavis/local-runtime-v2/dist/service/plugin-extension/contracts.js
+  - node_modules/@mavis/local-runtime-v2/dist/service/plugin-extension/errors.js
+  - node_modules/@mavis/local-runtime-v2/dist/service/plugin-extension/services/quota.js
+  - node_modules/@mavis/shared/package.json
+  - node_modules/@mavis/shared/dist/plugin-extension/**
 
 extraResources:
   - from: resources
