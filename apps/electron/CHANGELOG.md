@@ -6,6 +6,16 @@ section for the released version, so a version without a section cannot be
 released. Keep entries user-facing; internal refactors, test-only changes and
 packaging changes that do not alter behavior do not need an entry.
 
+## 3.1.20 · 2026-11-27
+
+### Fixed
+
+- Auto-update from 3.1.16 or earlier failed to run any code with
+  `Cannot find module ... @mavis/harness\...\ptc\quickjs-worker.js`: the update
+  moved the sandbox worker to a new package that the updater did not unpack.
+  Fresh installs and the manual installer were unaffected; the broken machines
+  need this build installed (it repairs the unpacked module set in place).
+
 ## 3.1.19 · 2026-11-26
 
 ### Changed
